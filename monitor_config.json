@@ -1,0 +1,33 @@
+{
+    "user_fb": "user",
+    "user_faf": "user",
+    "user_fab": "user",
+    "alerts_excluded": "9999",
+    "fb_arrays": "fb",
+    "faf_arrays": "fa1",
+    "fab_arrays": "fa2",
+    "sla_fb": "45m",
+    "sla_faf": "30m",
+    "sla_fab": "30m",
+    "lag_yellow": "10m",
+    "lag_orange": "30m",
+    "ignore_source_lag": true,
+    "smtp_server": "smtp",
+    "smtp_port": "25",
+    "smtp_from": "johnsmith@domain.org",
+    "smtp_to": "janedoe@domain.com",
+    "replication_pairs": [
+        {
+            "name": "Prod to DR - FlashArray Block",
+            "source": "flasharray1",
+            "destination": "flasharray2",
+            "type": "FA-Block"
+        },
+        {
+            "name": "Prod to DR - FlashArray Files",
+            "source": "flasharray1",
+            "destination": "flasharray2",
+            "type": "FA-File"
+        }
+    ]
+}
