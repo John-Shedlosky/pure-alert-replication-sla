@@ -2523,7 +2523,10 @@ class PureMonitorApp(tk.Tk):
         # scratch space to paste into without having to insert rows first.
         # Ongoing upkeep (via _ensure_trailing_blank_rows) only maintains a
         # 2-row tail, but the initial load keeps the original 20 visible.
-        rows.extend([['', '']] * 20)
+        # NOTE: must construct each row as its own list — [['',''] ] * 20 would
+        # create 20 references to the same inner list, so writing one cell
+        # would propagate the value into every padding row.
+        rows.extend([['', ''] for _ in range(20)])
 
         sheet_frame = ttk.Frame(parent)
         sheet_frame.grid(row=4, column=1, columnspan=2, rowspan=3,
