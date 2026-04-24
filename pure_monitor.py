@@ -2519,28 +2519,33 @@ class PureMonitorApp(tk.Tk):
         column Treeview-based editor so the app still runs without tksheet.
         """
         rows = [[n, l] for n, l in unified_arrays_from_config(config)]
-        # Always show at least one blank row for easy first-time editing.
-        if not rows:
-            rows = [['', '']]
+        # Pad with 2 blank rows at the end so the user has scratch space to
+        # paste into without having to insert rows first.
+        rows.extend([['', ''], ['', '']])
 
         sheet_frame = ttk.Frame(parent)
         sheet_frame.grid(row=4, column=1, columnspan=2, rowspan=3,
                          sticky=tk.NSEW, padx=(0, 0), pady=2)
+        # Let the sheet grow when the user resizes the window.
+        parent.rowconfigure(4, weight=1)
+        parent.rowconfigure(5, weight=1)
+        parent.rowconfigure(6, weight=1)
 
         if HAS_TKSHEET:
+            # Height tuned to show ~8 data rows plus the header comfortably.
             self.arrays_sheet = Sheet(
                 sheet_frame,
                 headers=["Array", "Location"],
                 data=rows,
-                width=360, height=110,
+                width=360, height=260,
                 show_row_index=False,
                 show_top_left=False,
                 show_x_scrollbar=False,
             )
             self.arrays_sheet.enable_bindings((
-                "single_select", "row_select", "column_select", "arrowkeys",
+                "single_select", "drag_select", "arrowkeys", "edit_cell",
+                "copy", "paste", "delete", "undo",
                 "right_click_popup_menu", "rc_insert_row", "rc_delete_row",
-                "copy", "cut", "paste", "delete", "undo", "edit_cell",
             ))
             try:
                 self.arrays_sheet.column_width(column=0, width=180)
