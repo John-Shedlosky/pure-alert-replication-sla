@@ -3060,8 +3060,9 @@ class PureMonitorApp(tk.Tk):
     def _show_busy_spinner(self, message="Running report..."):
         """Pop up a small transient window with a spinning logo.
 
-        Randomly picks one of FB-Green.png / FA-Green.png / everpure_logo.png
-        on each invocation. When an image is available the window is shown
+        Cycles through FB-Green.png \u2192 FA-Green.png \u2192 everpure_logo.png
+        (and wraps) on successive invocations so each logo gets equal
+        screen time. When an image is available the window is shown
         chrome-less with a chroma-keyed transparent background (Windows)
         so only the rotating logo itself is visible. Falls back to a titled
         window with an indeterminate ttk.Progressbar if Pillow isn't
@@ -3078,13 +3079,22 @@ class PureMonitorApp(tk.Tk):
             top.resizable(False, False)
             top.protocol("WM_DELETE_WINDOW", lambda: None)
 
-            import random, math
+            import math
             _img_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
             _candidates = ["FB-Green.png", "FA-Green.png", "everpure_logo.png"]
             _existing = [os.path.join(_img_dir, n)
                          for n in _candidates
                          if os.path.exists(os.path.join(_img_dir, n))]
-            img_path = random.choice(_existing) if _existing else None
+            # Round-robin selection: advance an instance counter each call
+            # so the three logos rotate 1 \u2192 2 \u2192 3 \u2192 1 \u2026 instead of random,
+            # which historically favored the first two by chance.
+            if _existing:
+                idx = getattr(self, '_busy_img_idx', -1) + 1
+                idx %= len(_existing)
+                self._busy_img_idx = idx
+                img_path = _existing[idx]
+            else:
+                img_path = None
             self._busy_pil_img   = None
             self._busy_tk_img    = None
             self._busy_angle     = 0
