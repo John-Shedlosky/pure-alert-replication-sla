@@ -2542,7 +2542,7 @@ class PureMonitorApp(tk.Tk):
                 sheet_frame,
                 headers=["Array", "Location"],
                 data=rows,
-                width=360, height=260,
+                width=540, height=260,
                 show_row_index=False,
                 show_top_left=False,
                 show_x_scrollbar=False,
@@ -2573,8 +2573,8 @@ class PureMonitorApp(tk.Tk):
             except Exception:
                 pass
             try:
-                self.arrays_sheet.column_width(column=0, width=180)
-                self.arrays_sheet.column_width(column=1, width=170)
+                self.arrays_sheet.column_width(column=0, width=270)
+                self.arrays_sheet.column_width(column=1, width=255)
             except Exception:
                 pass
             self.arrays_sheet.pack(fill=tk.BOTH, expand=True)
