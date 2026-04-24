@@ -2519,9 +2519,11 @@ class PureMonitorApp(tk.Tk):
         column Treeview-based editor so the app still runs without tksheet.
         """
         rows = [[n, l] for n, l in unified_arrays_from_config(config)]
-        # Pad with 2 blank rows at the end so the user has scratch space to
-        # paste into without having to insert rows first.
-        rows.extend([['', ''], ['', '']])
+        # Pad with 20 blank rows at the end on startup so the user has ample
+        # scratch space to paste into without having to insert rows first.
+        # Ongoing upkeep (via _ensure_trailing_blank_rows) only maintains a
+        # 2-row tail, but the initial load keeps the original 20 visible.
+        rows.extend([['', '']] * 20)
 
         sheet_frame = ttk.Frame(parent)
         sheet_frame.grid(row=4, column=1, columnspan=2, rowspan=3,
