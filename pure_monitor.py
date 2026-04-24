@@ -2535,6 +2535,14 @@ class PureMonitorApp(tk.Tk):
         parent.rowconfigure(4, weight=1)
         parent.rowconfigure(5, weight=1)
         parent.rowconfigure(6, weight=1)
+        # Reserve enough horizontal space in the grid cell so the sheet's
+        # two columns (270 + 255 px) plus the vertical scrollbar gutter fit
+        # without being clipped. Without these minsize values, cols 1/2 of
+        # the parent grid collapse down to the width of the 20-char entry
+        # widgets above, and the sheet gets squeezed regardless of its own
+        # `width=` constructor argument or internal column_width() calls.
+        parent.columnconfigure(1, minsize=275, weight=1)
+        parent.columnconfigure(2, minsize=285, weight=1)
 
         if HAS_TKSHEET:
             # Height tuned to show ~8 data rows plus the header comfortably.
