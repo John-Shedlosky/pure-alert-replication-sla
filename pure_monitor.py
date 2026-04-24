@@ -3144,22 +3144,38 @@ class PureMonitorApp(tk.Tk):
                 pb.start(10)
                 ttk.Label(top, text=message).pack(padx=24, pady=(0, 20))
 
-            self.update_idletasks()
-            try:
-                sz   = self._busy_canvas_sz if self._busy_canvas_sz else 160
-                half = sz // 2
-                x = self.winfo_rootx() + (self.winfo_width()  // 2) - half
-                y = self.winfo_rooty() + (self.winfo_height() // 2) - half
-                # Include width/height in the geometry string so a chrome-less
-                # Toplevel is forced to the exact canvas size; otherwise on
-                # some Windows Tk builds it may render at 1x1 before a map.
-                if self._busy_canvas_sz:
-                    top.geometry(f"{sz}x{sz}+{max(0, x)}+{max(0, y)}")
-                else:
-                    top.geometry(f"+{max(0, x)}+{max(0, y)}")
-            except Exception:
-                pass
+            # Compute target position: horizontally centered on the main
+            # window, vertically 1/4 of the way down from its top edge.
+            # winfo_* on the root requires that the window actually exists
+            # on screen, which it does by the time Run Report is clicked;
+            # update_idletasks() flushes any pending geometry changes so
+            # the values returned are current.
+            def _place_spinner():
+                try:
+                    self.update_idletasks()
+                    sz   = self._busy_canvas_sz if self._busy_canvas_sz else 160
+                    half = sz // 2
+                    rx = self.winfo_rootx()
+                    ry = self.winfo_rooty()
+                    rw = self.winfo_width()
+                    rh = self.winfo_height()
+                    # Fall back to screen-center when the root hasn't
+                    # reported a real size yet (rare; can happen if the
+                    # method is called before the app is fully mapped).
+                    if rw <= 1 or rh <= 1:
+                        rx, ry = 0, 0
+                        rw = self.winfo_screenwidth()
+                        rh = self.winfo_screenheight()
+                    x = rx + (rw // 2)     - half
+                    y = ry + (rh // 4)     - half
+                    if self._busy_canvas_sz:
+                        top.geometry(f"{sz}x{sz}+{max(0, x)}+{max(0, y)}")
+                    else:
+                        top.geometry(f"+{max(0, x)}+{max(0, y)}")
+                except Exception:
+                    pass
 
+            _place_spinner()
             self._busy_spinner_win = top
             # Force the window to be mapped and raised now \u2014 without this,
             # overrideredirect() Toplevels sometimes defer their first
@@ -3170,6 +3186,10 @@ class PureMonitorApp(tk.Tk):
                 top.update()
             except Exception:
                 pass
+            # Re-apply geometry after the window is actually mapped: on
+            # some Windows Tk builds an overrideredirect() Toplevel ignores
+            # the first .geometry() call (made pre-map) and lands at 0,0.
+            _place_spinner()
             if self._busy_pil_img is not None:
                 self._spin_busy_tick()
         except Exception:
