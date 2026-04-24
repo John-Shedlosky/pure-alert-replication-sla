@@ -3,14 +3,31 @@
     "user_faf": "user",
     "user_fab": "user",
     "alerts_excluded": "9999",
-    "fb_arrays": "fb",
-    "faf_arrays": "fa1",
-    "fab_arrays": "fa2",
+    "arrays": [
+        {
+            "name": "fb",
+            "location": "Boston"
+        },
+        {
+            "name": "fa1",
+            "location": "New York"
+        },
+        {
+            "name": "fa2",
+            "location": "Chicago"
+        },
+        {
+            "name": "fb2",
+            "location": "Tokyo"
+        }
+    ],
+    "arrays_col_widths": [
+        323,
+        176
+    ],
     "sla_fb": "45m",
     "sla_faf": "30m",
     "sla_fab": "30m",
-    "lag_yellow": "10m",
-    "lag_orange": "30m",
     "ignore_source_lag": true,
     "smtp_server": "smtp",
     "smtp_port": "25",
