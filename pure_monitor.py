@@ -20,12 +20,21 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    from tksheet import Sheet
+    HAS_TKSHEET = True
+except ImportError:
+    HAS_TKSHEET = False
+
 # =========================================================
 # CONFIGURABLE DEFAULTS
 # =========================================================
-DEFAULT_FB_ARRAYS = "flashblade1, flashblade2"
-DEFAULT_FA_FILE_ARRAYS = "flasharray2, flasharray1"
-DEFAULT_FA_BLOCK_ARRAYS = "flasharray2, flasharray1"
+DEFAULT_FB_ARRAYS = "flashblade1\nflashblade2"
+DEFAULT_FA_FILE_ARRAYS = "flasharray2\nflasharray1"
+DEFAULT_FA_BLOCK_ARRAYS = "flasharray2\nflasharray1"
+DEFAULT_FB_LOCATIONS = ""
+DEFAULT_FA_FILE_LOCATIONS = ""
+DEFAULT_FA_BLOCK_LOCATIONS = ""
 DEFAULT_EXCLUDED_ALERTS = "9999, 9998"
 
 # We use events/queues to prompt for passwords in the main thread
@@ -117,6 +126,163 @@ def run_ssh_command(array, user, command, log_list=None, nogui=False):
     if log_list is not None:
         log_list.append(f"=== Command Log: {user}@{array} ===\n> {command}\n[OUTPUT]\n{out}\n")
     return out
+
+
+# Platforms share Status-column semantics but use different unhealthy keywords.
+_HW_FB_BAD = {'critical', 'unhealthy', 'unknown', 'unrecognized'}
+_HW_FA_BAD = {'critical', 'degraded', 'unknown'}
+
+
+def collect_hw_health(array, user, platform, detailed_logs, nogui=False, idx=0):
+    """Run 'purehw list --csv' on *array* as *user* and classify its hardware.
+
+    *platform* is 'FB' or 'FA' (FA-File and FA-Block share the same FlashArray
+    hardware columns so they are grouped together). Returns a dict with keys:
+      name, platform, header, rows, unhealthy_rows, status_idx, healthy, error.
+    """
+    import csv as _csv
+    import io  as _io
+    bad = _HW_FB_BAD if platform == 'FB' else _HW_FA_BAD
+    result = {'name': array, 'platform': platform, 'header': [], 'rows': [],
+              'unhealthy_rows': [], 'status_idx': -1,
+              'healthy': None, 'error': None}
+
+    def _finalize():
+        for i, h in enumerate(result['header']):
+            if h.strip().lower() == 'status':
+                result['status_idx'] = i
+                break
+        si = result['status_idx']
+        if si >= 0:
+            for r in result['rows']:
+                if si < len(r) and r[si].strip().lower() in bad:
+                    result['unhealthy_rows'].append(r)
+            result['healthy'] = (len(result['unhealthy_rows']) == 0)
+
+    if ALERT_DEBUG:
+        if platform == 'FB':
+            result['header'] = ['Name', 'Type', 'Status', 'Speed', 'Details', 'Identify']
+            result['rows'] = [
+                ['CH1.FM1', 'fm',  'healthy', '-', '-', 'off'],
+                ['CH1.FB1', 'fb',  'healthy', '-', '-', 'off'],
+                ['CH1.PSU0','psu', 'healthy', '-', '-', 'off'],
+            ]
+            if idx % 3 == 1:
+                result['rows'].append(['CH1.PSU1', 'psu', 'critical', '-', 'Power supply failed', 'off'])
+            if idx % 4 == 2:
+                result['rows'].append(['CH2.FB3', 'fb', 'unknown', '-', 'Blade unresponsive', 'off'])
+        else:
+            result['header'] = ['Name', 'Status', 'Identify', 'Slot', 'Index', 'Speed', 'Temperature', 'Voltage', 'Details']
+            result['rows'] = [
+                ['CH0.BAY0', 'ok',   'off', '0', '0', '-',    '-',   '-', ''],
+                ['CH0.BAY1', 'ok',   'off', '0', '1', '-',    '-',   '-', ''],
+                ['CT0',      'ok',   'off', '-', '-', '-',    '-',   '-', ''],
+            ]
+            if idx % 4 == 2:
+                result['rows'].append(['CT0.FAN0', 'critical', 'off', '-', '-', '-', '-',   '-', 'Fan failure'])
+            if idx % 5 == 3:
+                result['rows'].append(['CT1.TMP0', 'degraded', 'off', '-', '-', '-', '72C', '-', 'Temp above threshold'])
+        _finalize()
+        _title = ",".join(result['header'])
+        _body  = "\n".join(",".join(r) for r in result['rows'])
+        detailed_logs.append(
+            f"=== Command Log: {user}@{array} ===\n> purehw list --csv\n[OUTPUT-DEBUG]\n{_title}\n{_body}\n")
+        return result
+
+    try:
+        out = run_ssh_command(array, user, "purehw list --csv",
+                              log_list=detailed_logs, nogui=nogui)
+        reader = _csv.reader(_io.StringIO(out.strip()))
+        rows = list(reader)
+        if not rows:
+            result['error'] = "Empty response"
+            return result
+        result['header'] = rows[0]
+        result['rows']   = rows[1:]
+        _finalize()
+    except Exception as e:
+        result['error'] = str(e)
+    return result
+
+
+def collect_replication_relationships(array, user, platform, detailed_logs,
+                                      nogui=False, idx=0, peers=None):
+    """Run the array's connection-list command and parse partner arrays.
+
+    FB platform issues 'purearray list --connect --csv'.
+    FA platform (FA-File and FA-Block share the same connection schema)
+    issues 'purearray connection list --csv'.
+
+    Returns dict with keys: name, platform, header, rows, partners, error.
+    Each partner is {'remote', 'status', 'type', 'mgmt_addr'} (extra fields
+    blank when the source CSV omits them).
+    """
+    import csv as _csv
+    import io  as _io
+    cmd = ("purearray list --connect --csv" if platform == 'FB'
+           else "purearray connection list --csv")
+    result = {'name': array, 'platform': platform, 'header': [], 'rows': [],
+              'partners': [], 'error': None}
+
+    def _idx(name):
+        for i, h in enumerate(result['header']):
+            if h.strip().lower() == name.lower():
+                return i
+        return -1
+
+    def _finalize():
+        ni = _idx('name')
+        si = _idx('status')
+        ti = _idx('type')
+        mi = _idx('management address')
+        if mi < 0:
+            mi = _idx('mgmt address')
+        for r in result['rows']:
+            if not r or ni < 0 or ni >= len(r):
+                continue
+            remote = r[ni].strip()
+            if not remote or remote == array:
+                continue
+            result['partners'].append({
+                'remote':    remote,
+                'status':    r[si].strip() if 0 <= si < len(r) else '',
+                'type':      r[ti].strip() if 0 <= ti < len(r) else '',
+                'mgmt_addr': r[mi].strip() if 0 <= mi < len(r) else '',
+            })
+
+    if ALERT_DEBUG:
+        candidates = [p for p in (peers or []) if p != array]
+        peer = candidates[idx % len(candidates)] if candidates else (array + '_dr')
+        if platform == 'FB':
+            result['header'] = ['Name', 'ID', 'Status', 'Throttle', 'Type']
+            result['rows']   = [[peer, 'aaaa-bbbb-cccc-dddd', 'connected', '-', 'replication']]
+        else:
+            result['header'] = ['Name', 'Type', 'Throttled', 'Status',
+                                'Management Address', 'Replication Address', 'Version']
+            result['rows']   = [[peer, 'replication', 'false', 'connected',
+                                 '10.10.10.10', '10.20.20.20', '6.5.0']]
+        _finalize()
+        _title = ",".join(result['header'])
+        _body  = "\n".join(",".join(r) for r in result['rows'])
+        detailed_logs.append(
+            f"=== Command Log: {user}@{array} ===\n> {cmd}\n[OUTPUT-DEBUG]\n{_title}\n{_body}\n")
+        return result
+
+    try:
+        out = run_ssh_command(array, user, cmd,
+                              log_list=detailed_logs, nogui=nogui)
+        reader = _csv.reader(_io.StringIO(out.strip()))
+        rows = list(reader)
+        if not rows:
+            result['error'] = "Empty response"
+            return result
+        result['header'] = rows[0]
+        result['rows']   = rows[1:]
+        _finalize()
+    except Exception as e:
+        result['error'] = str(e)
+    return result
+
 
 def parse_time_to_seconds(time_str):
     if not time_str or time_str == "-": return 0
@@ -242,6 +408,265 @@ def parse_pure_date(date_str):
             continue
     return None
 
+
+def parse_arr_loc(arr_val, loc_val):
+    """Parse parallel newline-delimited Array and Location text blocks.
+
+    Returns (arrays, locations) lists with a strict 1:1 index relationship.
+    Rows whose array name is blank are dropped (and their paired location
+    discarded). When the locations block has fewer lines than the arrays
+    block, missing entries become empty strings.
+    """
+    _arrs = (arr_val or '').splitlines()
+    _locs = (loc_val or '').splitlines()
+    out_arr, out_loc = [], []
+    for i, a in enumerate(_arrs):
+        a = a.strip()
+        if not a:
+            continue
+        l = _locs[i].strip() if i < len(_locs) else ''
+        out_arr.append(a)
+        out_loc.append(l)
+    return out_arr, out_loc
+
+
+def align_rel_pairs_by_location(raw_pairs):
+    """Return *raw_pairs* reordered so arrays at the same location land in
+    the same column across all rows.
+
+    The first encountered pair seeds the left (``a_loc``) and right
+    (``b_loc``) location columns; subsequent pairs are swapped when
+    necessary so any location consistently sits on the same side.
+    Missing / blank locations are tracked under the sentinel
+    ``"(no location)"``. Pairs whose two locations have both already been
+    mapped to the same column are kept as-is (left-side preference).
+
+    Each input pair must be a dict with keys
+    ``a_name`` ``a_plat`` ``a_loc`` ``a_status``
+    ``b_name`` ``b_plat`` ``b_loc`` ``b_status``.
+    The returned list contains new dicts with the same keys.
+    """
+    LOC_EMPTY = '(no location)'
+    def _lkey(v):
+        return v if v else LOC_EMPTY
+
+    col_of_loc = {}   # location -> 'L' or 'R'
+    out = []
+    for pp in raw_pairs:
+        la, lb = _lkey(pp.get('a_loc', '')), _lkey(pp.get('b_loc', ''))
+        # Seed mappings for any locations not yet placed.
+        if la not in col_of_loc and lb not in col_of_loc:
+            col_of_loc[la] = 'L'
+            if lb != la:
+                col_of_loc[lb] = 'R'
+        elif la in col_of_loc and lb not in col_of_loc:
+            col_of_loc[lb] = 'R' if col_of_loc[la] == 'L' else 'L'
+        elif lb in col_of_loc and la not in col_of_loc:
+            col_of_loc[la] = 'R' if col_of_loc[lb] == 'L' else 'L'
+
+        swap = False
+        if col_of_loc.get(la) == 'L' or col_of_loc.get(lb) == 'R':
+            swap = False
+        elif col_of_loc.get(la) == 'R' or col_of_loc.get(lb) == 'L':
+            swap = True
+        # else: same-column conflict -> keep as-is (prefer left-side alignment)
+
+        if swap:
+            out.append({
+                'a_name': pp['b_name'], 'a_plat': pp['b_plat'],
+                'a_loc':  pp['b_loc'],  'a_status': pp['b_status'],
+                'b_name': pp['a_name'], 'b_plat': pp['a_plat'],
+                'b_loc':  pp['a_loc'],  'b_status': pp['a_status'],
+            })
+        else:
+            out.append(dict(pp))
+    return out
+
+
+def _parse_csv_text(text):
+    """Return [[row cells ...], ...] from a CSV blob, or [] if empty/unparsable."""
+    import csv as _csv
+    import io as _io
+    if not text or not text.strip():
+        return []
+    try:
+        return list(_csv.reader(_io.StringIO(text.strip())))
+    except Exception:
+        return []
+
+
+def _classify_array_output(purearray_csv, purepod_csv, purepgroup_csv):
+    """Classify an array into (is_fb, is_faf, is_fab, is_nrp) from three CSV blobs.
+
+    Rules (per request):
+      * purearray list has a 'Product Type' column containing 'FlashBlade' -> FB.
+      * Otherwise the array is a FlashArray; it may be FA-File, FA-Block, both,
+        or neither ('No Replication FA'):
+          - purepod list with any data rows  -> FA-File
+          - purepgroup list 'Targets' column with any non-empty, non '-' cell
+            -> FA-Block
+    """
+    fb = faf = fab = False
+
+    pa_rows = _parse_csv_text(purearray_csv)
+    if pa_rows:
+        header = [c.strip() for c in pa_rows[0]]
+        try:
+            pt_idx = next(i for i, c in enumerate(header) if c.lower() == 'product type')
+        except StopIteration:
+            pt_idx = -1
+        if pt_idx >= 0:
+            for row in pa_rows[1:]:
+                if pt_idx < len(row) and 'flashblade' in row[pt_idx].strip().lower():
+                    fb = True
+                    break
+    if fb:
+        return True, False, False, False
+
+    pod_rows = _parse_csv_text(purepod_csv)
+    if len(pod_rows) > 1:
+        faf = True
+
+    pg_rows = _parse_csv_text(purepgroup_csv)
+    if pg_rows:
+        pg_hdr = [c.strip() for c in pg_rows[0]]
+        try:
+            tgt_idx = next(i for i, c in enumerate(pg_hdr) if c.lower() == 'targets')
+        except StopIteration:
+            tgt_idx = -1
+        if tgt_idx >= 0:
+            for row in pg_rows[1:]:
+                if tgt_idx < len(row):
+                    val = row[tgt_idx].strip()
+                    if val and val != '-':
+                        fab = True
+                        break
+
+    nrp = not (faf or fab)
+    return False, faf, fab, nrp
+
+
+def detect_array_type(array, users, detailed_logs=None, nogui=False):
+    """Detect an array's platform and replication capabilities via SSH.
+
+    *users* is an ordered iterable of (label, username) tuples (e.g. the three
+    configured users in FB, FA-File, FA-Block order). Detection tries each
+    until one connects, then issues ``purearray list --csv`` followed by
+    ``purepod list --csv`` and ``purepgroup list --csv`` (the latter two only
+    when the array is not a FlashBlade).
+
+    Returns a dict with keys:
+        is_fb, is_faf, is_fab, is_nrp  - booleans
+        user   - username that succeeded (or None if all failed)
+        error  - last error string, or None on success
+
+    When ALERT_DEBUG is set, SSH is bypassed and the array is reported as a
+    FA-Block so the rest of the pipeline has something to work with.
+    """
+    result = {'is_fb': False, 'is_faf': False, 'is_fab': False, 'is_nrp': False,
+              'user': None, 'error': None}
+    if ALERT_DEBUG:
+        result['is_fab'] = True
+        result['user']   = (users[0][1] if users else None)
+        return result
+
+    pa_out = None
+    last_err = None
+    used_user = None
+    for _label, _u in users:
+        if not _u:
+            continue
+        try:
+            pa_out = run_ssh_command(array, _u, "purearray list --csv",
+                                     log_list=detailed_logs, nogui=nogui)
+            used_user = _u
+            break
+        except Exception as e:
+            last_err = str(e)
+            continue
+    if pa_out is None:
+        result['error'] = last_err or "No SSH user could connect"
+        return result
+
+    result['user'] = used_user
+    pod_out = pg_out = ''
+    # Only need pod / pgroup output when we might be a FlashArray. A cheap way
+    # is to peek for 'FlashBlade' before issuing them.
+    if 'flashblade' not in pa_out.lower():
+        try:
+            pod_out = run_ssh_command(array, used_user, "purepod list --csv",
+                                      log_list=detailed_logs, nogui=nogui)
+        except Exception as e:
+            last_err = str(e)
+        try:
+            pg_out = run_ssh_command(array, used_user, "purepgroup list --csv",
+                                     log_list=detailed_logs, nogui=nogui)
+        except Exception as e:
+            last_err = str(e)
+
+    fb, faf, fab, nrp = _classify_array_output(pa_out, pod_out, pg_out)
+    result['is_fb']  = fb
+    result['is_faf'] = faf
+    result['is_fab'] = fab
+    result['is_nrp'] = nrp
+    if not any((fb, faf, fab, nrp)):
+        result['error'] = last_err or "Could not classify array"
+    return result
+
+
+def parse_unified_arrays(val):
+    """Parse the unified ``arrays`` config value into [(name, location), ...].
+
+    Accepts either a list of ``{"name": ..., "location": ...}`` dicts (the
+    preferred new form) or a newline/semicolon-delimited string where each
+    row is ``"name<TAB or comma>location"``. Blank name rows are dropped.
+    """
+    out = []
+    if isinstance(val, list):
+        for item in val:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name', '') or '').strip()
+            if not name:
+                continue
+            loc = str(item.get('location', '') or '').strip()
+            out.append((name, loc))
+        return out
+    if isinstance(val, str):
+        for line in val.splitlines():
+            parts = re.split(r'[\t,]', line, maxsplit=1)
+            name = parts[0].strip()
+            if not name:
+                continue
+            loc = parts[1].strip() if len(parts) > 1 else ''
+            out.append((name, loc))
+    return out
+
+
+def unified_arrays_from_config(raw):
+    """Return [(name, location), ...] from a raw config dict.
+
+    Prefers the new-style ``arrays`` list-of-dicts key. When absent, falls
+    back to the legacy ``fb_arrays`` / ``faf_arrays`` / ``fab_arrays`` and
+    paired ``*_locations`` newline-delimited strings; names that appear in
+    more than one legacy bucket are deduplicated (first occurrence wins).
+    """
+    if 'arrays' in raw:
+        return parse_unified_arrays(raw.get('arrays'))
+    seen = set()
+    out = []
+    for arr_key, loc_key in (('fb_arrays',  'fb_locations'),
+                             ('faf_arrays', 'faf_locations'),
+                             ('fab_arrays', 'fab_locations')):
+        names, locs = parse_arr_loc(raw.get(arr_key, ''), raw.get(loc_key, ''))
+        for n, l in zip(names, locs):
+            if n in seen:
+                continue
+            seen.add(n)
+            out.append((n, l))
+    return out
+
+
 def run_collection_core(config, nogui=False):
     import csv, io
     alert_lines = []
@@ -250,6 +675,121 @@ def run_collection_core(config, nogui=False):
     alerted_arrays = set()
     alert_counts = {}   # array -> {'info': n, 'warning': n, 'critical': n, 'error': bool}
     array_stats  = []   # list of per-array dicts for Word report
+    hw_by_array  = {}   # array_name -> hardware-health dict (from collect_hw_health)
+    hw_lines     = []   # lines for the top-of-report Hardware Health summary
+    rel_by_array = {}   # array_name -> replication-relationship dict
+    rel_lines    = []   # lines for the bottom-of-report Replication Relationships summary
+
+    # ── Unified array list → per-type buckets ────────────────────────────────
+    # When the config supplies a single ``arrays`` list (new-style, from the
+    # consolidated tksheet), probe each array once via SSH to classify it and
+    # populate arr_fb / arr_faf / arr_fab / loc_fb / loc_faf / loc_fab. Arrays
+    # that turn out to be "No Replication FA" roll into arr_fab so existing
+    # FA-Block-style alert + hardware-health checks still cover them.
+    _unified = config.get('arrays')
+    if _unified is not None:
+        _users = [
+            ('FB',      config.get('user_fb',  'pureuser')),
+            ('FA-File', config.get('user_faf', 'pureuser')),
+            ('FA-Block',config.get('user_fab', 'pureuser')),
+        ]
+        _bfb_a, _bfb_l   = [], []
+        _bfaf_a, _bfaf_l = [], []
+        _bfab_a, _bfab_l = [], []
+        for _name, _loc in parse_unified_arrays(_unified):
+            info = detect_array_type(_name, _users, detailed_logs=detailed_logs,
+                                     nogui=nogui)
+            if info.get('error') and not any((info['is_fb'], info['is_faf'],
+                                              info['is_fab'], info['is_nrp'])):
+                detailed_logs.append(
+                    f"[DETECT] {_name} - classification failed: {info['error']}\n")
+                continue
+            if info['is_fb']:
+                _bfb_a.append(_name);  _bfb_l.append(_loc)
+            if info['is_faf']:
+                _bfaf_a.append(_name); _bfaf_l.append(_loc)
+            if info['is_fab'] or info['is_nrp']:
+                _bfab_a.append(_name); _bfab_l.append(_loc)
+        config['arr_fb']  = _bfb_a;  config['loc_fb']  = _bfb_l
+        config['arr_faf'] = _bfaf_a; config['loc_faf'] = _bfaf_l
+        config['arr_fab'] = _bfab_a; config['loc_fab'] = _bfab_l
+
+    # Array -> location map. Locations are line-aligned with their array lists.
+    # If an FA array appears in both FA-File and FA-Block lists, the first
+    # non-empty entry wins so we don't drop a location because the second list
+    # left that slot blank.
+    def _zip_loc(_arrs, _locs):
+        _out = {}
+        for _idx, _name in enumerate(_arrs):
+            if not _name:
+                continue
+            _loc = _locs[_idx].strip() if _idx < len(_locs) and _locs[_idx] else ''
+            _out[_name] = _loc
+        return _out
+    _loc_by_array = {}
+    for _d in (_zip_loc(config.get('arr_fb',  []), config.get('loc_fb',  [])),
+               _zip_loc(config.get('arr_faf', []), config.get('loc_faf', [])),
+               _zip_loc(config.get('arr_fab', []), config.get('loc_fab', []))):
+        for _k, _v in _d.items():
+            if _k not in _loc_by_array or (not _loc_by_array[_k] and _v):
+                _loc_by_array[_k] = _v
+
+    # ── Hardware health (purehw list) — run once per unique array ────────────
+    # FA-File and FA-Block share the same FlashArray hardware columns, so an
+    # array appearing in both lists is probed just once as platform 'FA'.
+    _hw_targets = []  # ordered list of (array, user, platform)
+    _hw_seen    = set()
+    for _a in config.get('arr_fb', []):
+        if _a and _a not in _hw_seen:
+            _hw_targets.append((_a, config.get('user_fb',  'pureuser'), 'FB'))
+            _hw_seen.add(_a)
+    for _a in config.get('arr_faf', []):
+        if _a and _a not in _hw_seen:
+            _hw_targets.append((_a, config.get('user_faf', 'pureuser'), 'FA'))
+            _hw_seen.add(_a)
+    for _a in config.get('arr_fab', []):
+        if _a and _a not in _hw_seen:
+            _hw_targets.append((_a, config.get('user_fab', 'pureuser'), 'FA'))
+            _hw_seen.add(_a)
+    for _i, (_a, _u, _p) in enumerate(_hw_targets):
+        info = collect_hw_health(_a, _u, _p, detailed_logs, nogui=nogui, idx=_i)
+        hw_by_array[_a] = info
+        if info.get('error'):
+            hw_lines.append(f"{_a} - Hardware Health: Error ({info['error']})")
+        elif info.get('healthy') is True:
+            hw_lines.append(f"{_a} - Hardware Health: Healthy")
+        elif info.get('healthy') is False:
+            _names = [r[0] for r in info['unhealthy_rows'] if r]
+            hw_lines.append(
+                f"{_a} - Hardware Health: Unhealthy "
+                f"({len(info['unhealthy_rows'])} issue(s): {', '.join(_names)})")
+        else:
+            hw_lines.append(f"{_a} - Hardware Health: Unknown (no Status column)")
+
+    # ── Replication relationships — run once per unique array ─────────────────
+    # FB arrays use 'purearray list --connect'; FA arrays (File and Block share
+    # the same connection schema) use 'purearray connection list'. An FA array
+    # appearing in both lists is probed exactly once as platform 'FA'.
+    _fb_arrs = [a for a in config.get('arr_fb', []) if a]
+    _faf_arrs = [a for a in config.get('arr_faf', []) if a]
+    _fab_arrs = [a for a in config.get('arr_fab', []) if a]
+    _fa_arrs  = list(dict.fromkeys(_faf_arrs + _fab_arrs))
+    _rel_targets = []   # ordered list of (array, user, platform, peers)
+    _rel_seen    = set()
+    for _a in _fb_arrs:
+        if _a not in _rel_seen:
+            _rel_targets.append((_a, config.get('user_fb', 'pureuser'), 'FB', _fb_arrs))
+            _rel_seen.add(_a)
+    for _a in _fa_arrs:
+        if _a not in _rel_seen:
+            _user = (config.get('user_faf', 'pureuser') if _a in _faf_arrs
+                     else config.get('user_fab', 'pureuser'))
+            _rel_targets.append((_a, _user, 'FA', _fa_arrs))
+            _rel_seen.add(_a)
+    for _i, (_a, _u, _p, _peers) in enumerate(_rel_targets):
+        info = collect_replication_relationships(
+            _a, _u, _p, detailed_logs, nogui=nogui, idx=_i, peers=_peers)
+        rel_by_array[_a] = info
 
     def _alert_dict(array):
         """Return alert severity fields ready to unpack into array_stats entries."""
@@ -625,8 +1165,55 @@ def run_collection_core(config, nogui=False):
                                 'avg_lag': None, 'max_lag': None,
                                 'repl_details': []})
         repl_lines.append("")
-    final = "=== ALERTS SECTION ===\n" + "\n".join(alert_lines)
+
+    # Attach hardware-health, replication-relationship, and location metadata
+    # to every array_stats entry (an FA array that appears in both FA-File and
+    # FA-Block lists gets the same info on both of its stat entries — each
+    # probe only ran once).
+    for _s in array_stats:
+        _s['hw']  = hw_by_array.get(_s['name'])
+        _s['rel'] = rel_by_array.get(_s['name'])
+        _s['location'] = _loc_by_array.get(_s['name'], '')
+
+    # Build a deduplicated pair list for the Replication Relationships section.
+    def _loc_suffix(_name):
+        _loc = _loc_by_array.get(_name, '')
+        return f", {_loc}" if _loc else ''
+
+    _pair_seen = set()
+    for _a, _info in rel_by_array.items():
+        if _info.get('error'):
+            rel_lines.append(
+                f"{_a} ({_info.get('platform','')}{_loc_suffix(_a)}) "
+                f"- Error: {_info['error']}")
+            continue
+        _plat_a = _info.get('platform', '')
+        for _p in _info.get('partners', []):
+            _b      = _p['remote']
+            _plat_b = rel_by_array.get(_b, {}).get('platform', _plat_a)
+            _key    = tuple(sorted((_a, _b)))
+            if _key in _pair_seen:
+                continue
+            _pair_seen.add(_key)
+            _pa = _plat_a if _key[0] == _a else _plat_b
+            _pb = _plat_b if _key[1] == _b else _plat_a
+            _suffix = ''
+            _st = (_p.get('status') or '').strip()
+            if _st and _st.lower() != 'connected':
+                _suffix = f"  [{_st}]"
+            rel_lines.append(
+                f"{_key[0]} ({_pa}{_loc_suffix(_key[0])}) <-> "
+                f"{_key[1]} ({_pb}{_loc_suffix(_key[1])}){_suffix}")
+    for _a, _info in rel_by_array.items():
+        if _info.get('error') is None and not _info.get('partners'):
+            rel_lines.append(
+                f"{_a} ({_info.get('platform','')}{_loc_suffix(_a)}) "
+                f"- No replication relationships configured")
+
+    final  = "=== HARDWARE HEALTH SECTION ===\n" + "\n".join(hw_lines) + "\n\n"
+    final += "=== ALERTS SECTION ===\n" + "\n".join(alert_lines)
     final += "\n=== REPLICATION SECTION ===\n" + "\n".join(repl_lines)
+    final += "\n\n=== REPLICATION RELATIONSHIPS SECTION ===\n" + "\n".join(rel_lines)
     return final, "\n".join(detailed_logs), array_stats
 
 
@@ -641,14 +1228,22 @@ def build_nogui_header(config):
     header += f"Alert Codes Ignored: {', '.join(config['excluded']) if config['excluded'] else 'None'}\n"
     ignore_source = "Checked" if config['ignore_source_lag'] else "Unchecked"
     header += f"Ignore Source Side Replica Reporting setting: {ignore_source}\n\n"
-    for a in config['arr_fb']:
-        header += f"FB Array - {a}\n"
-    header += "\n"
-    for a in config['arr_faf']:
-        header += f"FA-File Array - {a}\n"
-    header += "\n"
-    for a in config['arr_fab']:
-        header += f"FA-Block Array - {a}\n"
+    # Prefer the unified ``arrays`` list (name, location). When the detection
+    # pass has already populated the per-type buckets, list them by detected
+    # type instead so the summary reflects the post-classification picture.
+    _unified = config.get('arrays')
+    if _unified is not None and not config.get('arr_fb') and not config.get('arr_faf') and not config.get('arr_fab'):
+        for _n, _l in parse_unified_arrays(_unified):
+            header += f"Array - {_n}" + (f"  ({_l})" if _l else "") + "\n"
+    else:
+        for a in config.get('arr_fb', []):
+            header += f"FB Array - {a}\n"
+        header += "\n"
+        for a in config.get('arr_faf', []):
+            header += f"FA-File Array - {a}\n"
+        header += "\n"
+        for a in config.get('arr_fab', []):
+            header += f"FA-Block Array - {a}\n"
     pairs = config.get('replication_pairs', [])
     if pairs:
         header += "\nReplication Pairs:\n"
@@ -667,16 +1262,12 @@ def run_nogui():
     with open(config_path, 'r', encoding='utf-8') as f:
         raw = json.load(f)
 
-    def parse_arr(val):
-        return [x.strip() for x in val.replace('\n', ',').split(',') if x.strip()]
-
+    _arrays = unified_arrays_from_config(raw)
     cfg = {
         'user_fb':  raw.get('user_fb',  'pureuser'),
         'user_faf': raw.get('user_faf', 'pureuser'),
         'user_fab': raw.get('user_fab', 'pureuser'),
-        'arr_fb':   parse_arr(raw.get('fb_arrays',  '')),
-        'arr_faf':  parse_arr(raw.get('faf_arrays', '')),
-        'arr_fab':  parse_arr(raw.get('fab_arrays', '')),
+        'arrays':   [{'name': n, 'location': l} for n, l in _arrays],
         'sla_fb':   parse_time_to_seconds(raw.get('sla_fb',  '1h 30m')),
         'sla_faf':  parse_time_to_seconds(raw.get('sla_faf', '1h')),
         'sla_fab':  parse_time_to_seconds(raw.get('sla_fab', '1h')),
@@ -685,9 +1276,6 @@ def run_nogui():
         'ignore_source_lag': raw.get('ignore_source_lag', False),
         'replication_pairs': raw.get('replication_pairs', []),
     }
-
-    lag_yellow_min = parse_time_to_seconds(raw.get('lag_yellow', '10m')) / 60.0
-    lag_orange_min = parse_time_to_seconds(raw.get('lag_orange', '30m')) / 60.0
 
     print("Running in --nogui mode. Polling arrays...")
     summary, detailed, stats = run_collection_core(cfg, nogui=True)
@@ -750,8 +1338,7 @@ def run_nogui():
 
     # ── Regenerate Array Health History ───────────────────────────────────────
     try:
-        PureMonitorApp._health_history_impl(lag_yellow_min, lag_orange_min,
-                                            open_browser=False)
+        PureMonitorApp._health_history_impl(open_browser=False)
         print("Array Health History updated.")
     except Exception as e:
         print(f"Warning: could not update Array Health History: {e}")
@@ -876,7 +1463,14 @@ def build_status_html(stats, config):
                   (stat.get('avg_lag') is None and stat.get('max_lag') is None))
         key = f"{'FB' if stat['type'] == 'FB' else 'FA'}-{'Red' if is_red else 'Green'}.png"
         b64 = _img_cache.get(key, '')
-        return f'<img src="data:image/png;base64,{b64}" style="width:100%;max-width:96px;">' if b64 else ''
+        if not b64:
+            return ''
+        safe = stat['name'].replace("'", "\\'")
+        return (f'<div style="cursor:pointer;display:inline-block;" '
+                f'onclick="showArrRel(\'{safe}\')" '
+                f'title="Click to view replication relationships">'
+                f'<img src="data:image/png;base64,{b64}" '
+                f'style="width:100%;max-width:96px;display:block;"></div>')
 
     def _make_chart_b64(stat):
         sla_min = (stat['sla_target'] or 0) / 60.0
@@ -929,6 +1523,111 @@ def build_status_html(stats, config):
         }
     _repl_js_str = _json.dumps(_repl_js, ensure_ascii=False).replace('</script>', '<\\/script>')
 
+    # Build per-array hardware-health data for the HW cell modal and the
+    # "All Hardware Issues" panel. Keyed by array name (platform is carried
+    # inside the object so FA-File and FA-Block rows collapse to one entry).
+    _hw_js = {}
+    for stat in stats:
+        _h = stat.get('hw')
+        if not _h:
+            continue
+        _name = _h.get('name') or stat['name']
+        if _name in _hw_js:
+            continue
+        _hw_js[_name] = {
+            'platform':       _h.get('platform', ''),
+            'healthy':        _h.get('healthy'),
+            'error':          _h.get('error'),
+            'header':         _h.get('header', []),
+            'rows':           _h.get('rows', []),
+            'unhealthy_rows': _h.get('unhealthy_rows', []),
+        }
+    _hw_js_str = _json.dumps(_hw_js, ensure_ascii=False).replace('</script>', '<\\/script>')
+
+    # Build the per-array replication-relationship dict for the JS payload.
+    # FA-File and FA-Block stat entries that share an array name collapse to
+    # one entry. Each partner is enriched with the peer's platform + location
+    # when known.
+    _rel_js = {}
+    _platform_lookup = {}
+    _location_lookup = {}
+    for stat in stats:
+        _loc = stat.get('location', '') or ''
+        if stat.get('name') and (_loc or stat['name'] not in _location_lookup):
+            _location_lookup[stat['name']] = _loc
+        _r = stat.get('rel')
+        if _r and _r.get('name'):
+            _platform_lookup[_r['name']] = _r.get('platform', '')
+    for stat in stats:
+        _r = stat.get('rel')
+        if not _r:
+            continue
+        _name = _r.get('name') or stat['name']
+        if _name in _rel_js:
+            continue
+        _parts = []
+        for _p in _r.get('partners', []):
+            _remote = _p.get('remote', '')
+            _parts.append({
+                'remote':    _remote,
+                'platform':  _platform_lookup.get(_remote, _r.get('platform', '')),
+                'location':  _location_lookup.get(_remote, ''),
+                'status':    _p.get('status', ''),
+                'type':      _p.get('type', ''),
+                'mgmt_addr': _p.get('mgmt_addr', ''),
+            })
+        _rel_js[_name] = {
+            'platform': _r.get('platform', ''),
+            'location': _location_lookup.get(_name, ''),
+            'header':   _r.get('header', []),
+            'rows':     _r.get('rows', []),
+            'partners': _parts,
+            'error':    _r.get('error'),
+        }
+    _rel_js_str = _json.dumps(_rel_js, ensure_ascii=False).replace('</script>', '<\\/script>')
+
+    # Deduplicated pair list for the "Show Replication Relationships" panel.
+    # Each entry carries both sides' platform, location, and connection status
+    # so the UI can pick the correct FB/FA green/red image and group by
+    # location without consulting REL_DATA.
+    def _status_of(src_info, tgt_name):
+        for _q in (src_info.get('partners') or []):
+            if _q.get('remote') == tgt_name:
+                return (_q.get('status') or '').strip()
+        return ''
+
+    _raw_pairs = []
+    _pair_seen_ui = set()
+    for _aname, _ainfo in _rel_js.items():
+        for _p in _ainfo.get('partners', []):
+            _bname = _p.get('remote', '')
+            if not _bname:
+                continue
+            _key = tuple(sorted([_aname, _bname]))
+            if _key in _pair_seen_ui:
+                continue
+            _pair_seen_ui.add(_key)
+            _a, _b = _key
+            _a_info = _rel_js.get(_a, {})
+            _b_info = _rel_js.get(_b, {})
+            _raw_pairs.append({
+                'a_name': _a,
+                'a_plat': _a_info.get('platform') or _b_info.get('platform') or 'FA',
+                'a_loc':  _location_lookup.get(_a, ''),
+                'a_status': _status_of(_a_info, _b) or _status_of(_b_info, _a),
+                'b_name': _b,
+                'b_plat': _b_info.get('platform') or _a_info.get('platform') or 'FA',
+                'b_loc':  _location_lookup.get(_b, ''),
+                'b_status': _status_of(_b_info, _a) or _status_of(_a_info, _b),
+            })
+    _raw_pairs.sort(key=lambda _pp: (_pp['a_name'].lower(), _pp['b_name'].lower()))
+    _rel_pairs = align_rel_pairs_by_location(_raw_pairs)
+    _rel_pairs_str = _json.dumps(_rel_pairs, ensure_ascii=False).replace('</script>', '<\\/script>')
+
+    # Status-image base64 map for the JS side (keys without the .png extension).
+    _img_b64_js  = {k.replace('.png', ''): v for k, v in _img_cache.items()}
+    _img_b64_str = _json.dumps(_img_b64_js, ensure_ascii=False).replace('</script>', '<\\/script>')
+
     def _alert_cell(count, sev, array_name):
         """Return a <td> for one severity column. Clickable if count > 0."""
         colors = {'critical': ('#c00000', '#ffd6d6'),
@@ -942,6 +1641,26 @@ def build_status_html(stats, config):
                 f'font-weight:bold;cursor:pointer;" '
                 f'onclick="showAlerts(\'{safe}\',\'{sev}\')" '
                 f'title="Click to view {sev} alerts">{count}</td>')
+
+    def _hw_cell(hw, array_name):
+        """Return a <td> for the Hardware Health column."""
+        if not hw:
+            return '<td style="text-align:center;color:#888;">\u2014</td>'
+        if hw.get('error'):
+            return ('<td style="text-align:center;background:#f5f5f5;color:#888;" '
+                    f'title="{hw["error"]}">Error</td>')
+        if hw.get('healthy') is None:
+            return '<td style="text-align:center;color:#888;">\u2014</td>'
+        safe = array_name.replace("'", "\\'")
+        if hw.get('healthy'):
+            return ('<td style="text-align:center;background:#d4edda;'
+                    'color:#155724;font-weight:bold;cursor:pointer;" '
+                    f'onclick="showHw(\'{safe}\')" '
+                    'title="Click to view full hardware list">Healthy</td>')
+        return ('<td style="text-align:center;background:#ffd6d6;color:#c00000;'
+                'font-weight:bold;cursor:pointer;" '
+                f'onclick="showHw(\'{safe}\')" '
+                'title="Click to view full hardware list">Unhealthy</td>')
 
     # Pre-compute per-stat SLA success counts and overall totals
     _sla_counts = []
@@ -977,9 +1696,10 @@ def build_status_html(stats, config):
                         f'title="Click for 24h replication detail">'
                         f'<img src="data:image/png;base64,{_make_chart_b64(stat)}" style="display:block;">'
                         f'</div>')
-        c_td = _alert_cell(stat.get('critical_alerts', 0), 'critical', stat['name'])
-        w_td = _alert_cell(stat.get('warning_alerts',  0), 'warning',  stat['name'])
-        i_td = _alert_cell(stat.get('info_alerts',     0), 'info',     stat['name'])
+        c_td  = _alert_cell(stat.get('critical_alerts', 0), 'critical', stat['name'])
+        w_td  = _alert_cell(stat.get('warning_alerts',  0), 'warning',  stat['name'])
+        i_td  = _alert_cell(stat.get('info_alerts',     0), 'info',     stat['name'])
+        hw_td = _hw_cell(stat.get('hw'), stat['name'])
         if total > 0:
             rate_pct = ok / total * 100
             r_color  = '#206020' if rate_pct >= 90 else ('#c07000' if rate_pct >= 80 else '#c00000')
@@ -990,11 +1710,16 @@ def build_status_html(stats, config):
         else:
             sla_td  = '<td style="text-align:center;color:#888;">\u2014</td>'
             rate_td = '<td style="text-align:center;color:#888;">\u2014</td>'
+        _loc_txt = stat.get('location', '') or ''
+        _loc_td = (f'<td>{_loc_txt}</td>' if _loc_txt
+                   else '<td style="text-align:center;color:#888;">\u2014</td>')
         rows_html += (f'      <tr>'
                       f'<td style="text-align:center;">{status_td}</td>'
                       f'<td>{stat["name"]}</td>'
+                      f'{_loc_td}'
                       f'<td>{stat["type"]}</td>'
                       f'{c_td}{w_td}{i_td}'
+                      f'{hw_td}'
                       f'<td>{chart_td}</td>'
                       f'{sla_td}{rate_td}'
                       f'</tr>\n')
@@ -1013,9 +1738,10 @@ def build_status_html(stats, config):
     table {{ border-collapse: collapse; width: auto; margin-top: 12px; table-layout: auto; }}
     th, td {{ border: 1px solid #999; padding: 4px 6px; vertical-align: middle; word-wrap: break-word; }}
     th    {{ background: #dce6f1; font-weight: bold; font-size: 10pt; }}
-    col.c0 {{ width: 96px; }} col.c1 {{ width: 144px; }} col.c2 {{ width: 67px; }}
-    col.c3 {{ width: 52px; }} col.c4 {{ width: 52px; }} col.c5 {{ width: 52px; }}
-    col.c7 {{ width: 80px; }} col.c8 {{ width: 80px; }}
+    col.c0  {{ width: 96px; }}  col.c1  {{ width: 144px; }} col.c1a {{ width: 110px; }}
+    col.c2  {{ width: 67px; }}
+    col.c3  {{ width: 52px; }}  col.c4  {{ width: 52px; }}  col.c5  {{ width: 52px; }}
+    col.c6  {{ width: 80px; }}  col.c8  {{ width: 80px; }}  col.c9  {{ width: 80px; }}
     /* SLA summary bar */
     .sla-summary {{ margin: 8px 0 4px; padding: 6px 12px; background: #f0f4fa;
       border: 1px solid #b8cfe8; border-radius: 4px; font-size: 10pt; }}
@@ -1033,6 +1759,29 @@ def build_status_html(stats, config):
     .warning-btn  {{ border-color:#c07000; color:#c07000; }}
     .critical-btn {{ border-color:#c00000; color:#c00000; }}
     .repl-all-btn {{ border-color:#2e6da4; color:#2e6da4; }}
+    .hw-all-btn   {{ border-color:#8a2a2a; color:#8a2a2a; }}
+    .rel-pairs-btn {{ border-color:#2a7a2a; color:#2a7a2a; }}
+    .rel-pairs-bar {{ margin-bottom:4px; }}
+    /* Replication-relationships pair panel */
+    .rel-panel-section {{ margin:12px 0 8px; }}
+    .rel-panel-section h3 {{ margin:0 0 6px; font-size:12pt; font-weight:bold;
+      padding:5px 10px; border-radius:3px; background:#dff0d8; color:#2a7a2a; }}
+    .rel-panel-section table {{ border-collapse:collapse; width:auto; margin-top:4px;
+      table-layout:auto; }}
+    .rel-panel-section td {{ border:1px solid #bbb; padding:6px 10px; vertical-align:middle; }}
+    .rel-pair-row {{ cursor:pointer; transition:background 0.15s; }}
+    .rel-pair-row:hover {{ background:#eef5ff; }}
+    .rel-array-cell {{ text-align:center; min-width:160px; }}
+    .rel-array-cell img {{ display:block; width:64px; height:auto; margin:0 auto 4px; }}
+    .rel-array-loc  {{ font-size:9pt; font-weight:bold; color:#2a5a7a;
+      margin-bottom:3px; text-transform:uppercase; letter-spacing:0.3px; }}
+    .rel-array-loc.empty {{ color:#999; font-weight:normal;
+      font-style:italic; text-transform:none; letter-spacing:0; }}
+    .rel-array-name {{ font-weight:bold; font-size:10pt; }}
+    .rel-array-stat {{ font-size:9pt; color:#555; }}
+    .rel-arrow {{ font-size:22pt; color:#444; text-align:center; min-width:50px; }}
+    .rel-group-hdr td {{ background:#eaf2f8; font-weight:bold; color:#24527a;
+      font-size:10pt; padding:4px 10px; letter-spacing:0.3px; }}
     /* Alert panel (bottom of page) */
     .alert-panel-section {{ margin-top:20px; }}
     .alert-panel-section h3 {{ margin:0 0 6px; font-size:12pt; font-weight:bold;
@@ -1040,7 +1789,26 @@ def build_status_html(stats, config):
     .panel-critical h3 {{ background:#ffd6d6; color:#c00000; }}
     .panel-warning  h3 {{ background:#fff4d6; color:#c07000; }}
     .panel-info     h3 {{ background:#d6eaff; color:#004490; }}
+    .panel-hw       h3 {{ background:#ffd6d6; color:#8a2a2a; }}
     .alert-panel-section table {{ width:100%; }}
+    .hw-panel-section {{ margin-top:20px; }}
+    .hw-panel-section h3 {{ margin:0 0 6px; font-size:12pt; font-weight:bold;
+      padding:5px 10px; border-radius:3px; background:#ffd6d6; color:#8a2a2a; }}
+    .hw-panel-section h4 {{ margin:8px 0 4px; font-size:11pt; }}
+    .hw-panel-section table {{ width:100%; margin-bottom:10px; }}
+    .hw-panel-section td.sev-critical,
+    .hw-panel-section td.sev-warning {{ text-align:center; }}
+    /* HW modal (reuses overlay) */
+    #hw-overlay {{ display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.5); z-index:1000; }}
+    #hw-modal {{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      background:#fff; border-radius:6px; padding:18px 22px; max-width:95vw; max-height:85vh;
+      overflow:auto; box-shadow:0 4px 24px rgba(0,0,0,0.4); min-width:500px; }}
+    #hw-modal h2 {{ margin:0 0 12px; font-size:13pt; color:#8a2a2a; }}
+    #hw-modal table {{ width:100%; margin-top:0; }}
+    #hw-modal th {{ background:#dce6f1; }}
+    #close-hw-modal {{ float:right; cursor:pointer; font-size:16pt; line-height:1;
+      border:none; background:none; color:#555; margin-top:-4px; }}
     /* Alert modal */
     #alert-overlay {{ display:none; position:fixed; top:0; left:0; width:100%; height:100%;
       background:rgba(0,0,0,0.5); z-index:1000; }}
@@ -1066,6 +1834,19 @@ def build_status_html(stats, config):
       border:none; background:none; color:#555; margin-top:-4px; }}
     .repl-ok       {{ background:#e8f5e9; }}
     .repl-exceeded {{ background:#ffd6d6; color:#c00000; font-weight:bold; }}
+    /* Replication-relationships modal */
+    #rel-overlay {{ display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.5); z-index:1000; }}
+    #rel-modal {{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      background:#fff; border-radius:6px; padding:18px 22px; max-width:92vw; max-height:85vh;
+      overflow:auto; box-shadow:0 4px 24px rgba(0,0,0,0.4); min-width:520px; }}
+    #rel-modal h2 {{ margin:0 0 12px; font-size:13pt; color:#2a7a2a; }}
+    #rel-modal h3 {{ margin:12px 0 6px; font-size:11pt; background:#dff0d8;
+      color:#2a7a2a; padding:4px 8px; border-radius:3px; }}
+    #rel-modal table {{ width:100%; margin-top:0; }}
+    #rel-modal th {{ background:#dce6f1; }}
+    #close-rel-modal {{ float:right; cursor:pointer; font-size:16pt; line-height:1;
+      border:none; background:none; color:#555; margin-top:-4px; }}
   </style>
 </head>
 <body>
@@ -1079,6 +1860,11 @@ def build_status_html(stats, config):
   <p class="arrays-heading">Arrays Checked:</p>
   <ul>
 {array_items}  </ul>
+  <div class="filter-bar rel-pairs-bar">
+    <button id="btn-rel-pairs" class="sev-btn rel-pairs-btn" onclick="toggleRelPairs()">Show Replication Relationships</button>
+  </div>
+  <!-- Replication-relationships pair panel (populated by JS when toggled) -->
+  <div id="rel-pairs-panel"></div>
   <div class="filter-bar">
     <span>Alert View:</span>
     <button id="btn-critical" class="sev-btn critical-btn" onclick="toggleSev('critical')">Show Critical</button>
@@ -1088,19 +1874,22 @@ def build_status_html(stats, config):
     <button id="btn-repl-FB"      class="sev-btn repl-all-btn" onclick="toggleReplGroup('FB')">FlashBlade Replication Detail</button>
     <button id="btn-repl-FAFile"  class="sev-btn repl-all-btn" onclick="toggleReplGroup('FA-File')">FlashArray Pod Replication Detail - File</button>
     <button id="btn-repl-FABlock" class="sev-btn repl-all-btn" onclick="toggleReplGroup('FA-Block')">FlashArray Snapshot Replication Detail</button>
+    <span style="border-left:1px solid #ccc;height:20px;margin:0 6px;"></span>
+    <button id="btn-hw-all" class="sev-btn hw-all-btn" onclick="toggleHwAll()">All Hardware Issues</button>
   </div>
 {summary_html}  <table>
     <colgroup>
-      <col class="c0"><col class="c1"><col class="c2">
+      <col class="c0"><col class="c1"><col class="c1a"><col class="c2">
       <col class="c3"><col class="c4"><col class="c5"><col class="c6">
-      <col class="c7"><col class="c8">
+      <col class="c7"><col class="c8"><col class="c9">
     </colgroup>
     <thead>
       <tr>
-        <th>Array Status</th><th>Array Name</th><th>Type</th>
+        <th>Array Status</th><th>Array Name</th><th>Location</th><th>Type</th>
         <th style="color:#c00000;">Critical</th>
         <th style="color:#c07000;">Warning</th>
         <th style="color:#004490;">Info</th>
+        <th style="color:#8a2a2a;">Hardware Health</th>
         <th>Replication Lag vs SLA</th>
         <th>Repl SLA Success</th>
         <th>Repl SLA Success Rate</th>
@@ -1109,6 +1898,9 @@ def build_status_html(stats, config):
     <tbody>
 {rows_html}    </tbody>
   </table>
+
+  <!-- Hardware-issues panel (populated by JS when "All Hardware Issues" is active) -->
+  <div id="hw-panel"></div>
 
   <!-- Severity alert panel (populated by JS when toggle buttons are active) -->
   <div id="alert-panel"></div>
@@ -1136,9 +1928,31 @@ def build_status_html(stats, config):
     </div>
   </div>
 
+  <!-- Hardware-health detail modal -->
+  <div id="hw-overlay" onclick="closeHw()">
+    <div id="hw-modal" onclick="event.stopPropagation()">
+      <button id="close-hw-modal" onclick="closeHw()" title="Close">&times;</button>
+      <h2 id="hw-modal-title">Hardware Issues</h2>
+      <div id="hw-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Replication-relationships detail modal -->
+  <div id="rel-overlay" onclick="closeRelModal()">
+    <div id="rel-modal" onclick="event.stopPropagation()">
+      <button id="close-rel-modal" onclick="closeRelModal()" title="Close">&times;</button>
+      <h2 id="rel-modal-title">Replication Relationship</h2>
+      <div id="rel-modal-body"></div>
+    </div>
+  </div>
+
   <script>
     var ALERT_DATA = {_alert_js_str};
     var REPL_DATA  = {_repl_js_str};
+    var HW_DATA    = {_hw_js_str};
+    var REL_DATA   = {_rel_js_str};
+    var REL_PAIRS  = {_rel_pairs_str};
+    var IMG_B64    = {_img_b64_str};
 
     /* ── Per-type replication detail panels ────────────────────────────── */
     var _replGroupActive = {{ 'FB': false, 'FA-File': false, 'FA-Block': false }};
@@ -1358,8 +2172,291 @@ def build_status_html(stats, config):
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }}
 
+    /* ── Hardware-health modal and "All Hardware Issues" panel ─────────── */
+    function _buildHwTable(header, rows, highlightIdx, unhealthyKeys) {{
+      var h = '<table><thead><tr>';
+      for (var i = 0; i < header.length; i++) h += '<th>' + escHtml(header[i]) + '</th>';
+      h += '</tr></thead><tbody>';
+      for (var r = 0; r < rows.length; r++) {{
+        var isBad = unhealthyKeys && unhealthyKeys[JSON.stringify(rows[r])];
+        h += isBad ? '<tr style="background:#ffecec;">' : '<tr>';
+        for (var c = 0; c < rows[r].length; c++) {{
+          var cell = escHtml(rows[r][c]);
+          if (c === highlightIdx && isBad) {{
+            h += '<td class="sev-critical">' + cell + '</td>';
+          }} else {{
+            h += '<td>' + cell + '</td>';
+          }}
+        }}
+        h += '</tr>';
+      }}
+      h += '</tbody></table>';
+      return h;
+    }}
+
+    function showHw(array) {{
+      var info = HW_DATA[array];
+      if (!info) return;
+      var bad = (info.unhealthy_rows && info.unhealthy_rows.length) || 0;
+      var title = (bad ? 'Hardware Issues \u2014 ' : 'Hardware Status \u2014 ')
+                + array + ' (' + info.platform + ')';
+      if (bad) title += '  \u2014  ' + bad + ' issue' + (bad === 1 ? '' : 's');
+      document.getElementById('hw-modal-title').textContent = title;
+      var body = document.getElementById('hw-modal-body');
+      if (info.error) {{
+        body.innerHTML = '<p><em>Error collecting hardware data: ' + escHtml(info.error) + '</em></p>';
+      }} else if (!info.rows || info.rows.length === 0) {{
+        body.innerHTML = '<p><em>No hardware components reported.</em></p>';
+      }} else {{
+        // Find the Status column index so unhealthy cells are flagged.
+        var si = -1;
+        for (var i = 0; i < info.header.length; i++) {{
+          if (String(info.header[i]).trim().toLowerCase() === 'status') {{ si = i; break; }}
+        }}
+        // Build a lookup of unhealthy rows (JSON-keyed) so the full list can
+        // highlight them while still showing every component from purehw list.
+        var keys = {{}};
+        if (info.unhealthy_rows) {{
+          for (var u = 0; u < info.unhealthy_rows.length; u++) {{
+            keys[JSON.stringify(info.unhealthy_rows[u])] = true;
+          }}
+        }}
+        var intro = bad
+          ? '<p style="margin:0 0 8px;color:#8a2a2a;">'
+            + bad + ' component' + (bad === 1 ? '' : 's') + ' flagged as unhealthy (highlighted below). '
+            + 'Full <code>purehw list</code> output:</p>'
+          : '<p style="margin:0 0 8px;color:#155724;">All components healthy. '
+            + 'Full <code>purehw list</code> output:</p>';
+        body.innerHTML = intro + _buildHwTable(info.header, info.rows, si, keys);
+      }}
+      document.getElementById('hw-overlay').style.display = 'block';
+    }}
+
+    function closeHw() {{
+      document.getElementById('hw-overlay').style.display = 'none';
+    }}
+
+    /* ── Replication-relationships panel + modal ───────────────────────── */
+    var _relPairsActive = false;
+    function toggleRelPairs() {{
+      _relPairsActive = !_relPairsActive;
+      var btn = document.getElementById('btn-rel-pairs');
+      if (_relPairsActive) btn.classList.add('active'); else btn.classList.remove('active');
+      buildRelPanel();
+    }}
+
+    function _relImgTag(plat, status) {{
+      var p = (plat === 'FB') ? 'FB' : 'FA';
+      var s = (String(status || '').trim().toLowerCase() === 'connected') ? 'Green' : 'Red';
+      var b64 = IMG_B64[p + '-' + s] || '';
+      if (!b64) return '';
+      return '<img src="data:image/png;base64,' + b64 + '" alt="' + p + ' ' + s + '">';
+    }}
+
+    function _relLocDiv(loc) {{
+      var t = String(loc || '').trim();
+      if (!t) return '<div class="rel-array-loc empty">(no location)</div>';
+      return '<div class="rel-array-loc">' + escHtml(t) + '</div>';
+    }}
+
+    function _relPairCell(name, plat, status, loc) {{
+      return '<td class="rel-array-cell">'
+        + _relLocDiv(loc)
+        + _relImgTag(plat, status)
+        + '<div class="rel-array-name">' + escHtml(name) + '</div>'
+        + '<div class="rel-array-stat">' + escHtml(status || '(unknown)') + '</div>'
+        + '</td>';
+    }}
+
+    function buildRelPanel() {{
+      var panel = document.getElementById('rel-pairs-panel');
+      if (!_relPairsActive) {{ panel.innerHTML = ''; return; }}
+      if (!REL_PAIRS || REL_PAIRS.length === 0) {{
+        panel.innerHTML = '<div class="rel-panel-section">'
+          + '<h3>Replication Relationships \u2014 None discovered.</h3></div>';
+        return;
+      }}
+      // Group pairs by (a_loc, b_loc) preserving first-seen order so the
+      // alignment seeded server-side is reflected visually.
+      var groupOrder = [];
+      var groups = {{}};
+      for (var i = 0; i < REL_PAIRS.length; i++) {{
+        var p = REL_PAIRS[i];
+        var la = String(p.a_loc || '').trim();
+        var lb = String(p.b_loc || '').trim();
+        var key = la + '\u241F' + lb;
+        if (!groups[key]) {{ groups[key] = {{la: la, lb: lb, items: []}}; groupOrder.push(key); }}
+        groups[key].items.push(i);
+      }}
+      var html = '<div class="rel-panel-section">'
+               + '<h3>Replication Relationships</h3>';
+      for (var g = 0; g < groupOrder.length; g++) {{
+        var grp = groups[groupOrder[g]];
+        var lbl = (grp.la || '(no location)') + '  \u2194  ' + (grp.lb || '(no location)');
+        html += '<table><tbody>'
+             +  '<tr class="rel-group-hdr"><td colspan="3">' + escHtml(lbl) + '</td></tr>';
+        for (var j = 0; j < grp.items.length; j++) {{
+          var idx = grp.items[j];
+          var pp = REL_PAIRS[idx];
+          html += '<tr class="rel-pair-row" onclick="showRelRow(' + idx + ')" '
+               +  'title="Click to view connection-list row detail">'
+               +  _relPairCell(pp.a_name, pp.a_plat, pp.a_status, pp.a_loc)
+               +  '<td class="rel-arrow">\u2194</td>'
+               +  _relPairCell(pp.b_name, pp.b_plat, pp.b_status, pp.b_loc)
+               +  '</tr>';
+        }}
+        html += '</tbody></table>';
+      }}
+      html += '</div>';
+      panel.innerHTML = html;
+    }}
+
+    function _relMatchingRows(arr, remote) {{
+      var info = REL_DATA[arr];
+      if (!info) return {{header: [], rows: []}};
+      var header = info.header || [];
+      var ni = -1;
+      for (var i = 0; i < header.length; i++) {{
+        if (String(header[i]).trim().toLowerCase() === 'name') {{ ni = i; break; }}
+      }}
+      var rows = info.rows || [];
+      if (ni < 0) return {{header: header, rows: rows}};
+      var out = [];
+      for (var r = 0; r < rows.length; r++) {{
+        if (ni < rows[r].length && String(rows[r][ni]).trim() === remote) out.push(rows[r]);
+      }}
+      return {{header: header, rows: out}};
+    }}
+
+    function _relSideTable(title, data) {{
+      var h = '<h3>' + escHtml(title) + '</h3>';
+      if (!data.header.length || !data.rows.length) {{
+        h += '<p><em>No matching row in the connection-list output.</em></p>';
+        return h;
+      }}
+      h += '<table><thead><tr>';
+      for (var i = 0; i < data.header.length; i++) h += '<th>' + escHtml(data.header[i]) + '</th>';
+      h += '</tr></thead><tbody>';
+      for (var r = 0; r < data.rows.length; r++) {{
+        h += '<tr>';
+        for (var c = 0; c < data.rows[r].length; c++) h += '<td>' + escHtml(data.rows[r][c]) + '</td>';
+        h += '</tr>';
+      }}
+      h += '</tbody></table>';
+      return h;
+    }}
+
+    function _relTitleName(name, loc) {{
+      var t = String(loc || '').trim();
+      return t ? (name + ' (' + t + ')') : name;
+    }}
+
+    function showRelRow(idx) {{
+      var p = REL_PAIRS[idx];
+      if (!p) return;
+      document.getElementById('rel-modal-title').textContent =
+        'Replication Relationship \u2014 '
+        + _relTitleName(p.a_name, p.a_loc) + ' \u2194 '
+        + _relTitleName(p.b_name, p.b_loc);
+      var body = _relSideTable(
+        p.a_name + ' (' + p.a_plat + ') \u2014 connection to ' + p.b_name,
+        _relMatchingRows(p.a_name, p.b_name));
+      body += _relSideTable(
+        p.b_name + ' (' + p.b_plat + ') \u2014 connection to ' + p.a_name,
+        _relMatchingRows(p.b_name, p.a_name));
+      document.getElementById('rel-modal-body').innerHTML = body;
+      document.getElementById('rel-overlay').style.display = 'block';
+    }}
+
+    function showArrRel(arr) {{
+      var matches = [];
+      for (var i = 0; i < REL_PAIRS.length; i++) {{
+        if (REL_PAIRS[i].a_name === arr || REL_PAIRS[i].b_name === arr) matches.push(i);
+      }}
+      document.getElementById('rel-modal-title').textContent =
+        'Replication Partners \u2014 ' + arr;
+      var body = document.getElementById('rel-modal-body');
+      if (matches.length === 0) {{
+        body.innerHTML = '<p><em>' + escHtml(arr)
+          + ' has no replication relationships configured.</em></p>';
+        document.getElementById('rel-overlay').style.display = 'block';
+        return;
+      }}
+      var html = '<table><tbody>';
+      for (var m = 0; m < matches.length; m++) {{
+        var p = REL_PAIRS[matches[m]];
+        var local = (p.a_name === arr) ? p
+          : {{a_name: p.b_name, a_plat: p.b_plat, a_status: p.b_status, a_loc: p.b_loc,
+              b_name: p.a_name, b_plat: p.a_plat, b_status: p.a_status, b_loc: p.a_loc}};
+        html += '<tr class="rel-pair-row" onclick="showRelRow(' + matches[m] + ')" '
+             +  'title="Click for connection-list row detail">'
+             +  _relPairCell(local.a_name, local.a_plat, local.a_status, local.a_loc)
+             +  '<td class="rel-arrow">\u2194</td>'
+             +  _relPairCell(local.b_name, local.b_plat, local.b_status, local.b_loc)
+             +  '</tr>';
+      }}
+      html += '</tbody></table>';
+      body.innerHTML = html;
+      document.getElementById('rel-overlay').style.display = 'block';
+    }}
+
+    function closeRelModal() {{
+      document.getElementById('rel-overlay').style.display = 'none';
+    }}
+
+    var _hwAllActive = false;
+    function toggleHwAll() {{
+      _hwAllActive = !_hwAllActive;
+      var btn = document.getElementById('btn-hw-all');
+      if (_hwAllActive) btn.classList.add('active'); else btn.classList.remove('active');
+      buildHwPanel();
+    }}
+
+    function buildHwPanel() {{
+      var panel = document.getElementById('hw-panel');
+      if (!_hwAllActive) {{ panel.innerHTML = ''; return; }}
+      // Group arrays by platform. FA-File and FA-Block share columns so they
+      // go in a single FA table (the HW data itself is de-duped per array).
+      var fb = [], fa = [];
+      var fbHeader = null, faHeader = null;
+      var names = Object.keys(HW_DATA).sort();
+      for (var i = 0; i < names.length; i++) {{
+        var n = names[i];
+        var info = HW_DATA[n];
+        if (!info || !info.unhealthy_rows || info.unhealthy_rows.length === 0) continue;
+        var dest = (info.platform === 'FB') ? fb : fa;
+        if (info.platform === 'FB' && !fbHeader) fbHeader = info.header;
+        if (info.platform !== 'FB' && !faHeader) faHeader = info.header;
+        for (var r = 0; r < info.unhealthy_rows.length; r++) {{
+          // Prepend array name so the combined table shows which array each row came from
+          dest.push([n].concat(info.unhealthy_rows[r]));
+        }}
+      }}
+      var html = '<div class="hw-panel-section"><h3>All Hardware Issues</h3>';
+      if (fbHeader && fb.length > 0) {{
+        // Find Status column index after prepending 'Array' header
+        var si = -1;
+        for (var i = 0; i < fbHeader.length; i++) {{
+          if (String(fbHeader[i]).trim().toLowerCase() === 'status') {{ si = i + 1; break; }}
+        }}
+        html += '<h4>FlashBlade</h4>' + _buildHwTable(['Array'].concat(fbHeader), fb, si);
+      }}
+      if (faHeader && fa.length > 0) {{
+        var si = -1;
+        for (var i = 0; i < faHeader.length; i++) {{
+          if (String(faHeader[i]).trim().toLowerCase() === 'status') {{ si = i + 1; break; }}
+        }}
+        html += '<h4>FlashArray (File &amp; Block)</h4>' + _buildHwTable(['Array'].concat(faHeader), fa, si);
+      }}
+      if ((!fbHeader || fb.length === 0) && (!faHeader || fa.length === 0)) {{
+        html += '<p><em>No unhealthy hardware components reported across any array.</em></p>';
+      }}
+      html += '</div>';
+      panel.innerHTML = html;
+    }}
+
     document.addEventListener('keydown', function(e) {{
-      if (e.key === 'Escape') {{ closeAlerts(); closeRepl(); }}
+      if (e.key === 'Escape') {{ closeAlerts(); closeRepl(); closeHw(); }}
     }});
   </script>
 </body>
@@ -1414,6 +2511,80 @@ class PureMonitorApp(tk.Tk):
 
         widget.bind("<Button-3>", _show_menu)
         widget.bind("<Control-a>", _ctrl_a)
+
+    def _build_arrays_sheet(self, parent, config):
+        """Build the unified Arrays/Location editor, spanning rows 4-6, cols 1-2.
+
+        Uses ``tksheet`` when available; otherwise falls back to a simple two-
+        column Treeview-based editor so the app still runs without tksheet.
+        """
+        rows = [[n, l] for n, l in unified_arrays_from_config(config)]
+        # Always show at least one blank row for easy first-time editing.
+        if not rows:
+            rows = [['', '']]
+
+        sheet_frame = ttk.Frame(parent)
+        sheet_frame.grid(row=4, column=1, columnspan=2, rowspan=3,
+                         sticky=tk.NSEW, padx=(0, 0), pady=2)
+
+        if HAS_TKSHEET:
+            self.arrays_sheet = Sheet(
+                sheet_frame,
+                headers=["Array", "Location"],
+                data=rows,
+                width=360, height=110,
+                show_row_index=False,
+                show_top_left=False,
+                show_x_scrollbar=False,
+            )
+            self.arrays_sheet.enable_bindings((
+                "single_select", "row_select", "column_select", "arrowkeys",
+                "right_click_popup_menu", "rc_insert_row", "rc_delete_row",
+                "copy", "cut", "paste", "delete", "undo", "edit_cell",
+            ))
+            try:
+                self.arrays_sheet.column_width(column=0, width=180)
+                self.arrays_sheet.column_width(column=1, width=170)
+            except Exception:
+                pass
+            self.arrays_sheet.pack(fill=tk.BOTH, expand=True)
+        else:
+            # Fallback: two synced text boxes. Keeps the app usable without
+            # tksheet (diagnostics prompt shown at run time).
+            self.arrays_sheet = None
+            self._fallback_arr_txt = scrolledtext.ScrolledText(sheet_frame, width=30, height=6)
+            self._fallback_loc_txt = scrolledtext.ScrolledText(sheet_frame, width=20, height=6)
+            self._fallback_arr_txt.pack(side=tk.LEFT, fill=tk.Y)
+            self._fallback_loc_txt.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
+            self._fallback_arr_txt.insert(tk.END, "\n".join(r[0] for r in rows))
+            self._fallback_loc_txt.insert(tk.END, "\n".join(r[1] for r in rows))
+            self._add_context_menu(self._fallback_arr_txt)
+            self._add_context_menu(self._fallback_loc_txt)
+
+    def _get_arrays_from_sheet(self):
+        """Return [(name, location), ...] from the unified sheet editor.
+
+        Drops rows whose name is blank after whitespace trimming.
+        """
+        out = []
+        if getattr(self, 'arrays_sheet', None) is not None:
+            try:
+                data = self.arrays_sheet.get_sheet_data() or []
+            except Exception:
+                data = []
+            for row in data:
+                if not row:
+                    continue
+                name = str(row[0] if len(row) > 0 else '').strip()
+                if not name:
+                    continue
+                loc = str(row[1] if len(row) > 1 else '').strip()
+                out.append((name, loc))
+            return out
+        # Fallback path
+        arr_txt = self._fallback_arr_txt.get("1.0", tk.END) if hasattr(self, '_fallback_arr_txt') else ''
+        loc_txt = self._fallback_loc_txt.get("1.0", tk.END) if hasattr(self, '_fallback_loc_txt') else ''
+        return list(zip(*parse_arr_loc(arr_txt, loc_txt)))
 
     def _setup_ui(self):
         config = self._load_config()
@@ -1479,63 +2650,26 @@ class PureMonitorApp(tk.Tk):
         self.user_fab_entry.insert(0, config.get("user_fab", config.get("user", "pureuser")))
         self.user_fab_entry.grid(row=2, column=1, sticky=tk.W, pady=2)
 
-        # Row 3: Excluded Alerts
+        # Row 3: Excluded Alerts (column 1)
         ttk.Label(config_frame, text="Excluded Alerts (Partial Match or ID Range):", wraplength=120, justify=tk.LEFT).grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.alerts_entry = scrolledtext.ScrolledText(config_frame, width=40, height=3)
+        self.alerts_entry = scrolledtext.ScrolledText(config_frame, width=30, height=3)
         self.alerts_entry.insert(tk.END, config.get("alerts_excluded", DEFAULT_EXCLUDED_ALERTS))
-        # Reduced columnspan from 5 to 2 to make room for SLA header on the right
-        self.alerts_entry.grid(row=3, column=1, columnspan=2, sticky=tk.W, pady=2)
+        self.alerts_entry.grid(row=3, column=1, sticky=tk.W, pady=2)
 
-        # SLA Section Header
-        ttk.Label(config_frame, text="Replication Lag Thresholds", font=("Segoe UI", 9, "bold")).grid(row=3, column=3, columnspan=2, sticky=tk.S, pady=(0, 2))
+        # Rows 4-6: unified Arrays / Location sheet on the left, SLA entries on the right
+        ttk.Label(config_frame, text="Arrays:", wraplength=WL, justify=tk.LEFT).grid(row=4, column=0, sticky=tk.NW, pady=2)
+        self._build_arrays_sheet(config_frame, config)
 
-        # HTML Report - Replication Lag Threshold Section Header
-        ttk.Label(config_frame, text="HTML Report - Replication Lag Thresholds:", font=("Segoe UI", 9, "bold")).grid(row=3, column=5, columnspan=2, sticky=tk.S, pady=(0, 2))
-
-        # Row 4: FB Arrays
-        ttk.Label(config_frame, text="FB Arrays:", wraplength=WL, justify=tk.LEFT).grid(row=4, column=0, sticky=tk.NW, pady=2)
-        self.fb_arr_entry = scrolledtext.ScrolledText(config_frame, width=40, height=4)
-        self.fb_arr_entry.insert(tk.END, config.get("fb_arrays", DEFAULT_FB_ARRAYS))
-        self.fb_arr_entry.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=2)
-        self._add_context_menu(self.fb_arr_entry)
-        
-        # SLA labels in column 3, entry boxes in column 4 to prevent overlap
         ttk.Label(config_frame, text="SLA FB:", justify=tk.LEFT).grid(row=4, column=3, sticky=tk.W, padx=(10, 5), pady=2)
         self.sla_fb_entry = ttk.Entry(config_frame, width=10)
         self.sla_fb_entry.insert(0, config.get("sla_fb", "1h 30m"))
         self.sla_fb_entry.grid(row=4, column=4, sticky=tk.W, padx=(5, 10), pady=2)
 
-        # Lag threshold: Yellow
-        ttk.Label(config_frame, text="Yellow above:", justify=tk.LEFT).grid(row=4, column=5, sticky=tk.W, padx=(10, 5), pady=2)
-        self.lag_yellow_entry = ttk.Entry(config_frame, width=10)
-        self.lag_yellow_entry.insert(0, config.get("lag_yellow", "10m"))
-        self.lag_yellow_entry.grid(row=4, column=6, sticky=tk.W, padx=(5, 10), pady=2)
-
-        # Row 5: FA-File Arrays
-        ttk.Label(config_frame, text="FA-File Arrays:", wraplength=WL, justify=tk.LEFT).grid(row=5, column=0, sticky=tk.NW, pady=2)
-        self.faf_arr_entry = scrolledtext.ScrolledText(config_frame, width=40, height=4)
-        self.faf_arr_entry.insert(tk.END, config.get("faf_arrays", DEFAULT_FA_FILE_ARRAYS))
-        self.faf_arr_entry.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=2)
-        self._add_context_menu(self.faf_arr_entry)
-        
         ttk.Label(config_frame, text="SLA FA-File:", justify=tk.LEFT).grid(row=5, column=3, sticky=tk.W, padx=(10, 5), pady=2)
         self.sla_faf_entry = ttk.Entry(config_frame, width=10)
         self.sla_faf_entry.insert(0, config.get("sla_faf", "1h"))
         self.sla_faf_entry.grid(row=5, column=4, sticky=tk.W, padx=(5, 10), pady=2)
 
-        # Lag threshold: Orange
-        ttk.Label(config_frame, text="Orange above:", justify=tk.LEFT).grid(row=5, column=5, sticky=tk.W, padx=(10, 5), pady=2)
-        self.lag_orange_entry = ttk.Entry(config_frame, width=10)
-        self.lag_orange_entry.insert(0, config.get("lag_orange", "30m"))
-        self.lag_orange_entry.grid(row=5, column=6, sticky=tk.W, padx=(5, 10), pady=2)
-
-        # Row 6: FA-Block Arrays
-        ttk.Label(config_frame, text="FA-Block Arrays:", wraplength=WL, justify=tk.LEFT).grid(row=6, column=0, sticky=tk.NW, pady=2)
-        self.fab_arr_entry = scrolledtext.ScrolledText(config_frame, width=40, height=4)
-        self.fab_arr_entry.insert(tk.END, config.get("fab_arrays", DEFAULT_FA_BLOCK_ARRAYS))
-        self.fab_arr_entry.grid(row=6, column=1, columnspan=2, sticky=tk.W, pady=2)
-        self._add_context_menu(self.fab_arr_entry)
-        
         ttk.Label(config_frame, text="SLA FA-Block:", justify=tk.LEFT).grid(row=6, column=3, sticky=tk.W, padx=(10, 5), pady=2)
         self.sla_fab_entry = ttk.Entry(config_frame, width=10)
         self.sla_fab_entry.insert(0, config.get("sla_fab", "1h"))
@@ -1613,19 +2747,16 @@ class PureMonitorApp(tk.Tk):
         return {}
 
     def _save_config(self):
+        arrays = [{"name": n, "location": l} for n, l in self._get_arrays_from_sheet()]
         data = {
             "user_fb": self.user_fb_entry.get().strip(),
             "user_faf": self.user_faf_entry.get().strip(),
             "user_fab": self.user_fab_entry.get().strip(),
             "alerts_excluded": self.alerts_entry.get("1.0", tk.END).strip(),
-            "fb_arrays": self.fb_arr_entry.get("1.0", tk.END).strip(),
-            "faf_arrays": self.faf_arr_entry.get("1.0", tk.END).strip(),
-            "fab_arrays": self.fab_arr_entry.get("1.0", tk.END).strip(),
+            "arrays": arrays,
             "sla_fb": self.sla_fb_entry.get().strip(),
             "sla_faf": self.sla_faf_entry.get().strip(),
             "sla_fab": self.sla_fab_entry.get().strip(),
-            "lag_yellow": self.lag_yellow_entry.get().strip(),
-            "lag_orange": self.lag_orange_entry.get().strip(),
             "ignore_source_lag": self.ignore_source_lag_var.get(),
             "smtp_server": self._smtp_server,
             "smtp_port":   self._smtp_port,
@@ -1648,11 +2779,11 @@ class PureMonitorApp(tk.Tk):
         import time
         tz = time.tzname[time.daylight]
         now = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p")
-        
+
         fb_sec = parse_time_to_seconds(self.sla_fb_entry.get())
         faf_sec = parse_time_to_seconds(self.sla_faf_entry.get())
         fab_sec = parse_time_to_seconds(self.sla_fab_entry.get())
-        
+
         header = f"Output from Report run on {now} {tz}\n"
         header += f"Defined Replication SLA for SLA FB: {format_seconds_human(fb_sec)}\n"
         header += f"Defined Replication SLA for SLA FA-File: {format_seconds_human(faf_sec)}\n"
@@ -1663,21 +2794,22 @@ class PureMonitorApp(tk.Tk):
 
         ignore_source = "Checked" if self.ignore_source_lag_var.get() else "Unchecked"
         header += f"Ignore Source Side Replica Reporting setting: {ignore_source}\n\n"
-        
-        # Add array lists
-        fb_list = [x.strip() for x in self.fb_arr_entry.get("1.0", tk.END).replace('\n', ',').split(',') if x.strip()]
-        for a in fb_list:
-            header += f"FB Array - {a}\n"
-        header += "\n"
-            
-        faf_list = [x.strip() for x in self.faf_arr_entry.get("1.0", tk.END).replace('\n', ',').split(',') if x.strip()]
-        for a in faf_list:
-            header += f"FA-File Array - {a}\n"
-        header += "\n"
-            
-        fab_list = [x.strip() for x in self.fab_arr_entry.get("1.0", tk.END).replace('\n', ',').split(',') if x.strip()]
-        for a in fab_list:
-            header += f"FA-Block Array - {a}\n"
+
+        # Array list: if a run has completed, list by detected type buckets;
+        # otherwise fall back to the unified sheet entries (type unknown).
+        _last = getattr(self, '_last_cfg', None) or {}
+        if _last.get('arr_fb') or _last.get('arr_faf') or _last.get('arr_fab'):
+            for a in _last.get('arr_fb', []):
+                header += f"FB Array - {a}\n"
+            header += "\n"
+            for a in _last.get('arr_faf', []):
+                header += f"FA-File Array - {a}\n"
+            header += "\n"
+            for a in _last.get('arr_fab', []):
+                header += f"FA-Block Array - {a}\n"
+        else:
+            for n, l in self._get_arrays_from_sheet():
+                header += f"Array - {n}" + (f"  ({l})" if l else "") + "\n"
 
         pairs = self.config_data.get('replication_pairs', [])
         if pairs:
@@ -1720,13 +2852,14 @@ class PureMonitorApp(tk.Tk):
         self.run_btn.config(state=tk.DISABLED)
         self.text_out.delete("1.0", tk.END)
         self.text_out.insert(tk.END, "Polling arrays... Please wait.\n\n")
+        # Unified arrays list (name, location). SSH-based classification happens
+        # inside run_collection_core, which fans out arr_fb/arr_faf/arr_fab.
+        _arrays = [{'name': n, 'location': l} for n, l in self._get_arrays_from_sheet()]
         cfg = {
             'user_fb': self.user_fb_entry.get().strip(),
             'user_faf': self.user_faf_entry.get().strip(),
             'user_fab': self.user_fab_entry.get().strip(),
-            'arr_fb': [x.strip() for x in self.fb_arr_entry.get("1.0", tk.END).replace('\n', ',').split(',') if x.strip()],
-            'arr_faf': [x.strip() for x in self.faf_arr_entry.get("1.0", tk.END).replace('\n', ',').split(',') if x.strip()],
-            'arr_fab': [x.strip() for x in self.fab_arr_entry.get("1.0", tk.END).replace('\n', ',').split(',') if x.strip()],
+            'arrays': _arrays,
             'sla_fb': parse_time_to_seconds(self.sla_fb_entry.get()),
             'sla_faf': parse_time_to_seconds(self.sla_faf_entry.get()),
             'sla_fab': parse_time_to_seconds(self.sla_fab_entry.get()),
@@ -1737,6 +2870,9 @@ class PureMonitorApp(tk.Tk):
 
     def _run_collection(self, config):
         final, detailed, stats = run_collection_core(config, nogui=False)
+        # Stash the post-classification config so _auto_save_reports can reuse
+        # the populated arr_fb / arr_faf / arr_fab buckets when building HTML.
+        self._last_cfg = config
         self.after(0, lambda: self._update_gui(final, detailed, stats))
 
 
@@ -1801,15 +2937,16 @@ class PureMonitorApp(tk.Tk):
 
         # HTML daily report
         try:
+            _last = getattr(self, '_last_cfg', None) or {}
             cfg = {
                 'sla_fb':          fb_sec,
                 'sla_faf':         faf_sec,
                 'sla_fab':         fab_sec,
                 'excluded':        excluded,
                 'ignore_source_lag': self.ignore_source_lag_var.get(),
-                'arr_fb':  [x.strip() for x in self.fb_arr_entry.get("1.0",  tk.END).replace('\n', ',').split(',') if x.strip()],
-                'arr_faf': [x.strip() for x in self.faf_arr_entry.get("1.0", tk.END).replace('\n', ',').split(',') if x.strip()],
-                'arr_fab': [x.strip() for x in self.fab_arr_entry.get("1.0", tk.END).replace('\n', ',').split(',') if x.strip()],
+                'arr_fb':  list(_last.get('arr_fb',  [])),
+                'arr_faf': list(_last.get('arr_faf', [])),
+                'arr_fab': list(_last.get('arr_fab', [])),
             }
             html = build_status_html(stats, cfg)
             path = os.path.join(dir_daily, f"Pure Array Report {date_str}.html")
@@ -1956,16 +3093,12 @@ class PureMonitorApp(tk.Tk):
         self._open_daily_report()
 
     def _show_health_history(self):
-        lag_yellow_min = parse_time_to_seconds(self.lag_yellow_entry.get().strip() or "10m") / 60.0
-        lag_orange_min = parse_time_to_seconds(self.lag_orange_entry.get().strip() or "30m") / 60.0
-        self._health_history_impl(lag_yellow_min, lag_orange_min,
-                                  open_browser=True,
+        self._health_history_impl(open_browser=True,
                                   _warn=messagebox.showwarning,
                                   _error=messagebox.showerror)
 
     @staticmethod
-    def _health_history_impl(lag_yellow_min, lag_orange_min, open_browser=True,
-                             _warn=None, _error=None):
+    def _health_history_impl(open_browser=True, _warn=None, _error=None):
         if _warn  is None: _warn  = lambda t, m: print(f"Warning: {m}")
         if _error is None: _error = lambda t, m: print(f"Error: {m}")
         import csv as _csv
@@ -1998,6 +3131,9 @@ class PureMonitorApp(tk.Tk):
         daily_sla  = {d: {a: 0    for a in arrays_set} for d in dates_set}
         daily_alrt = {d: {a: {'i': 0, 'w': 0, 'c': 0} for a in arrays_set} for d in dates_set}
         daily_lag  = {d: {a: None for a in arrays_set} for d in dates_set}
+        # SLA target (minutes) recorded per day/array — may vary over time as
+        # the user updates SLA values in the config.
+        daily_sla_target = {d: {a: None for a in arrays_set} for d in dates_set}
         for r in rows:
             d, a = r['timestamp'][:10], r['array_name']
             if r.get('sla_violated', '').strip().lower() == 'true':
@@ -2014,6 +3150,31 @@ class PureMonitorApp(tk.Tk):
                     daily_lag[d][a] = float(lag_str) / 60.0   # store as minutes
                 except ValueError:
                     pass
+            sla_str = r.get('sla_target_sec', '').strip()
+            if sla_str:
+                try:
+                    daily_sla_target[d][a] = float(sla_str) / 60.0   # minutes
+                except ValueError:
+                    pass
+
+        # Fill forward missing per-array SLA targets so every (d, a) cell
+        # has a threshold to compare against (uses the most recent value
+        # seen for that array; arrays with no SLA anywhere get None).
+        for a in arrays_set:
+            last = None
+            for d in dates_set:
+                v = daily_sla_target[d][a]
+                if v is not None:
+                    last = v
+                elif last is not None:
+                    daily_sla_target[d][a] = last
+            # Backfill leading gaps with the first non-None value.
+            first = next((daily_sla_target[d][a] for d in dates_set
+                          if daily_sla_target[d][a] is not None), None)
+            if first is not None:
+                for d in dates_set:
+                    if daily_sla_target[d][a] is None:
+                        daily_sla_target[d][a] = first
 
         # ── Group into periods ────────────────────────────────────────────────
         # Each period: (label, x_labels, sla_data, alert_data)
@@ -2095,28 +3256,80 @@ class PureMonitorApp(tk.Tk):
             return base64.b64encode(buf.read()).decode('ascii')
 
         def _lag_line_b64(period_dates, x_labels, arr_daily_lag, title,
-                          yellow_min=10.0, orange_min=30.0):
-            """Line chart of avg lag in minutes for one array over a period."""
+                          sla_min=None):
+            """Line chart of avg lag in minutes for one array over a period.
+
+            Bands and threshold lines are drawn relative to the array's own
+            SLA target, which may vary day-to-day: green 0–50% of SLA,
+            yellow 50–100%, orange/red above SLA. *sla_min* accepts either a
+            scalar (legacy, constant SLA) or a list of per-x-point values in
+            minutes (None entries are forward/backward filled from nearest
+            known day). If no SLA data is available the chart is rendered
+            without bands.
+            """
             n     = len(period_dates)
             y_raw = [arr_daily_lag.get(d) for d in period_dates]
             y     = [v if v is not None else float('nan') for v in y_raw]
             y_fin = [v for v in y_raw if v is not None]
-            y_max = max(max(y_fin) * 1.15, orange_min * 1.2) if y_fin else orange_min * 1.2
+
+            # Normalise sla_min into a per-point list of length n.
+            if isinstance(sla_min, (list, tuple)):
+                sla_list = list(sla_min) + [None] * max(0, n - len(sla_min))
+                sla_list = sla_list[:n]
+            elif sla_min is None:
+                sla_list = [None] * n
+            else:
+                sla_list = [sla_min] * n
+            # Forward-fill then backward-fill Nones so every point has a value
+            # if at least one day carries an SLA. This lets the bands step on
+            # SLA-change days without opening gaps before the first sample.
+            _last = None
+            for _i in range(n):
+                if sla_list[_i] is not None and sla_list[_i] > 0:
+                    _last = sla_list[_i]
+                else:
+                    sla_list[_i] = _last
+            _last = None
+            for _i in range(n - 1, -1, -1):
+                if sla_list[_i] is not None and sla_list[_i] > 0:
+                    _last = sla_list[_i]
+                else:
+                    sla_list[_i] = _last
+            have_sla = any(s is not None and s > 0 for s in sla_list)
+            sla_valid = [s for s in sla_list if s is not None and s > 0]
+            ref   = max(sla_valid) if have_sla else (max(y_fin) if y_fin else 1.0)
+            y_max = max((max(y_fin) * 1.15) if y_fin else 0.0, ref * 1.2)
 
             fig, ax = plt.subplots(figsize=(max(8, n * 0.6), 4.5))
             x = np.arange(n)
 
-            # Colour-banded background
-            ax.axhspan(0,          yellow_min, alpha=0.10, color='#28a745', zorder=0)
-            ax.axhspan(yellow_min, orange_min, alpha=0.10, color='#ffc107', zorder=0)
-            ax.axhspan(orange_min, y_max,      alpha=0.10, color='#fd7e14', zorder=0)
+            # Colour-banded background — steps per-day so historical points
+            # are judged against the SLA that was in effect that day.
+            if have_sla:
+                sla_arr    = np.array([s if s is not None else 0.0 for s in sla_list], dtype=float)
+                yellow_arr = sla_arr * 0.5
+                orange_arr = sla_arr
+                top_arr    = np.full_like(sla_arr, y_max)
+                ax.fill_between(x, 0,          yellow_arr, step='mid',
+                                alpha=0.10, color='#28a745', zorder=0, linewidth=0)
+                ax.fill_between(x, yellow_arr, orange_arr, step='mid',
+                                alpha=0.10, color='#ffc107', zorder=0, linewidth=0)
+                ax.fill_between(x, orange_arr, top_arr,    step='mid',
+                                alpha=0.10, color='#fd7e14', zorder=0, linewidth=0)
             ax.set_ylim(0, y_max)
 
-            # Threshold dashed lines
-            ax.axhline(yellow_min, color='#856404', linestyle='--', linewidth=1,
-                       alpha=0.75, label=f'{yellow_min:g} min (yellow)')
-            ax.axhline(orange_min, color='#7a3500', linestyle='--', linewidth=1,
-                       alpha=0.75, label=f'{orange_min:g} min (orange)')
+            # Threshold step-lines (dashed). Labels describe the relative
+            # thresholds; the actual values move with the SLA each day.
+            if have_sla:
+                _legend_suffix = ''
+                if len(set(sla_valid)) == 1:
+                    _legend_suffix = f' ({sla_valid[0]:g} min)'
+                ax.step(x, yellow_arr, where='mid', color='#856404',
+                        linestyle='--', linewidth=1,   alpha=0.75,
+                        label=f'50% of SLA{_legend_suffix}', zorder=2)
+                ax.step(x, orange_arr, where='mid', color='#7a3500',
+                        linestyle='--', linewidth=1.4, alpha=0.85,
+                        label=f'SLA limit{_legend_suffix}', zorder=2)
 
             # Data line
             ax.plot(x, y, color='#2E4D8C', linewidth=2,
@@ -2154,11 +3367,13 @@ class PureMonitorApp(tk.Tk):
             _rows_by_month.setdefault(_mk, []).append(_r)
 
         def _period_hash(period_dates):
-            """Hash the CSV data + thresholds for a period to detect changes."""
+            """Hash the CSV data for a period to detect changes. Thresholds are
+            now derived from each row's sla_target_sec, so hashing the rows
+            alone captures any threshold change."""
             _mk  = period_dates[0][:7] if period_dates else ''
             _mrs = sorted(_rows_by_month.get(_mk, []),
                           key=lambda r: (r['timestamp'], r['array_name']))
-            _raw = json.dumps(_mrs, sort_keys=True) + f"|{lag_yellow_min}|{lag_orange_min}"
+            _raw = json.dumps(_mrs, sort_keys=True)
             return hashlib.md5(_raw.encode()).hexdigest()
 
         # ── Generate one chart-set per period (SLA + 4 alert severity combos) ─
@@ -2195,10 +3410,14 @@ class PureMonitorApp(tk.Tk):
                                      f"Alerts – {pt}", False, False)
                 _arr = {}
                 for a in arrays_set:
+                    # Pass the per-day SLA list so the bands and threshold
+                    # step-lines move with the SLA each day. The cache key
+                    # already changes if any SLA value in the CSV changes.
+                    _sla_list = [daily_sla_target[d][a] for d in period_dates]
                     _arr[a] = _lag_line_b64(
                         period_dates, x_labels, {d: daily_lag[d][a] for d in period_dates},
                         f"{a}  \u2013  {pt}  Avg Replication Lag",
-                        lag_yellow_min, lag_orange_min)
+                        sla_min=_sla_list)
                 sla_charts.append(_sla)
                 alrt_ii.append(_aii); alrt_ic.append(_aic)
                 alrt_wc.append(_awc); alrt_c.append(_ac)
@@ -2219,8 +3438,11 @@ class PureMonitorApp(tk.Tk):
             pass   # cache write failure is non-fatal
 
         # ── Calendar day-status data (monthly mode only) ─────────────────────
+        # Each lag cell carries both the avg-lag (m) and the SLA target (s)
+        # in minutes so the JS can colour cells relative to that day's own
+        # SLA — < 50% green, 50–100% yellow, > 100% orange.
         cal_data     = {}
-        lag_cal_data = {}   # {label: {array: {day_key: minutes_float}}}
+        lag_cal_data = {}   # {label: {array: {day_key: {"m": mins, "s": sla}}}}
         if use_months:
             for label, period_dates, x_labels, sla_agg, alrt_agg in periods:
                 day_map = {}
@@ -2238,8 +3460,13 @@ class PureMonitorApp(tk.Tk):
                     day_lag = {}
                     for d, xl in zip(period_dates, x_labels):
                         v = daily_lag[d][a]
-                        if v is not None:
-                            day_lag[xl] = round(v, 1)  # minutes, 1 decimal
+                        if v is None:
+                            continue
+                        s = daily_sla_target[d][a]
+                        cell = {"m": round(v, 1)}
+                        if s is not None:
+                            cell["s"] = round(s, 1)
+                        day_lag[xl] = cell
                     arr_lag[a] = day_lag
                 lag_cal_data[label] = arr_lag
 
@@ -2255,8 +3482,6 @@ class PureMonitorApp(tk.Tk):
         js_lag_cal     = json.dumps(lag_cal_data)
         js_lag_charts  = json.dumps(lag_charts)
         js_array_names = json.dumps(sorted(arrays_set))
-        js_lag_yellow  = round(lag_yellow_min, 4)
-        js_lag_orange  = round(lag_orange_min, 4)
         nav_note       = ("Grouped by month &mdash; use arrows to navigate"
                           if use_months else "Showing all days")
 
@@ -2406,8 +3631,6 @@ class PureMonitorApp(tk.Tk):
     var LAG_CAL_DATA = {js_lag_cal};
     var LAG_CHARTS      = {js_lag_charts};
     var ARRAY_NAMES     = {js_array_names};
-    var LAG_YELLOW_MIN  = {js_lag_yellow};
-    var LAG_ORANGE_MIN  = {js_lag_orange};
     var idx          = 0;
 
     var MONTH_NAMES = ['January','February','March','April','May','June',
@@ -2525,10 +3748,13 @@ class PureMonitorApp(tk.Tk):
       var firstDay    = new Date(yr, mi, 1).getDay();
       var daysInMonth = new Date(yr, mi + 1, 0).getDate();
       var monthData   = LAG_CAL_DATA[label] || {{}};
+      // Cells are colour-banded relative to each day's own SLA target
+      // (stored on the cell as .s). When no SLA is available we fall back
+      // to marking the day "No Data".
       var lagLegend   =
-          '<span><span class="leg-swatch" style="background:#d4edda;"></span>&lt;' + LAG_YELLOW_MIN + ' min</span>'
-        + '<span><span class="leg-swatch" style="background:#fff9c4;"></span>' + LAG_YELLOW_MIN + '&ndash;' + LAG_ORANGE_MIN + ' min</span>'
-        + '<span><span class="leg-swatch" style="background:#ffe0b2;"></span>&gt;' + LAG_ORANGE_MIN + ' min</span>'
+          '<span><span class="leg-swatch" style="background:#d4edda;"></span>&lt; 50% of SLA</span>'
+        + '<span><span class="leg-swatch" style="background:#fff9c4;"></span>50&ndash;100% of SLA</span>'
+        + '<span><span class="leg-swatch" style="background:#ffe0b2;"></span>&gt; SLA</span>'
         + '<span><span class="leg-swatch" style="background:#f5f5f5;border:1px solid #ccc;"></span>No Data</span>';
       var html = '';
       for (var ai = 0; ai < ARRAY_NAMES.length; ai++) {{
@@ -2536,15 +3762,19 @@ class PureMonitorApp(tk.Tk):
         var lagData = monthData[arr] || {{}};
         var calHtml = buildCal(
           firstDay, daysInMonth, lagData,
-          function(mins) {{
-            if (mins === undefined || mins === null) return 'cal-nodata';
-            if (mins < LAG_YELLOW_MIN)  return 'cal-lag-green';
-            if (mins < LAG_ORANGE_MIN)  return 'cal-lag-yellow';
+          function(cell) {{
+            if (!cell || cell.m === undefined || cell.m === null) return 'cal-nodata';
+            if (!cell.s) return 'cal-nodata';
+            var ratio = cell.m / cell.s;
+            if (ratio < 0.5) return 'cal-lag-green';
+            if (ratio < 1.0) return 'cal-lag-yellow';
             return 'cal-lag-orange';
           }},
-          function(mins) {{
-            if (mins === undefined || mins === null) return 'No data';
-            return mins.toFixed(1) + ' min avg lag';
+          function(cell) {{
+            if (!cell || cell.m === undefined || cell.m === null) return 'No data';
+            var t = cell.m.toFixed(1) + ' min avg lag';
+            if (cell.s) t += ' (SLA: ' + cell.s.toFixed(1) + ' min)';
+            return t;
           }},
           lagLegend
         );
