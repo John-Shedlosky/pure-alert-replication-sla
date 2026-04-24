@@ -33,18 +33,6 @@
     "smtp_port": "25",
     "smtp_from": "johnsmith@domain.org",
     "smtp_to": "janedoe@domain.com",
-    "replication_pairs": [
-        {
-            "name": "Prod to DR - FlashArray Block",
-            "source": "flasharray1",
-            "destination": "flasharray2",
-            "type": "FA-Block"
-        },
-        {
-            "name": "Prod to DR - FlashArray Files",
-            "source": "flasharray1",
-            "destination": "flasharray2",
-            "type": "FA-File"
-        }
+
     ]
 }
