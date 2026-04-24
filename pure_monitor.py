@@ -2987,11 +2987,97 @@ class PureMonitorApp(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save file: {e}")
 
+    def _show_busy_spinner(self, message="Running report..."):
+        """Pop up a small transient window with a spinning pure_logo.png.
+
+        Falls back to an indeterminate ttk.Progressbar if Pillow isn't
+        available or the logo file is missing. Safe to call repeatedly \u2014
+        subsequent calls while a spinner is already visible are no-ops.
+        """
+        try:
+            if getattr(self, '_busy_spinner_win', None) is not None:
+                return
+            top = tk.Toplevel(self)
+            top.title("Working")
+            top.transient(self)
+            top.resizable(False, False)
+            top.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "images", "pure_logo.png")
+            self._busy_pil_img   = None
+            self._busy_tk_img    = None
+            self._busy_angle     = 0
+            self._busy_stop      = False
+            self._busy_img_label = None
+
+            if HAS_PIL and os.path.exists(img_path):
+                pil = Image.open(img_path).convert("RGBA")
+                pil = pil.resize((96, 96), Image.Resampling.LANCZOS)
+                self._busy_pil_img   = pil
+                self._busy_tk_img    = ImageTk.PhotoImage(pil)
+                lbl = tk.Label(top, image=self._busy_tk_img, borderwidth=0)
+                lbl.pack(padx=24, pady=(20, 8))
+                self._busy_img_label = lbl
+            else:
+                pb = ttk.Progressbar(top, mode="indeterminate", length=180)
+                pb.pack(padx=24, pady=(20, 8))
+                pb.start(10)
+
+            ttk.Label(top, text=message).pack(padx=24, pady=(0, 20))
+
+            self.update_idletasks()
+            try:
+                x = self.winfo_rootx() + (self.winfo_width()  // 2) - 80
+                y = self.winfo_rooty() + (self.winfo_height() // 2) - 80
+                top.geometry(f"+{max(0, x)}+{max(0, y)}")
+            except Exception:
+                pass
+
+            self._busy_spinner_win = top
+            if self._busy_pil_img is not None:
+                self._spin_busy_tick()
+        except Exception:
+            pass
+
+    def _spin_busy_tick(self):
+        """Advance the spinning-logo animation by one frame."""
+        if getattr(self, '_busy_stop', True):
+            return
+        win = getattr(self, '_busy_spinner_win', None)
+        pil = getattr(self, '_busy_pil_img',   None)
+        lbl = getattr(self, '_busy_img_label', None)
+        if win is None or pil is None or lbl is None:
+            return
+        try:
+            self._busy_angle = (self._busy_angle + 15) % 360
+            rot = pil.rotate(-self._busy_angle, resample=Image.Resampling.BILINEAR)
+            self._busy_tk_img = ImageTk.PhotoImage(rot)
+            lbl.configure(image=self._busy_tk_img)
+            self.after(60, self._spin_busy_tick)
+        except Exception:
+            return
+
+    def _hide_busy_spinner(self):
+        """Tear down the busy spinner window if it's currently shown."""
+        self._busy_stop = True
+        win = getattr(self, '_busy_spinner_win', None)
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self._busy_spinner_win = None
+        self._busy_pil_img     = None
+        self._busy_tk_img      = None
+        self._busy_img_label   = None
+
     def run_report(self):
         self.run_btn.config(state=tk.NORMAL) # Reset in thread
         self.run_btn.config(state=tk.DISABLED)
         self.text_out.delete("1.0", tk.END)
         self.text_out.insert(tk.END, "Polling arrays... Please wait.\n\n")
+        self._show_busy_spinner("Polling arrays... Please wait.")
         # Unified arrays list (name, location). SSH-based classification happens
         # inside run_collection_core, which fans out arr_fb/arr_faf/arr_fab.
         _arrays = [{'name': n, 'location': l} for n, l in self._get_arrays_from_sheet()]
@@ -3009,11 +3095,17 @@ class PureMonitorApp(tk.Tk):
         threading.Thread(target=self._run_collection, args=(cfg,), daemon=True).start()
 
     def _run_collection(self, config):
-        final, detailed, stats = run_collection_core(config, nogui=False)
-        # Stash the post-classification config so _auto_save_reports can reuse
-        # the populated arr_fb / arr_faf / arr_fab buckets when building HTML.
-        self._last_cfg = config
-        self.after(0, lambda: self._update_gui(final, detailed, stats))
+        try:
+            final, detailed, stats = run_collection_core(config, nogui=False)
+            # Stash the post-classification config so _auto_save_reports can reuse
+            # the populated arr_fb / arr_faf / arr_fab buckets when building HTML.
+            self._last_cfg = config
+            self.after(0, lambda: self._update_gui(final, detailed, stats))
+        finally:
+            # Always tear down the busy spinner on the main thread, even if
+            # run_collection_core raised \u2014 otherwise the spinner window
+            # would linger after an error.
+            self.after(0, self._hide_busy_spinner)
 
 
     # ── Open-file helpers (files are auto-saved after every run) ─────────────
