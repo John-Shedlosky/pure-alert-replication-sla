@@ -3037,10 +3037,13 @@ class PureMonitorApp(tk.Tk):
         """Pop up a small transient window with a spinning logo.
 
         Randomly picks one of FB-Green.png / FA-Green.png / everpure_logo.png
-        on each invocation. Falls back to an indeterminate ttk.Progressbar
-        if Pillow isn't available or none of the candidate images exist.
-        Safe to call repeatedly \u2014 subsequent calls while a spinner is
-        already visible are no-ops.
+        on each invocation. When an image is available the window is shown
+        chrome-less with a chroma-keyed transparent background (Windows)
+        so only the rotating logo itself is visible. Falls back to a titled
+        window with an indeterminate ttk.Progressbar if Pillow isn't
+        available or none of the candidate images exist. Safe to call
+        repeatedly \u2014 subsequent calls while a spinner is already visible
+        are no-ops.
         """
         try:
             if getattr(self, '_busy_spinner_win', None) is not None:
@@ -3051,7 +3054,7 @@ class PureMonitorApp(tk.Tk):
             top.resizable(False, False)
             top.protocol("WM_DELETE_WINDOW", lambda: None)
 
-            import random
+            import random, math
             _img_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
             _candidates = ["FB-Green.png", "FA-Green.png", "everpure_logo.png"]
             _existing = [os.path.join(_img_dir, n)
@@ -3063,26 +3066,47 @@ class PureMonitorApp(tk.Tk):
             self._busy_angle     = 0
             self._busy_stop      = False
             self._busy_img_label = None
+            self._busy_canvas_sz = 0
 
             if HAS_PIL and img_path is not None:
+                # Image-only mode: strip window chrome and chroma-key the
+                # background so only the rotating logo is visible on screen.
+                _chroma = "#ff00fe"
+                try:
+                    top.overrideredirect(True)
+                    top.configure(bg=_chroma)
+                    top.attributes("-transparentcolor", _chroma)
+                except Exception:
+                    pass
+
                 pil = Image.open(img_path).convert("RGBA")
                 pil = pil.resize((96, 96), Image.Resampling.LANCZOS)
-                self._busy_pil_img   = pil
-                self._busy_tk_img    = ImageTk.PhotoImage(pil)
-                lbl = tk.Label(top, image=self._busy_tk_img, borderwidth=0)
-                lbl.pack(padx=24, pady=(20, 8))
+                self._busy_pil_img = pil
+                # Fixed canvas >= image diagonal so rotation never clips the
+                # corners or resizes the Label as the angle changes.
+                self._busy_canvas_sz = int(math.ceil(96 * math.sqrt(2))) + 4  # \u2248 140
+
+                sz = self._busy_canvas_sz
+                initial = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+                off = (sz - 96) // 2
+                initial.paste(pil, (off, off), pil)
+                self._busy_tk_img = ImageTk.PhotoImage(initial)
+
+                lbl = tk.Label(top, image=self._busy_tk_img, bg=_chroma,
+                               borderwidth=0, highlightthickness=0)
+                lbl.pack(padx=0, pady=0)
                 self._busy_img_label = lbl
             else:
                 pb = ttk.Progressbar(top, mode="indeterminate", length=180)
                 pb.pack(padx=24, pady=(20, 8))
                 pb.start(10)
-
-            ttk.Label(top, text=message).pack(padx=24, pady=(0, 20))
+                ttk.Label(top, text=message).pack(padx=24, pady=(0, 20))
 
             self.update_idletasks()
             try:
-                x = self.winfo_rootx() + (self.winfo_width()  // 2) - 80
-                y = self.winfo_rooty() + (self.winfo_height() // 2) - 80
+                half = (self._busy_canvas_sz // 2) if self._busy_canvas_sz else 80
+                x = self.winfo_rootx() + (self.winfo_width()  // 2) - half
+                y = self.winfo_rooty() + (self.winfo_height() // 2) - half
                 top.geometry(f"+{max(0, x)}+{max(0, y)}")
             except Exception:
                 pass
@@ -3100,12 +3124,19 @@ class PureMonitorApp(tk.Tk):
         win = getattr(self, '_busy_spinner_win', None)
         pil = getattr(self, '_busy_pil_img',   None)
         lbl = getattr(self, '_busy_img_label', None)
-        if win is None or pil is None or lbl is None:
+        sz  = getattr(self, '_busy_canvas_sz', 0)
+        if win is None or pil is None or lbl is None or not sz:
             return
         try:
             self._busy_angle = (self._busy_angle + 15) % 360
-            rot = pil.rotate(-self._busy_angle, resample=Image.Resampling.BILINEAR)
-            self._busy_tk_img = ImageTk.PhotoImage(rot)
+            rot = pil.rotate(-self._busy_angle,
+                             resample=Image.Resampling.BILINEAR,
+                             expand=True)
+            canvas = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+            x = (sz - rot.width)  // 2
+            y = (sz - rot.height) // 2
+            canvas.paste(rot, (x, y), rot)
+            self._busy_tk_img = ImageTk.PhotoImage(canvas)
             lbl.configure(image=self._busy_tk_img)
             self.after(60, self._spin_busy_tick)
         except Exception:
