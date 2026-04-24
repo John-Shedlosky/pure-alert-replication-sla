@@ -2519,14 +2519,14 @@ class PureMonitorApp(tk.Tk):
         column Treeview-based editor so the app still runs without tksheet.
         """
         rows = [[n, l] for n, l in unified_arrays_from_config(config)]
-        # Pad with 20 blank rows at the end on startup so the user has ample
+        # Pad with 30 blank rows at the end on startup so the user has ample
         # scratch space to paste into without having to insert rows first.
         # Ongoing upkeep (via _ensure_trailing_blank_rows) only maintains a
-        # 2-row tail, but the initial load keeps the original 20 visible.
-        # NOTE: must construct each row as its own list — [['',''] ] * 20 would
-        # create 20 references to the same inner list, so writing one cell
+        # 2-row tail, but the initial load keeps the original 30 visible.
+        # NOTE: must construct each row as its own list \u2014 [['',''] ] * 30 would
+        # create 30 references to the same inner list, so writing one cell
         # would propagate the value into every padding row.
-        rows.extend([['', ''] for _ in range(20)])
+        rows.extend([['', ''] for _ in range(30)])
 
         sheet_frame = ttk.Frame(parent)
         sheet_frame.grid(row=4, column=1, columnspan=2, rowspan=3,
@@ -2546,12 +2546,15 @@ class PureMonitorApp(tk.Tk):
 
         if HAS_TKSHEET:
             # Height tuned to show ~8 data rows plus the header comfortably.
+            # show_row_index=True enables a non-editable gutter to the left
+            # of "Array" that _refresh_arrays_row_index populates with a
+            # 1-based count of rows that actually have a name filled in.
             self.arrays_sheet = Sheet(
                 sheet_frame,
                 headers=["Array", "Location"],
                 data=rows,
                 width=540, height=260,
-                show_row_index=False,
+                show_row_index=True,
                 show_top_left=False,
                 show_x_scrollbar=False,
             )
@@ -2585,7 +2588,17 @@ class PureMonitorApp(tk.Tk):
                 self.arrays_sheet.column_width(column=1, width=255)
             except Exception:
                 pass
+            # Narrow non-editable row-number gutter; populated with a
+            # 1-based running count of rows that have an Array name.
+            try:
+                self.arrays_sheet.set_index_width(40)
+            except Exception:
+                pass
             self.arrays_sheet.pack(fill=tk.BOTH, expand=True)
+            try:
+                self._refresh_arrays_row_index()
+            except Exception:
+                pass
         else:
             # Fallback: two synced text boxes. Keeps the app usable without
             # tksheet (diagnostics prompt shown at run time).
@@ -2699,32 +2712,60 @@ class PureMonitorApp(tk.Tk):
                 break
 
         needed = min_trailing - trailing
-        if needed <= 0:
-            return
-        self._blank_row_guard = True
-        try:
+        if needed > 0:
+            self._blank_row_guard = True
             try:
-                # create_selections=False prevents tksheet from leaving a
-                # selection box spanning the newly-added rows, which would
-                # otherwise cause the next paste to tile the clipboard across
-                # all of them.
-                sheet.insert_rows(rows=needed, idx="end",
-                                  emit_event=False,
-                                  create_selections=False,
-                                  redraw=True)
-            except TypeError:
-                # Older tksheet signatures that don't accept these kwargs.
                 try:
-                    sheet.insert_rows(rows=needed, idx="end", redraw=True)
+                    # create_selections=False prevents tksheet from leaving a
+                    # selection box spanning the newly-added rows, which would
+                    # otherwise cause the next paste to tile the clipboard across
+                    # all of them.
+                    sheet.insert_rows(rows=needed, idx="end",
+                                      emit_event=False,
+                                      create_selections=False,
+                                      redraw=True)
+                except TypeError:
+                    # Older tksheet signatures that don't accept these kwargs.
+                    try:
+                        sheet.insert_rows(rows=needed, idx="end", redraw=True)
+                    except Exception:
+                        new_data = list(data) + [['', ''] for _ in range(needed)]
+                        sheet.set_sheet_data(new_data, redraw=True)
                 except Exception:
+                    # Fallback: rebuild the data in one shot.
                     new_data = list(data) + [['', ''] for _ in range(needed)]
                     sheet.set_sheet_data(new_data, redraw=True)
-            except Exception:
-                # Fallback: rebuild the data in one shot.
-                new_data = list(data) + [['', ''] for _ in range(needed)]
-                sheet.set_sheet_data(new_data, redraw=True)
-        finally:
-            self._blank_row_guard = False
+            finally:
+                self._blank_row_guard = False
+        # Always refresh the row-index labels: edits that don't add rows
+        # (e.g. the user typed a name into a blank row) still change the
+        # running count of non-empty arrays.
+        self._refresh_arrays_row_index()
+
+    def _refresh_arrays_row_index(self):
+        """Populate the row-index gutter with a 1-based count of rows that
+        have a non-blank Array name; blank rows get an empty label.
+        """
+        sheet = getattr(self, 'arrays_sheet', None)
+        if sheet is None:
+            return
+        try:
+            data = sheet.get_sheet_data() or []
+        except Exception:
+            return
+        labels = []
+        n = 0
+        for r in data:
+            name = str((r[0] if r else '') or '').strip()
+            if name:
+                n += 1
+                labels.append(str(n))
+            else:
+                labels.append('')
+        try:
+            sheet.row_index(newindex=labels, redraw=True)
+        except Exception:
+            pass
 
     def _setup_ui(self):
         config = self._load_config()
