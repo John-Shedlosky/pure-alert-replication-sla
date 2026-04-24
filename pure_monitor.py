@@ -2549,6 +2549,16 @@ class PureMonitorApp(tk.Tk):
                 "copy", "paste", "delete", "undo",
                 "right_click_popup_menu", "rc_insert_row", "rc_delete_row",
             ))
+            # Force single-cell paste semantics. tksheet's default Excel-like
+            # behavior tiles the clipboard across the current selection box
+            # when that box is larger than the clipboard data (and the row
+            # count is a multiple of it). That surprised the user when a
+            # stray multi-row selection was active, so shrink the selection
+            # to just the caret cell before delegating to tksheet's ctrl_v.
+            try:
+                self._install_single_cell_paste(self.arrays_sheet)
+            except Exception:
+                pass
             # Auto-grow: whenever the last two rows are no longer both blank
             # (e.g. the user typed into the last empty row, or pasted a block
             # that filled past the end), append fresh blank rows so there is
@@ -2603,6 +2613,52 @@ class PureMonitorApp(tk.Tk):
         loc_txt = self._fallback_loc_txt.get("1.0", tk.END) if hasattr(self, '_fallback_loc_txt') else ''
         return list(zip(*parse_arr_loc(arr_txt, loc_txt)))
 
+    def _install_single_cell_paste(self, sheet):
+        """Rebind Ctrl-V on the sheet so pasting always targets a single cell.
+
+        tksheet's native ctrl_v will tile the clipboard across the current
+        selection box when it spans more cells than the clipboard contains.
+        That surprises users who expect plain single-cell paste. This wrapper
+        deselects any wider selection, then re-selects just the caret cell
+        before invoking the built-in ctrl_v so it can only ever paste into
+        that one cell (plus whatever expansion the clipboard data itself
+        contributes when it has multiple rows/cols).
+        """
+        mt = getattr(sheet, 'MT', None)
+        if mt is None or not hasattr(mt, 'ctrl_v'):
+            return
+        orig_ctrl_v = mt.ctrl_v
+
+        def _single_cell_paste(event=None):
+            try:
+                sel = sheet.get_currently_selected()
+                if sel:
+                    r = getattr(sel, 'row', None)
+                    c = getattr(sel, 'column', None)
+                    if r is not None and c is not None:
+                        try:
+                            sheet.deselect("all", redraw=False)
+                        except Exception:
+                            pass
+                        try:
+                            sheet.select_cell(r, c, redraw=True,
+                                              run_binding_func=False)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            return orig_ctrl_v(event)
+
+        for w in (mt, getattr(sheet, 'RI', None),
+                  getattr(sheet, 'CH', None), getattr(sheet, 'TL', None)):
+            if w is None:
+                continue
+            for seq in ("<Control-v>", "<Control-V>"):
+                try:
+                    w.bind(seq, _single_cell_paste)
+                except Exception:
+                    pass
+
     def _ensure_trailing_blank_rows(self, event=None, min_trailing=2):
         """Keep at least *min_trailing* fully-blank rows at the bottom of the
         arrays sheet. Called after edits / pastes / row inserts / deletes so
@@ -2637,11 +2693,21 @@ class PureMonitorApp(tk.Tk):
         self._blank_row_guard = True
         try:
             try:
+                # create_selections=False prevents tksheet from leaving a
+                # selection box spanning the newly-added rows, which would
+                # otherwise cause the next paste to tile the clipboard across
+                # all of them.
                 sheet.insert_rows(rows=needed, idx="end",
-                                  emit_event=False, redraw=True)
+                                  emit_event=False,
+                                  create_selections=False,
+                                  redraw=True)
             except TypeError:
-                # Older tksheet signatures that don't accept emit_event.
-                sheet.insert_rows(rows=needed, idx="end", redraw=True)
+                # Older tksheet signatures that don't accept these kwargs.
+                try:
+                    sheet.insert_rows(rows=needed, idx="end", redraw=True)
+                except Exception:
+                    new_data = list(data) + [['', ''] for _ in range(needed)]
+                    sheet.set_sheet_data(new_data, redraw=True)
             except Exception:
                 # Fallback: rebuild the data in one shot.
                 new_data = list(data) + [['', ''] for _ in range(needed)]
