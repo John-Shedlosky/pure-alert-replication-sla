@@ -2564,6 +2564,7 @@ class PureMonitorApp(tk.Tk):
                 "single_select", "drag_select", "arrowkeys", "edit_cell",
                 "copy", "paste", "delete", "undo",
                 "right_click_popup_menu", "rc_insert_row", "rc_delete_row",
+                "column_width_resize", "double_click_column_resize",
             ))
             # Force single-cell paste semantics. tksheet's default Excel-like
             # behavior tiles the clipboard across the current selection box
@@ -2585,9 +2586,21 @@ class PureMonitorApp(tk.Tk):
                                        self._ensure_trailing_blank_rows)
             except Exception:
                 pass
+            # Column widths: use values saved in the config when present
+            # (the user can drag column separators to resize; those widths
+            # are persisted back by _save_config under 'arrays_col_widths').
+            _saved_w = config.get('arrays_col_widths') or []
             try:
-                self.arrays_sheet.column_width(column=0, width=270)
-                self.arrays_sheet.column_width(column=1, width=255)
+                w0 = int(_saved_w[0]) if len(_saved_w) > 0 and _saved_w[0] else 270
+            except Exception:
+                w0 = 270
+            try:
+                w1 = int(_saved_w[1]) if len(_saved_w) > 1 and _saved_w[1] else 255
+            except Exception:
+                w1 = 255
+            try:
+                self.arrays_sheet.column_width(column=0, width=w0)
+                self.arrays_sheet.column_width(column=1, width=w1)
             except Exception:
                 pass
             # Narrow non-editable row-number gutter; populated with a
@@ -2934,12 +2947,23 @@ class PureMonitorApp(tk.Tk):
 
     def _save_config(self):
         arrays = [{"name": n, "location": l} for n, l in self._get_arrays_from_sheet()]
+        # Capture the current Arrays-sheet column widths so any user-driven
+        # resize (drag separator / double-click auto-fit) survives restart.
+        col_widths = []
+        try:
+            _sheet = getattr(self, 'arrays_sheet', None)
+            if _sheet is not None:
+                col_widths = [int(_sheet.column_width(column=0)),
+                              int(_sheet.column_width(column=1))]
+        except Exception:
+            col_widths = []
         data = {
             "user_fb": self.user_fb_entry.get().strip(),
             "user_faf": self.user_faf_entry.get().strip(),
             "user_fab": self.user_fab_entry.get().strip(),
             "alerts_excluded": self.alerts_entry.get("1.0", tk.END).strip(),
             "arrays": arrays,
+            "arrays_col_widths": col_widths,
             "sla_fb": self.sla_fb_entry.get().strip(),
             "sla_faf": self.sla_faf_entry.get().strip(),
             "sla_fab": self.sla_fab_entry.get().strip(),
@@ -3084,17 +3108,30 @@ class PureMonitorApp(tk.Tk):
                 except Exception:
                     pass
 
-                pil = Image.open(img_path).convert("RGBA")
-                pil = pil.resize((96, 96), Image.Resampling.LANCZOS)
+                # Per-image target widths \u2014 the logos are all wider than tall
+                # (e.g. everpure_logo is ~997x183, ~5.4:1), so forcing them
+                # all to 96x96 squished them. Preserve aspect ratio and give
+                # the very-wide everpure logo double the nominal width.
+                _target_widths = {
+                    "everpure_logo.png": 192,
+                    "FB-Green.png":       96,
+                    "FA-Green.png":       96,
+                }
+                orig = Image.open(img_path).convert("RGBA")
+                tw = _target_widths.get(os.path.basename(img_path), 96)
+                th = max(1, int(round(tw * orig.height / orig.width)))
+                pil = orig.resize((tw, th), Image.Resampling.LANCZOS)
                 self._busy_pil_img = pil
                 # Fixed canvas >= image diagonal so rotation never clips the
                 # corners or resizes the Label as the angle changes.
-                self._busy_canvas_sz = int(math.ceil(96 * math.sqrt(2))) + 4  # \u2248 140
+                diag = int(math.ceil(math.sqrt(tw * tw + th * th)))
+                self._busy_canvas_sz = diag + 4
 
                 sz = self._busy_canvas_sz
                 initial = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
-                off = (sz - 96) // 2
-                initial.paste(pil, (off, off), pil)
+                ox = (sz - tw) // 2
+                oy = (sz - th) // 2
+                initial.paste(pil, (ox, oy), pil)
                 self._busy_tk_img = ImageTk.PhotoImage(initial)
 
                 lbl = tk.Label(top, image=self._busy_tk_img, bg=_chroma,
