@@ -2535,16 +2535,18 @@ class PureMonitorApp(tk.Tk):
         parent.rowconfigure(4, weight=1)
         parent.rowconfigure(5, weight=1)
         parent.rowconfigure(6, weight=1)
-        # Reserve enough horizontal space in the grid cell so the sheet's
-        # two columns (270 + 255 px) plus the vertical scrollbar gutter fit
-        # without being clipped. Without these minsize values, cols 1/2 of
-        # the parent grid collapse down to the width of the 20-char entry
-        # widgets above, and the sheet gets squeezed regardless of its own
-        # `width=` constructor argument or internal column_width() calls.
-        parent.columnconfigure(1, minsize=275, weight=1)
-        parent.columnconfigure(2, minsize=285, weight=1)
+        # Reserve enough horizontal space in the grid cell for the sheet,
+        # but don't let it grow beyond that: weight=0 keeps the extra width
+        # from the window (if any) out of this grid cell, so empty space
+        # never appears to the right of the Location column.
+        parent.columnconfigure(1, minsize=290, weight=0)
+        parent.columnconfigure(2, minsize=295, weight=0)
 
         if HAS_TKSHEET:
+            # Width sized to exactly fit the three columns with no empty
+            # gutter on the right:
+            #   row-index (40) + Array (270) + Location (255) = 565 content
+            #   + vertical scrollbar (~18) + widget border (~2) \u2248 585.
             # Height tuned to show ~8 data rows plus the header comfortably.
             # show_row_index=True enables a non-editable gutter to the left
             # of "Array" that _refresh_arrays_row_index populates with a
@@ -2553,7 +2555,7 @@ class PureMonitorApp(tk.Tk):
                 sheet_frame,
                 headers=["Array", "Location"],
                 data=rows,
-                width=540, height=260,
+                width=585, height=260,
                 show_row_index=True,
                 show_top_left=False,
                 show_x_scrollbar=False,
@@ -2594,7 +2596,10 @@ class PureMonitorApp(tk.Tk):
                 self.arrays_sheet.set_index_width(40)
             except Exception:
                 pass
-            self.arrays_sheet.pack(fill=tk.BOTH, expand=True)
+            # fill=tk.Y (not BOTH) keeps the sheet at its requested width
+            # so the three columns fill the widget edge-to-edge and nothing
+            # shifts horizontally when the user edits a Location cell.
+            self.arrays_sheet.pack(side=tk.LEFT, fill=tk.Y, expand=True)
             try:
                 self._refresh_arrays_row_index()
             except Exception:
@@ -3029,11 +3034,13 @@ class PureMonitorApp(tk.Tk):
                 messagebox.showerror("Error", f"Failed to save file: {e}")
 
     def _show_busy_spinner(self, message="Running report..."):
-        """Pop up a small transient window with a spinning pure_logo.png.
+        """Pop up a small transient window with a spinning logo.
 
-        Falls back to an indeterminate ttk.Progressbar if Pillow isn't
-        available or the logo file is missing. Safe to call repeatedly \u2014
-        subsequent calls while a spinner is already visible are no-ops.
+        Randomly picks one of FB-Green.png / FA-Green.png / everpure_logo.png
+        on each invocation. Falls back to an indeterminate ttk.Progressbar
+        if Pillow isn't available or none of the candidate images exist.
+        Safe to call repeatedly \u2014 subsequent calls while a spinner is
+        already visible are no-ops.
         """
         try:
             if getattr(self, '_busy_spinner_win', None) is not None:
@@ -3044,15 +3051,20 @@ class PureMonitorApp(tk.Tk):
             top.resizable(False, False)
             top.protocol("WM_DELETE_WINDOW", lambda: None)
 
-            img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "images", "pure_logo.png")
+            import random
+            _img_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+            _candidates = ["FB-Green.png", "FA-Green.png", "everpure_logo.png"]
+            _existing = [os.path.join(_img_dir, n)
+                         for n in _candidates
+                         if os.path.exists(os.path.join(_img_dir, n))]
+            img_path = random.choice(_existing) if _existing else None
             self._busy_pil_img   = None
             self._busy_tk_img    = None
             self._busy_angle     = 0
             self._busy_stop      = False
             self._busy_img_label = None
 
-            if HAS_PIL and os.path.exists(img_path):
+            if HAS_PIL and img_path is not None:
                 pil = Image.open(img_path).convert("RGBA")
                 pil = pil.resize((96, 96), Image.Resampling.LANCZOS)
                 self._busy_pil_img   = pil
