@@ -3071,11 +3071,16 @@ class PureMonitorApp(tk.Tk):
             if HAS_PIL and img_path is not None:
                 # Image-only mode: strip window chrome and chroma-key the
                 # background so only the rotating logo is visible on screen.
+                # overrideredirect(True) takes the window out of the WM's
+                # control, which also neutralizes transient()/focus and can
+                # leave it behind the main window \u2014 force -topmost so it
+                # actually appears in front.
                 _chroma = "#ff00fe"
                 try:
                     top.overrideredirect(True)
                     top.configure(bg=_chroma)
                     top.attributes("-transparentcolor", _chroma)
+                    top.attributes("-topmost", True)
                 except Exception:
                     pass
 
@@ -3104,14 +3109,30 @@ class PureMonitorApp(tk.Tk):
 
             self.update_idletasks()
             try:
-                half = (self._busy_canvas_sz // 2) if self._busy_canvas_sz else 80
+                sz   = self._busy_canvas_sz if self._busy_canvas_sz else 160
+                half = sz // 2
                 x = self.winfo_rootx() + (self.winfo_width()  // 2) - half
                 y = self.winfo_rooty() + (self.winfo_height() // 2) - half
-                top.geometry(f"+{max(0, x)}+{max(0, y)}")
+                # Include width/height in the geometry string so a chrome-less
+                # Toplevel is forced to the exact canvas size; otherwise on
+                # some Windows Tk builds it may render at 1x1 before a map.
+                if self._busy_canvas_sz:
+                    top.geometry(f"{sz}x{sz}+{max(0, x)}+{max(0, y)}")
+                else:
+                    top.geometry(f"+{max(0, x)}+{max(0, y)}")
             except Exception:
                 pass
 
             self._busy_spinner_win = top
+            # Force the window to be mapped and raised now \u2014 without this,
+            # overrideredirect() Toplevels sometimes defer their first
+            # on-screen paint until the next idle cycle, which may not happen
+            # before the worker thread blocks on SSH.
+            try:
+                top.lift()
+                top.update()
+            except Exception:
+                pass
             if self._busy_pil_img is not None:
                 self._spin_busy_tick()
         except Exception:
