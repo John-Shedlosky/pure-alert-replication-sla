@@ -2547,6 +2547,16 @@ class PureMonitorApp(tk.Tk):
                 "copy", "paste", "delete", "undo",
                 "right_click_popup_menu", "rc_insert_row", "rc_delete_row",
             ))
+            # Auto-grow: whenever the last two rows are no longer both blank
+            # (e.g. the user typed into the last empty row, or pasted a block
+            # that filled past the end), append fresh blank rows so there is
+            # always room to keep going without manually inserting rows.
+            self._blank_row_guard = False
+            try:
+                self.arrays_sheet.bind("<<SheetModified>>",
+                                       self._ensure_trailing_blank_rows)
+            except Exception:
+                pass
             try:
                 self.arrays_sheet.column_width(column=0, width=180)
                 self.arrays_sheet.column_width(column=1, width=170)
@@ -2590,6 +2600,52 @@ class PureMonitorApp(tk.Tk):
         arr_txt = self._fallback_arr_txt.get("1.0", tk.END) if hasattr(self, '_fallback_arr_txt') else ''
         loc_txt = self._fallback_loc_txt.get("1.0", tk.END) if hasattr(self, '_fallback_loc_txt') else ''
         return list(zip(*parse_arr_loc(arr_txt, loc_txt)))
+
+    def _ensure_trailing_blank_rows(self, event=None, min_trailing=2):
+        """Keep at least *min_trailing* fully-blank rows at the bottom of the
+        arrays sheet. Called after edits / pastes / row inserts / deletes so
+        the sheet auto-grows whenever the user fills in the last free row or
+        pastes a block that reaches the end.
+        """
+        sheet = getattr(self, 'arrays_sheet', None)
+        if sheet is None:
+            return
+        # Guard against the <<SheetModified>> event firing recursively when
+        # insert_rows itself triggers another modification.
+        if getattr(self, '_blank_row_guard', False):
+            return
+        try:
+            data = sheet.get_sheet_data() or []
+        except Exception:
+            return
+
+        def _row_blank(r):
+            return all(not str(c if c is not None else '').strip() for c in r)
+
+        trailing = 0
+        for r in reversed(data):
+            if _row_blank(r):
+                trailing += 1
+            else:
+                break
+
+        needed = min_trailing - trailing
+        if needed <= 0:
+            return
+        self._blank_row_guard = True
+        try:
+            try:
+                sheet.insert_rows(rows=needed, idx="end",
+                                  emit_event=False, redraw=True)
+            except TypeError:
+                # Older tksheet signatures that don't accept emit_event.
+                sheet.insert_rows(rows=needed, idx="end", redraw=True)
+            except Exception:
+                # Fallback: rebuild the data in one shot.
+                new_data = list(data) + [['', ''] for _ in range(needed)]
+                sheet.set_sheet_data(new_data, redraw=True)
+        finally:
+            self._blank_row_guard = False
 
     def _setup_ui(self):
         config = self._load_config()
