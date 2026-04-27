@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import paramiko
@@ -43,6 +44,15 @@ password_response_event = threading.Event()
 global_password_request_msg = ""
 global_password_response = None
 credentials_cache = {}
+# Serializes the request/response transaction in ask_password_in_main so
+# that concurrent workers (e.g. parallel array detection) don't clobber
+# global_password_request_msg or both consume the same response.
+_password_prompt_lock = threading.Lock()
+# Guards alerted_arrays, alert_counts and detailed_logs writes when the
+# replication loops process up to 4 arrays concurrently. Workers also use
+# their own thread-local buffers for alert_lines / repl_lines so report
+# ordering follows array input order rather than worker completion order.
+_alert_collection_lock = threading.Lock()
 
 # Set to True when --alert-debug is passed on the command line.
 # In this mode SSH calls are bypassed and synthetic alert / lag data are injected
@@ -51,11 +61,12 @@ ALERT_DEBUG = '--alert-debug' in sys.argv
 
 def ask_password_in_main(msg):
     global global_password_request_msg
-    global_password_request_msg = msg
-    password_request_event.set()
-    password_response_event.wait()
-    password_response_event.clear()
-    return global_password_response
+    with _password_prompt_lock:
+        global_password_request_msg = msg
+        password_request_event.set()
+        password_response_event.wait()
+        password_response_event.clear()
+        return global_password_response
 
 def run_ssh_command(array, user, command, log_list=None, nogui=False):
     if not HAS_PARAMIKO:
@@ -667,7 +678,51 @@ def unified_arrays_from_config(raw):
     return out
 
 
-def run_collection_core(config, nogui=False):
+def parse_unified_arrays_full(val):
+    """Parse the unified ``arrays`` config value into [(name, location, notes), ...].
+
+    Same input shapes as :func:`parse_unified_arrays` but also extracts the
+    optional ``notes`` field. The 2-tuple variant remains the canonical form
+    for the SSH/report pipeline; this 3-tuple variant is used by the GUI
+    sheet so the user-entered notes survive a save/reload cycle.
+    """
+    out = []
+    if isinstance(val, list):
+        for item in val:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name', '') or '').strip()
+            if not name:
+                continue
+            loc = str(item.get('location', '') or '').strip()
+            notes = str(item.get('notes', '') or '').strip()
+            out.append((name, loc, notes))
+        return out
+    if isinstance(val, str):
+        for line in val.splitlines():
+            parts = re.split(r'[\t,]', line, maxsplit=2)
+            name = parts[0].strip()
+            if not name:
+                continue
+            loc   = parts[1].strip() if len(parts) > 1 else ''
+            notes = parts[2].strip() if len(parts) > 2 else ''
+            out.append((name, loc, notes))
+    return out
+
+
+def unified_arrays_from_config_full(raw):
+    """Return [(name, location, notes), ...] from a raw config dict.
+
+    Mirrors :func:`unified_arrays_from_config` but preserves notes when the
+    new-style ``arrays`` list-of-dicts key is present. Legacy fall-back
+    rows always have empty notes.
+    """
+    if 'arrays' in raw:
+        return parse_unified_arrays_full(raw.get('arrays'))
+    return [(n, l, '') for n, l in unified_arrays_from_config(raw)]
+
+
+def run_collection_core(config, nogui=False, progress_cb=None):
     import csv, io
     alert_lines = []
     repl_lines = []
@@ -679,6 +734,17 @@ def run_collection_core(config, nogui=False):
     hw_lines     = []   # lines for the top-of-report Hardware Health summary
     rel_by_array = {}   # array_name -> replication-relationship dict
     rel_lines    = []   # lines for the bottom-of-report Replication Relationships summary
+
+    # Optional progress hook. The GUI passes a thread-safe callback that
+    # posts to the main-thread status label under the busy spinner; the
+    # nogui path leaves it None and the helper becomes a no-op.
+    def _p(msg):
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(msg)
+        except Exception:
+            pass
 
     # ── Unified array list → per-type buckets ────────────────────────────────
     # When the config supplies a single ``arrays`` list (new-style, from the
@@ -696,9 +762,37 @@ def run_collection_core(config, nogui=False):
         _bfb_a, _bfb_l   = [], []
         _bfaf_a, _bfaf_l = [], []
         _bfab_a, _bfab_l = [], []
-        for _name, _loc in parse_unified_arrays(_unified):
-            info = detect_array_type(_name, _users, detailed_logs=detailed_logs,
-                                     nogui=nogui)
+        # Run up to 4 array-type detections concurrently. Detection is
+        # I/O-bound on paramiko socket reads (purearray/purepod/purepgroup),
+        # so threads give real wall-clock parallelism. Output bucket order
+        # is preserved by indexing results by input position and assembling
+        # the buckets after all workers finish.
+        _arrays_in_order = list(parse_unified_arrays(_unified))
+        _results = [None] * len(_arrays_in_order)
+
+        def _detect_one(_idx_pair):
+            _idx, (_name, _loc) = _idx_pair
+            _p(f"Detecting array {_name} type...")
+            try:
+                info = detect_array_type(_name, _users,
+                                         detailed_logs=detailed_logs,
+                                         nogui=nogui)
+            except Exception as e:
+                info = {'is_fb': False, 'is_faf': False, 'is_fab': False,
+                        'is_nrp': False, 'user': None, 'error': str(e)}
+            return (_idx, _name, _loc, info)
+
+        if _arrays_in_order:
+            _workers = min(4, len(_arrays_in_order))
+            with ThreadPoolExecutor(max_workers=_workers) as _ex:
+                for _idx, _name, _loc, info in _ex.map(
+                        _detect_one, list(enumerate(_arrays_in_order))):
+                    _results[_idx] = (_name, _loc, info)
+
+        for _entry in _results:
+            if _entry is None:
+                continue
+            _name, _loc, info = _entry
             if info.get('error') and not any((info['is_fb'], info['is_faf'],
                                               info['is_fab'], info['is_nrp'])):
                 detailed_logs.append(
@@ -751,20 +845,32 @@ def run_collection_core(config, nogui=False):
         if _a and _a not in _hw_seen:
             _hw_targets.append((_a, config.get('user_fab', 'pureuser'), 'FA'))
             _hw_seen.add(_a)
-    for _i, (_a, _u, _p) in enumerate(_hw_targets):
-        info = collect_hw_health(_a, _u, _p, detailed_logs, nogui=nogui, idx=_i)
-        hw_by_array[_a] = info
+    # Up to 4 hardware-health probes run concurrently. Each worker only
+    # touches its own array_name key in hw_by_array, and the per-array
+    # summary line is returned so the caller can extend hw_lines in the
+    # same order as _hw_targets (preserving report layout).
+    def _hw_one(_arg):
+        _i, (_a, _u, _plat) = _arg
+        _p(f"Collecting array {_a} Hardware Health...")
+        info = collect_hw_health(_a, _u, _plat, detailed_logs, nogui=nogui, idx=_i)
         if info.get('error'):
-            hw_lines.append(f"{_a} - Hardware Health: Error ({info['error']})")
+            line = f"{_a} - Hardware Health: Error ({info['error']})"
         elif info.get('healthy') is True:
-            hw_lines.append(f"{_a} - Hardware Health: Healthy")
+            line = f"{_a} - Hardware Health: Healthy"
         elif info.get('healthy') is False:
             _names = [r[0] for r in info['unhealthy_rows'] if r]
-            hw_lines.append(
-                f"{_a} - Hardware Health: Unhealthy "
-                f"({len(info['unhealthy_rows'])} issue(s): {', '.join(_names)})")
+            line = (f"{_a} - Hardware Health: Unhealthy "
+                    f"({len(info['unhealthy_rows'])} issue(s): {', '.join(_names)})")
         else:
-            hw_lines.append(f"{_a} - Hardware Health: Unknown (no Status column)")
+            line = f"{_a} - Hardware Health: Unknown (no Status column)"
+        return _a, info, line
+
+    if _hw_targets:
+        _workers = min(4, len(_hw_targets))
+        with ThreadPoolExecutor(max_workers=_workers) as _ex:
+            for _a, info, line in _ex.map(_hw_one, list(enumerate(_hw_targets))):
+                hw_by_array[_a] = info
+                hw_lines.append(line)
 
     # ── Replication relationships — run once per unique array ─────────────────
     # FB arrays use 'purearray list --connect'; FA arrays (File and Block share
@@ -786,10 +892,21 @@ def run_collection_core(config, nogui=False):
                      else config.get('user_fab', 'pureuser'))
             _rel_targets.append((_a, _user, 'FA', _fa_arrs))
             _rel_seen.add(_a)
-    for _i, (_a, _u, _p, _peers) in enumerate(_rel_targets):
+    # Up to 4 partner-list probes run concurrently. Each worker only
+    # writes its own array_name key in rel_by_array, so no lock is
+    # needed for the merge.
+    def _rel_one(_arg):
+        _i, (_a, _u, _plat, _peers) = _arg
+        _p(f"Collecting array {_a} Partners...")
         info = collect_replication_relationships(
-            _a, _u, _p, detailed_logs, nogui=nogui, idx=_i, peers=_peers)
-        rel_by_array[_a] = info
+            _a, _u, _plat, detailed_logs, nogui=nogui, idx=_i, peers=_peers)
+        return _a, info
+
+    if _rel_targets:
+        _workers = min(4, len(_rel_targets))
+        with ThreadPoolExecutor(max_workers=_workers) as _ex:
+            for _a, info in _ex.map(_rel_one, list(enumerate(_rel_targets))):
+                rel_by_array[_a] = info
 
     def _alert_dict(array):
         """Return alert severity fields ready to unpack into array_stats entries."""
@@ -833,24 +950,43 @@ def run_collection_core(config, nogui=False):
     # Sentinel used inside the replication loops to bypass SSH in debug mode.
     class _AlertDebugSkip(Exception): pass
 
-    # Running index across all arrays so each gets a different alert pattern.
-    _debug_array_idx = [0]
+    # Stable per-array debug index. With concurrent execution the previous
+    # running counter (and list(alert_counts.keys()).index(array)) would
+    # produce non-deterministic indices; precomputing once over the union
+    # of arr_fb / arr_faf / arr_fab guarantees each array always picks
+    # the same synthetic alert pattern regardless of completion order.
+    _debug_idx_by_array = {}
+    for _a in (list(config.get('arr_fb', []))
+               + list(config.get('arr_faf', []))
+               + list(config.get('arr_fab', []))):
+        if _a and _a not in _debug_idx_by_array:
+            _debug_idx_by_array[_a] = len(_debug_idx_by_array)
 
-    def check_alert(array, user):
-        if array in alerted_arrays:
-            return
-        alerted_arrays.add(array)
+    def check_alert(array, user, local_alert_lines):
+        """Thread-safe alert collection.
+
+        Appends report lines to *local_alert_lines* (a per-worker buffer)
+        and writes the counts dict into the shared alert_counts under
+        _alert_collection_lock. Cross-loop dedup via alerted_arrays so an
+        array that appears in multiple type buckets only runs alerts once.
+        """
+        with _alert_collection_lock:
+            if array in alerted_arrays:
+                return
+            alerted_arrays.add(array)
+        _p(f"Collecting array {array} Alerts...")
 
         if ALERT_DEBUG:
-            counts, log_lines, _avg, _max = _get_debug_alerts(array, _debug_array_idx[0])
-            _debug_array_idx[0] += 1
-            alert_counts[array] = counts
-            alert_lines.append(f"[ALERT-DEBUG] {array} - "
+            counts, log_lines, _avg, _max = _get_debug_alerts(
+                array, _debug_idx_by_array.get(array, 0))
+            with _alert_collection_lock:
+                alert_counts[array] = counts
+            local_alert_lines.append(f"[ALERT-DEBUG] {array} - "
                                 f"{counts['critical']} Critical, "
                                 f"{counts['warning']} Warning, "
                                 f"{counts['info']} Info (synthetic data)")
-            alert_lines.extend(log_lines)
-            alert_lines.append("")
+            local_alert_lines.extend(log_lines)
+            local_alert_lines.append("")
             return
 
         try:
@@ -889,26 +1025,35 @@ def run_collection_core(config, nogui=False):
                     for i, hf in enumerate(hdr_fields):
                         detail[hf.strip()] = fields[i].strip() if i < len(fields) else ''
                     counts['alerts'].append(detail)
-                alert_counts[array] = counts
+                with _alert_collection_lock:
+                    alert_counts[array] = counts
                 block = ([header] if header else []) + valid
                 prefs = ([f"{array} - Alert Header:"] if header else []) + [f"{array} - Alert:"] * len(valid)
-                alert_lines.extend(format_csv(block, prefs))
+                local_alert_lines.extend(format_csv(block, prefs))
             else:
-                alert_counts[array] = counts
-                alert_lines.append(f"{array} - Alerts: Healthy")
+                with _alert_collection_lock:
+                    alert_counts[array] = counts
+                local_alert_lines.append(f"{array} - Alerts: Healthy")
         except Exception as e:
-            alert_counts[array] = {'info': 0, 'warning': 0, 'critical': 0, 'error': True}
-            alert_lines.append(f"{array} - Alerts Error: {str(e)}")
-        alert_lines.append("")
+            with _alert_collection_lock:
+                alert_counts[array] = {'info': 0, 'warning': 0, 'critical': 0, 'error': True}
+            local_alert_lines.append(f"{array} - Alerts Error: {str(e)}")
+        local_alert_lines.append("")
 
-    # FB Loop
-    for array in config['arr_fb']:
-        check_alert(array, config['user_fb'])
+    # FB Loop -- up to 4 arrays processed concurrently. Each worker writes
+    # to its own buffers and returns them so the main thread can extend the
+    # shared alert_lines/repl_lines/array_stats in input order.
+    def _fb_one(array):
+        local_alert_lines = []
+        local_repl_lines = []
+        check_alert(array, config['user_fb'], local_alert_lines)
+        _p(f"Collecting array {array} Replication...")
         all_lags = []
         repl_rows = []
+        stat = None
         try:
             if ALERT_DEBUG:
-                _, _, avg_s, max_s = _get_debug_alerts(array, list(alert_counts.keys()).index(array))
+                _, _, avg_s, max_s = _get_debug_alerts(array, _debug_idx_by_array.get(array, 0))
                 all_lags = [avg_s, max_s]
                 _rp_time = (datetime.datetime.now() - datetime.timedelta(seconds=int(avg_s))).strftime('%Y-%m-%d %H:%M:%S')
                 repl_rows = [
@@ -922,10 +1067,10 @@ def run_collection_core(config, nogui=False):
                      'SLA Status': 'Exceeded' if max_s > config['sla_fb'] else 'OK'},
                 ]
                 if max_s > config['sla_fb']:
-                    repl_lines.append(f"[ALERT-DEBUG] {array} - FB Replication SLA exceeded "
+                    local_repl_lines.append(f"[ALERT-DEBUG] {array} - FB Replication SLA exceeded "
                                       f"(simulated max lag {format_seconds_human(max_s)} vs SLA {format_seconds_human(config['sla_fb'])})")
                 else:
-                    repl_lines.append(f"[ALERT-DEBUG] {array} - FB Replication: Healthy (synthetic data)")
+                    local_repl_lines.append(f"[ALERT-DEBUG] {array} - FB Replication: Healthy (synthetic data)")
                 raise _AlertDebugSkip()
             out = run_ssh_command(array, config['user_fb'], "purefs replica-link list --csv", log_list=detailed_logs, nogui=nogui)
             rows = list(csv.reader(io.StringIO(out)))
@@ -957,38 +1102,53 @@ def run_collection_core(config, nogui=False):
                 for line, act, req in bad:
                     block.extend([line, f"SLA = {format_seconds_human(req)} vs Actual = {format_seconds_human(act)} --- A SLA violation of {format_seconds_human(act-req)}"])
                     prefs.extend([f"{array} - Repl Exceeded:", f"{array} - SLA Status:"])
-                repl_lines.extend(format_csv(block, prefs))
-            else: repl_lines.append(f"{array} - FB Replication: Healthy")
-            array_stats.append({'name': array, 'type': 'FB',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_fb'],
-                                'avg_lag': sum(all_lags)/len(all_lags) if all_lags else None,
-                                'max_lag': max(all_lags) if all_lags else None,
-                                'repl_details': repl_rows})
+                local_repl_lines.extend(format_csv(block, prefs))
+            else: local_repl_lines.append(f"{array} - FB Replication: Healthy")
+            stat = {'name': array, 'type': 'FB',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_fb'],
+                    'avg_lag': sum(all_lags)/len(all_lags) if all_lags else None,
+                    'max_lag': max(all_lags) if all_lags else None,
+                    'repl_details': repl_rows}
         except _AlertDebugSkip:
-            array_stats.append({'name': array, 'type': 'FB',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_fb'],
-                                'avg_lag': sum(all_lags)/len(all_lags) if all_lags else None,
-                                'max_lag': max(all_lags) if all_lags else None,
-                                'repl_details': repl_rows})
+            stat = {'name': array, 'type': 'FB',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_fb'],
+                    'avg_lag': sum(all_lags)/len(all_lags) if all_lags else None,
+                    'max_lag': max(all_lags) if all_lags else None,
+                    'repl_details': repl_rows}
         except Exception as e:
-            repl_lines.append(f"{array} - Repl Error: {str(e)}")
-            array_stats.append({'name': array, 'type': 'FB',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_fb'],
-                                'avg_lag': None, 'max_lag': None,
-                                'repl_details': []})
-        repl_lines.append("")
+            local_repl_lines.append(f"{array} - Repl Error: {str(e)}")
+            stat = {'name': array, 'type': 'FB',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_fb'],
+                    'avg_lag': None, 'max_lag': None,
+                    'repl_details': []}
+        local_repl_lines.append("")
+        return local_alert_lines, local_repl_lines, stat
 
-    # FA-File Loop
-    for array in config['arr_faf']:
-        check_alert(array, config['user_faf'])
+    if config['arr_fb']:
+        _workers = min(4, len(config['arr_fb']))
+        with ThreadPoolExecutor(max_workers=_workers) as _ex:
+            for _la, _lr, _st in _ex.map(_fb_one, list(config['arr_fb'])):
+                alert_lines.extend(_la)
+                repl_lines.extend(_lr)
+                if _st is not None:
+                    array_stats.append(_st)
+
+    # FA-File Loop -- up to 4 arrays concurrent; same buffer-and-merge
+    # pattern as FB so the merged output preserves arr_faf input order.
+    def _faf_one(array):
+        local_alert_lines = []
+        local_repl_lines = []
+        check_alert(array, config['user_faf'], local_alert_lines)
+        _p(f"Collecting array {array} Replication...")
         all_avgs, all_maxes = [], []
         repl_rows = []
+        stat = None
         try:
             if ALERT_DEBUG:
-                _, _, avg_s, max_s = _get_debug_alerts(array, list(alert_counts.keys()).index(array))
+                _, _, avg_s, max_s = _get_debug_alerts(array, _debug_idx_by_array.get(array, 0))
                 all_avgs  = [avg_s]
                 all_maxes = [max_s]
                 repl_rows = [
@@ -1000,10 +1160,10 @@ def run_collection_core(config, nogui=False):
                      'SLA Status': 'Exceeded' if avg_s > config['sla_faf'] else 'OK'},
                 ]
                 if max_s > config['sla_faf']:
-                    repl_lines.append(f"[ALERT-DEBUG] {array} - FA File Replication SLA exceeded "
+                    local_repl_lines.append(f"[ALERT-DEBUG] {array} - FA File Replication SLA exceeded "
                                       f"(simulated max lag {format_seconds_human(max_s)} vs SLA {format_seconds_human(config['sla_faf'])})")
                 else:
-                    repl_lines.append(f"[ALERT-DEBUG] {array} - FA File Replication: Healthy (synthetic data)")
+                    local_repl_lines.append(f"[ALERT-DEBUG] {array} - FA File Replication: Healthy (synthetic data)")
                 raise _AlertDebugSkip()
             out = run_ssh_command(array, config['user_faf'], "purepod replica-link list --historical 24h --lag --csv", log_list=detailed_logs, nogui=nogui)
             rows = list(csv.reader(io.StringIO(out)))
@@ -1033,38 +1193,52 @@ def run_collection_core(config, nogui=False):
                 for line, act, req in bad:
                     block.extend([line, f"SLA = {format_seconds_human(req)} vs Actual = {format_seconds_human(act)} --- A SLA violation of {format_seconds_human(act-req)}"])
                     prefs.extend([f"{array} - Repl Exceeded:", f"{array} - SLA Status:"])
-                repl_lines.extend(format_csv(block, prefs))
-            else: repl_lines.append(f"{array} - FA File Replication: Healthy")
-            array_stats.append({'name': array, 'type': 'FA-File',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_faf'],
-                                'avg_lag': sum(all_avgs)/len(all_avgs) if all_avgs else None,
-                                'max_lag': max(all_maxes) if all_maxes else None,
-                                'repl_details': repl_rows})
+                local_repl_lines.extend(format_csv(block, prefs))
+            else: local_repl_lines.append(f"{array} - FA File Replication: Healthy")
+            stat = {'name': array, 'type': 'FA-File',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_faf'],
+                    'avg_lag': sum(all_avgs)/len(all_avgs) if all_avgs else None,
+                    'max_lag': max(all_maxes) if all_maxes else None,
+                    'repl_details': repl_rows}
         except _AlertDebugSkip:
-            array_stats.append({'name': array, 'type': 'FA-File',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_faf'],
-                                'avg_lag': sum(all_avgs)/len(all_avgs) if all_avgs else None,
-                                'max_lag': max(all_maxes) if all_maxes else None,
-                                'repl_details': repl_rows})
+            stat = {'name': array, 'type': 'FA-File',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_faf'],
+                    'avg_lag': sum(all_avgs)/len(all_avgs) if all_avgs else None,
+                    'max_lag': max(all_maxes) if all_maxes else None,
+                    'repl_details': repl_rows}
         except Exception as e:
-            repl_lines.append(f"{array} - Repl Error: {str(e)}")
-            array_stats.append({'name': array, 'type': 'FA-File',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_faf'],
-                                'avg_lag': None, 'max_lag': None,
-                                'repl_details': []})
-        repl_lines.append("")
+            local_repl_lines.append(f"{array} - Repl Error: {str(e)}")
+            stat = {'name': array, 'type': 'FA-File',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_faf'],
+                    'avg_lag': None, 'max_lag': None,
+                    'repl_details': []}
+        local_repl_lines.append("")
+        return local_alert_lines, local_repl_lines, stat
 
-    # FA-Block Loop
-    for array in config['arr_fab']:
-        check_alert(array, config['user_fab'])
+    if config['arr_faf']:
+        _workers = min(4, len(config['arr_faf']))
+        with ThreadPoolExecutor(max_workers=_workers) as _ex:
+            for _la, _lr, _st in _ex.map(_faf_one, list(config['arr_faf'])):
+                alert_lines.extend(_la)
+                repl_lines.extend(_lr)
+                if _st is not None:
+                    array_stats.append(_st)
+
+    # FA-Block Loop -- up to 4 arrays concurrent; same pattern as FB/FA-File.
+    def _fab_one(array):
+        local_alert_lines = []
+        local_repl_lines = []
+        check_alert(array, config['user_fab'], local_alert_lines)
+        _p(f"Collecting array {array} Replication...")
         all_diffs = []
         repl_rows = []
+        stat = None
         try:
             if ALERT_DEBUG:
-                _, _, avg_s, max_s = _get_debug_alerts(array, list(alert_counts.keys()).index(array))
+                _, _, avg_s, max_s = _get_debug_alerts(array, _debug_idx_by_array.get(array, 0))
                 all_diffs = [avg_s, max_s]
                 _now_dbg = datetime.datetime.now()
                 repl_rows = [
@@ -1082,10 +1256,10 @@ def run_collection_core(config, nogui=False):
                      'SLA Status': 'Exceeded' if avg_s > config['sla_fab'] else 'OK'},
                 ]
                 if max_s > config['sla_fab']:
-                    repl_lines.append(f"[ALERT-DEBUG] {array} - FA Block Replication SLA exceeded "
+                    local_repl_lines.append(f"[ALERT-DEBUG] {array} - FA Block Replication SLA exceeded "
                                       f"(simulated max lag {format_seconds_human(max_s)} vs SLA {format_seconds_human(config['sla_fab'])})")
                 else:
-                    repl_lines.append(f"[ALERT-DEBUG] {array} - FA Block Replication: Healthy (synthetic data)")
+                    local_repl_lines.append(f"[ALERT-DEBUG] {array} - FA Block Replication: Healthy (synthetic data)")
                 raise _AlertDebugSkip()
             time_out = run_ssh_command(array, config['user_fab'], "purearray list --time", log_list=detailed_logs, nogui=nogui)
             tm = re.search(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', time_out)
@@ -1142,29 +1316,39 @@ def run_collection_core(config, nogui=False):
                     for line, act, req, ct in bad:
                         block.extend([line, f"SLA = {format_seconds_human(req)} vs Actual = {format_seconds_human(act)} {ct} --- A SLA violation of {format_seconds_human(act-req)}"])
                         prefs.extend([f"{array} - Block Repl SLA Exceeded:", f"{array} - SLA Status:"])
-                    repl_lines.extend(format_csv(block, prefs))
-                else: repl_lines.append(f"{array} - FA Block Replication: Healthy")
-            array_stats.append({'name': array, 'type': 'FA-Block',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_fab'],
-                                'avg_lag': sum(all_diffs)/len(all_diffs) if all_diffs else None,
-                                'max_lag': max(all_diffs) if all_diffs else None,
-                                'repl_details': repl_rows})
+                    local_repl_lines.extend(format_csv(block, prefs))
+                else: local_repl_lines.append(f"{array} - FA Block Replication: Healthy")
+            stat = {'name': array, 'type': 'FA-Block',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_fab'],
+                    'avg_lag': sum(all_diffs)/len(all_diffs) if all_diffs else None,
+                    'max_lag': max(all_diffs) if all_diffs else None,
+                    'repl_details': repl_rows}
         except _AlertDebugSkip:
-            array_stats.append({'name': array, 'type': 'FA-Block',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_fab'],
-                                'avg_lag': sum(all_diffs)/len(all_diffs) if all_diffs else None,
-                                'max_lag': max(all_diffs) if all_diffs else None,
-                                'repl_details': repl_rows})
+            stat = {'name': array, 'type': 'FA-Block',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_fab'],
+                    'avg_lag': sum(all_diffs)/len(all_diffs) if all_diffs else None,
+                    'max_lag': max(all_diffs) if all_diffs else None,
+                    'repl_details': repl_rows}
         except Exception as e:
-            repl_lines.append(f"{array} - Repl Error: {str(e)}")
-            array_stats.append({'name': array, 'type': 'FA-Block',
-                                **_alert_dict(array),
-                                'sla_target': config['sla_fab'],
-                                'avg_lag': None, 'max_lag': None,
-                                'repl_details': []})
-        repl_lines.append("")
+            local_repl_lines.append(f"{array} - Repl Error: {str(e)}")
+            stat = {'name': array, 'type': 'FA-Block',
+                    **_alert_dict(array),
+                    'sla_target': config['sla_fab'],
+                    'avg_lag': None, 'max_lag': None,
+                    'repl_details': []}
+        local_repl_lines.append("")
+        return local_alert_lines, local_repl_lines, stat
+
+    if config['arr_fab']:
+        _workers = min(4, len(config['arr_fab']))
+        with ThreadPoolExecutor(max_workers=_workers) as _ex:
+            for _la, _lr, _st in _ex.map(_fab_one, list(config['arr_fab'])):
+                alert_lines.extend(_la)
+                repl_lines.extend(_lr)
+                if _st is not None:
+                    array_stats.append(_st)
 
     # Attach hardware-health, replication-relationship, and location metadata
     # to every array_stats entry (an FA array that appears in both FA-File and
@@ -1210,6 +1394,7 @@ def run_collection_core(config, nogui=False):
                 f"{_a} ({_info.get('platform','')}{_loc_suffix(_a)}) "
                 f"- No replication relationships configured")
 
+    _p("Compiling Reports...")
     final  = "=== HARDWARE HEALTH SECTION ===\n" + "\n".join(hw_lines) + "\n\n"
     final += "=== ALERTS SECTION ===\n" + "\n".join(alert_lines)
     final += "\n=== REPLICATION SECTION ===\n" + "\n".join(repl_lines)
@@ -2467,8 +2652,12 @@ class PureMonitorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Everpure (Pure Storage) - Alert and Replication SLA Status Report")
-        self.geometry("1100x800")
-        
+        # 1000 px tall fits the 660 px Configuration pane (3 user rows +
+        # alerts + 15-row Arrays sheet + checkbox + LabelFrame chrome) and
+        # leaves room for the button bar plus an 8-row output log without
+        # the sheet getting squeezed by the PanedWindow's initial layout.
+        self.geometry("1100x1000")
+
         _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "pure_logo.png")
         if os.path.exists(_icon):
             try:
@@ -2518,47 +2707,60 @@ class PureMonitorApp(tk.Tk):
         Uses ``tksheet`` when available; otherwise falls back to a simple two-
         column Treeview-based editor so the app still runs without tksheet.
         """
-        rows = [[n, l] for n, l in unified_arrays_from_config(config)]
-        # Pad with 30 blank rows at the end on startup so the user has ample
+        rows = [[n, l, nt] for n, l, nt in unified_arrays_from_config_full(config)]
+        # Pad with 50 blank rows at the end on startup so the user has ample
         # scratch space to paste into without having to insert rows first.
-        # Ongoing upkeep (via _ensure_trailing_blank_rows) only maintains a
-        # 2-row tail, but the initial load keeps the original 30 visible.
-        # NOTE: must construct each row as its own list \u2014 [['',''] ] * 30 would
-        # create 30 references to the same inner list, so writing one cell
+        # _ensure_trailing_blank_rows then appends another 50 in one batch
+        # whenever the user fills the last visible blank row, so the sheet
+        # auto-grows in 50-row chunks rather than one row at a time.
+        # NOTE: must construct each row as its own list \u2014 [['','',''] ] * 50 would
+        # create 50 references to the same inner list, so writing one cell
         # would propagate the value into every padding row.
-        rows.extend([['', ''] for _ in range(30)])
+        rows.extend([['', '', ''] for _ in range(50)])
 
         sheet_frame = ttk.Frame(parent)
         sheet_frame.grid(row=4, column=1, columnspan=2, rowspan=3,
                          sticky=tk.NSEW, padx=(0, 0), pady=2)
-        # Let the sheet grow when the user resizes the window.
+        # Kept on self so the <Configure> handler in _on_sheet_resize can
+        # query the live frame width and redistribute column widths.
+        self._sheet_frame = sheet_frame
+        # Let the sheet grow when the user resizes the window or drags the
+        # main vertical PanedWindow sash to give Configuration more height.
         parent.rowconfigure(4, weight=1)
         parent.rowconfigure(5, weight=1)
         parent.rowconfigure(6, weight=1)
-        # Reserve enough horizontal space in the grid cell for the sheet,
-        # but don't let it grow beyond that: weight=0 keeps the extra width
-        # from the window (if any) out of this grid cell, so empty space
-        # never appears to the right of the Location column.
-        parent.columnconfigure(1, minsize=290, weight=0)
-        parent.columnconfigure(2, minsize=295, weight=0)
+        # weight=1 lets the grid cell expand horizontally when the parent
+        # frame is wider than the sheet's reserved minsize, so the sheet's
+        # drawing area tracks the visible width rather than being clipped.
+        parent.columnconfigure(1, minsize=290, weight=1)
+        parent.columnconfigure(2, minsize=295, weight=1)
 
         if HAS_TKSHEET:
-            # Width sized to exactly fit the three columns with no empty
-            # gutter on the right:
-            #   row-index (40) + Array (270) + Location (255) = 565 content
-            #   + vertical scrollbar (~18) + widget border (~2) \u2248 585.
-            # Height tuned to show ~8 data rows plus the header comfortably.
+            # Initial width/height are just a starting size; fill=BOTH +
+            # expand=True below makes the sheet's drawing area track the
+            # frame size, so the columns stay inside the visible widget
+            # rather than being clipped, and the user can grow the sheet
+            # by dragging the main vertical PanedWindow sash downward.
+            # height=466 px targets ~15 visible data rows on first paint
+            # (header ~28 + 15 rows x ~28 + horizontal scrollbar ~18); the
+            # ttk.PanedWindow uses each pane's requested height to seed the
+            # initial sash position, so this is what determines how many
+            # rows the user sees before they touch the sash.
             # show_row_index=True enables a non-editable gutter to the left
             # of "Array" that _refresh_arrays_row_index populates with a
             # 1-based count of rows that actually have a name filled in.
             self.arrays_sheet = Sheet(
                 sheet_frame,
-                headers=["Array", "Location"],
+                headers=["Array", "Location", "Notes"],
                 data=rows,
-                width=585, height=260,
+                width=585, height=466,
                 show_row_index=True,
                 show_top_left=False,
-                show_x_scrollbar=False,
+                # Always render the horizontal scrollbar so when the user
+                # widens either column past the widget's visible width the
+                # extra content is reachable by sliding the thumb at the
+                # bottom.
+                show_x_scrollbar=True,
             )
             self.arrays_sheet.enable_bindings((
                 "single_select", "drag_select", "arrowkeys", "edit_cell",
@@ -2591,16 +2793,21 @@ class PureMonitorApp(tk.Tk):
             # are persisted back by _save_config under 'arrays_col_widths').
             _saved_w = config.get('arrays_col_widths') or []
             try:
-                w0 = int(_saved_w[0]) if len(_saved_w) > 0 and _saved_w[0] else 270
+                w0 = int(_saved_w[0]) if len(_saved_w) > 0 and _saved_w[0] else 200
             except Exception:
-                w0 = 270
+                w0 = 200
             try:
-                w1 = int(_saved_w[1]) if len(_saved_w) > 1 and _saved_w[1] else 255
+                w1 = int(_saved_w[1]) if len(_saved_w) > 1 and _saved_w[1] else 165
             except Exception:
-                w1 = 255
+                w1 = 165
+            try:
+                w2 = int(_saved_w[2]) if len(_saved_w) > 2 and _saved_w[2] else 200
+            except Exception:
+                w2 = 200
             try:
                 self.arrays_sheet.column_width(column=0, width=w0)
                 self.arrays_sheet.column_width(column=1, width=w1)
+                self.arrays_sheet.column_width(column=2, width=w2)
             except Exception:
                 pass
             # Narrow non-editable row-number gutter; populated with a
@@ -2609,10 +2816,16 @@ class PureMonitorApp(tk.Tk):
                 self.arrays_sheet.set_index_width(40)
             except Exception:
                 pass
-            # fill=tk.Y (not BOTH) keeps the sheet at its requested width
-            # so the three columns fill the widget edge-to-edge and nothing
-            # shifts horizontally when the user edits a Location cell.
-            self.arrays_sheet.pack(side=tk.LEFT, fill=tk.Y, expand=True)
+            # fill=tk.BOTH + expand=True lets the sheet's drawing area
+            # track the frame's actual size, so when the user enlarges the
+            # window or drags the vertical PanedWindow sash downward the
+            # sheet absorbs the extra space (more visible rows / wider
+            # columns) instead of staying pinned to its initial 585x466.
+            self.arrays_sheet.pack(fill=tk.BOTH, expand=True)
+            # Bind on the frame (not the sheet) so we get exactly one
+            # <Configure> per geometry change and can read the authoritative
+            # available width before redistributing column widths.
+            sheet_frame.bind('<Configure>', self._on_sheet_resize)
             try:
                 self._refresh_arrays_row_index()
             except Exception:
@@ -2621,17 +2834,21 @@ class PureMonitorApp(tk.Tk):
             # Fallback: two synced text boxes. Keeps the app usable without
             # tksheet (diagnostics prompt shown at run time).
             self.arrays_sheet = None
-            self._fallback_arr_txt = scrolledtext.ScrolledText(sheet_frame, width=30, height=6)
-            self._fallback_loc_txt = scrolledtext.ScrolledText(sheet_frame, width=20, height=6)
+            self._fallback_arr_txt   = scrolledtext.ScrolledText(sheet_frame, width=30, height=6)
+            self._fallback_loc_txt   = scrolledtext.ScrolledText(sheet_frame, width=20, height=6)
+            self._fallback_notes_txt = scrolledtext.ScrolledText(sheet_frame, width=24, height=6)
             self._fallback_arr_txt.pack(side=tk.LEFT, fill=tk.Y)
             self._fallback_loc_txt.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
-            self._fallback_arr_txt.insert(tk.END, "\n".join(r[0] for r in rows))
-            self._fallback_loc_txt.insert(tk.END, "\n".join(r[1] for r in rows))
+            self._fallback_notes_txt.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
+            self._fallback_arr_txt.insert(tk.END,   "\n".join(r[0] for r in rows))
+            self._fallback_loc_txt.insert(tk.END,   "\n".join(r[1] for r in rows))
+            self._fallback_notes_txt.insert(tk.END, "\n".join((r[2] if len(r) > 2 else '') for r in rows))
             self._add_context_menu(self._fallback_arr_txt)
             self._add_context_menu(self._fallback_loc_txt)
+            self._add_context_menu(self._fallback_notes_txt)
 
     def _get_arrays_from_sheet(self):
-        """Return [(name, location), ...] from the unified sheet editor.
+        """Return [(name, location, notes), ...] from the unified sheet editor.
 
         Drops rows whose name is blank after whitespace trimming.
         """
@@ -2647,13 +2864,26 @@ class PureMonitorApp(tk.Tk):
                 name = str(row[0] if len(row) > 0 else '').strip()
                 if not name:
                     continue
-                loc = str(row[1] if len(row) > 1 else '').strip()
-                out.append((name, loc))
+                loc   = str(row[1] if len(row) > 1 else '').strip()
+                notes = str(row[2] if len(row) > 2 else '').strip()
+                out.append((name, loc, notes))
             return out
-        # Fallback path
-        arr_txt = self._fallback_arr_txt.get("1.0", tk.END) if hasattr(self, '_fallback_arr_txt') else ''
-        loc_txt = self._fallback_loc_txt.get("1.0", tk.END) if hasattr(self, '_fallback_loc_txt') else ''
-        return list(zip(*parse_arr_loc(arr_txt, loc_txt)))
+        # Fallback path: three synced ScrolledText boxes (Array / Location / Notes).
+        arr_lines = (self._fallback_arr_txt.get("1.0", tk.END)
+                     if hasattr(self, '_fallback_arr_txt') else '').splitlines()
+        loc_lines = (self._fallback_loc_txt.get("1.0", tk.END)
+                     if hasattr(self, '_fallback_loc_txt') else '').splitlines()
+        notes_lines = (self._fallback_notes_txt.get("1.0", tk.END)
+                       if hasattr(self, '_fallback_notes_txt') else '').splitlines()
+        out = []
+        for i, name in enumerate(arr_lines):
+            name = name.strip()
+            if not name:
+                continue
+            loc   = loc_lines[i].strip()   if i < len(loc_lines)   else ''
+            notes = notes_lines[i].strip() if i < len(notes_lines) else ''
+            out.append((name, loc, notes))
+        return out
 
     def _install_single_cell_paste(self, sheet):
         """Rebind Ctrl-V on the sheet so pasting always targets a single cell.
@@ -2701,11 +2931,75 @@ class PureMonitorApp(tk.Tk):
                 except Exception:
                     pass
 
-    def _ensure_trailing_blank_rows(self, event=None, min_trailing=2):
-        """Keep at least *min_trailing* fully-blank rows at the bottom of the
-        arrays sheet. Called after edits / pastes / row inserts / deletes so
-        the sheet auto-grows whenever the user fills in the last free row or
-        pastes a block that reaches the end.
+    def _on_sheet_resize(self, event=None):
+        """Redistribute Array/Location/Notes column widths when the arrays
+        sheet frame is resized (window resize, PanedWindow sash drag, etc.).
+
+        The three columns are stretched proportionally to their current
+        width ratio so any user-driven column resize is preserved across
+        subsequent frame resizes; columns are floored at 60 px each so
+        they cannot collapse below a usable minimum.
+        """
+        sheet = getattr(self, 'arrays_sheet', None)
+        sf = getattr(self, '_sheet_frame', None)
+        if sheet is None or sf is None:
+            return
+        # Re-entrancy guard: column_width() writes can theoretically
+        # bounce a <Configure> back through tksheet's internal layout.
+        if getattr(self, '_sheet_resize_guard', False):
+            return
+        try:
+            # Available drawing width = frame width - row-index gutter (40)
+            # - vertical scrollbar (~18) - widget borders (~4).
+            avail = sf.winfo_width() - 62
+        except Exception:
+            return
+        # Skip until the frame has a real geometry; the first <Configure>
+        # often fires with width=1 before the layout has settled.
+        if avail < 200:
+            return
+        try:
+            w0 = int(sheet.column_width(column=0))
+            w1 = int(sheet.column_width(column=1))
+            w2 = int(sheet.column_width(column=2))
+        except Exception:
+            return
+        total = max(w0 + w1 + w2, 1)
+        r0 = w0 / total
+        r1 = w1 / total
+        new_w0 = max(60, int(avail * r0))
+        new_w1 = max(60, int(avail * r1))
+        new_w2 = max(60, avail - new_w0 - new_w1)
+        if new_w0 == w0 and new_w1 == w1 and new_w2 == w2:
+            return
+        self._sheet_resize_guard = True
+        try:
+            try:
+                sheet.column_width(column=0, width=new_w0)
+                sheet.column_width(column=1, width=new_w1)
+                sheet.column_width(column=2, width=new_w2)
+                # refresh() forces tksheet to repaint with the new widths
+                # without waiting for the next user interaction.
+                try:
+                    sheet.refresh()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        finally:
+            self._sheet_resize_guard = False
+
+    def _ensure_trailing_blank_rows(self, event=None,
+                                    min_trailing=1, grow_chunk=50):
+        """Auto-grow the arrays sheet in 50-row chunks.
+
+        Triggered by ``<<SheetModified>>`` (and explicit calls) so that
+        whenever the user fills in the last blank row \u2014 or pastes a block
+        that consumes all of the trailing blanks \u2014 a fresh batch of
+        *grow_chunk* empty rows is appended in one go. Keeping the
+        threshold at *min_trailing=1* means the user always has at least
+        one ready-to-edit blank row at the bottom; growth happens in
+        50-row increments rather than topping up one row at a time.
         """
         sheet = getattr(self, 'arrays_sheet', None)
         if sheet is None:
@@ -2729,7 +3023,10 @@ class PureMonitorApp(tk.Tk):
             else:
                 break
 
-        needed = min_trailing - trailing
+        # Add a full grow_chunk batch (50 rows) when the trailing blank
+        # count drops below the threshold, instead of just topping up to
+        # the threshold one row at a time.
+        needed = grow_chunk if trailing < min_trailing else 0
         if needed > 0:
             self._blank_row_guard = True
             try:
@@ -2747,11 +3044,11 @@ class PureMonitorApp(tk.Tk):
                     try:
                         sheet.insert_rows(rows=needed, idx="end", redraw=True)
                     except Exception:
-                        new_data = list(data) + [['', ''] for _ in range(needed)]
+                        new_data = list(data) + [['', '', ''] for _ in range(needed)]
                         sheet.set_sheet_data(new_data, redraw=True)
                 except Exception:
                     # Fallback: rebuild the data in one shot.
-                    new_data = list(data) + [['', ''] for _ in range(needed)]
+                    new_data = list(data) + [['', '', ''] for _ in range(needed)]
                     sheet.set_sheet_data(new_data, redraw=True)
             finally:
                 self._blank_row_guard = False
@@ -2799,9 +3096,23 @@ class PureMonitorApp(tk.Tk):
 
         main_frame = ttk.Frame(self, padding=5)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        config_frame = ttk.LabelFrame(main_frame, text="Configuration", padding=5)
-        config_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Vertical PanedWindow lets the user redistribute height between the
+        # Configuration pane (which hosts the Arrays sheet) and the lower
+        # pane (button bar + run-output log). Dragging the sash downward
+        # grows the sheet; dragging it upward grows the output log.
+        # sashrelief=RAISED makes the divider visually grabbable.
+        main_paned = ttk.PanedWindow(main_frame, orient=tk.VERTICAL)
+        main_paned.pack(fill=tk.BOTH, expand=True)
+        self._main_paned = main_paned
+
+        config_frame = ttk.LabelFrame(main_paned, text="Configuration", padding=5)
+        # weight=3 biases initial sash placement toward the Configuration
+        # pane so the sheet has room for ~8-10 visible rows on first launch.
+        main_paned.add(config_frame, weight=3)
+        # Kept on self so _show_busy_spinner can grid an inline spinner
+        # widget directly under the Everpure logo (column 5).
+        self._config_frame = config_frame
         
         # Label wraplength roughly 100px.
         WL = 100
@@ -2895,8 +3206,35 @@ class PureMonitorApp(tk.Tk):
         self._smtp_from   = config.get("smtp_from",   "")
         self._smtp_to     = config.get("smtp_to",     "")
 
+        # ── Lower pane: button bar + run-output log ──────────────────────────
+        # Wrapping btn_frame and text_out in a single Frame lets us add them
+        # to the PanedWindow as one pane; the user-draggable sash above it
+        # grows or shrinks the Configuration pane (and the Arrays sheet
+        # inside it) at the expense of this lower pane.
+        lower_pane = ttk.Frame(main_paned)
+        # weight=2 leaves a usable initial slice of the window for the
+        # output log while still favoring the Configuration pane on top.
+        main_paned.add(lower_pane, weight=2)
+
+        # ttk.PanedWindow seeds its sash position from each pane's
+        # *requested* size; under tight initial geometry the lower pane's
+        # ScrolledText can out-bid the Configuration pane and squeeze the
+        # Arrays sheet down to a few visible rows. Force the sash to the
+        # target Configuration height after the first idle pass so 15
+        # data rows are visible regardless of initial window height.
+        # Target: 3 user rows + alerts + 15-row sheet + checkbox + label
+        # frame chrome ~= 660 px. update_idletasks forces the geometry
+        # manager to compute sizes before we read/set the sash.
+        def _set_initial_sash():
+            try:
+                main_paned.update_idletasks()
+                main_paned.sashpos(0, 660)
+            except Exception:
+                pass
+        self.after_idle(_set_initial_sash)
+
         # ── Button bar ────────────────────────────────────────────────────────
-        btn_frame = ttk.Frame(main_frame)
+        btn_frame = ttk.Frame(lower_pane)
         btn_frame.pack(fill=tk.X, pady=5)
 
         # Email button packed RIGHT first so it anchors to the far edge
@@ -2925,7 +3263,11 @@ class PureMonitorApp(tk.Tk):
         ttk.Button(btn_frame, text="Open History Report",
                    command=self._show_health_history).pack(side=tk.LEFT, padx=5)
         
-        self.text_out = scrolledtext.ScrolledText(main_frame, wrap=tk.NONE)
+        # height=8 (rows) caps the ScrolledText's natural requested height
+        # so it doesn't out-bid the Configuration pane for vertical space
+        # in the PanedWindow on first paint. fill=BOTH + expand=True still
+        # lets it grow when the user drags the sash upward.
+        self.text_out = scrolledtext.ScrolledText(lower_pane, wrap=tk.NONE, height=8)
         self.text_out.pack(fill=tk.BOTH, expand=True)
 
     def check_queue(self):
@@ -2946,7 +3288,8 @@ class PureMonitorApp(tk.Tk):
         return {}
 
     def _save_config(self):
-        arrays = [{"name": n, "location": l} for n, l in self._get_arrays_from_sheet()]
+        arrays = [{"name": n, "location": l, "notes": nt}
+                  for n, l, nt in self._get_arrays_from_sheet()]
         # Capture the current Arrays-sheet column widths so any user-driven
         # resize (drag separator / double-click auto-fit) survives restart.
         col_widths = []
@@ -2954,7 +3297,8 @@ class PureMonitorApp(tk.Tk):
             _sheet = getattr(self, 'arrays_sheet', None)
             if _sheet is not None:
                 col_widths = [int(_sheet.column_width(column=0)),
-                              int(_sheet.column_width(column=1))]
+                              int(_sheet.column_width(column=1)),
+                              int(_sheet.column_width(column=2))]
         except Exception:
             col_widths = []
         data = {
@@ -3018,7 +3362,7 @@ class PureMonitorApp(tk.Tk):
             for a in _last.get('arr_fab', []):
                 header += f"FA-Block Array - {a}\n"
         else:
-            for n, l in self._get_arrays_from_sheet():
+            for n, l, _nt in self._get_arrays_from_sheet():
                 header += f"Array - {n}" + (f"  ({l})" if l else "") + "\n"
 
         pairs = self.config_data.get('replication_pairs', [])
@@ -3058,26 +3402,24 @@ class PureMonitorApp(tk.Tk):
                 messagebox.showerror("Error", f"Failed to save file: {e}")
 
     def _show_busy_spinner(self, message="Running report..."):
-        """Pop up a small transient window with a spinning logo.
+        """Embed a spinning logo directly in the Configuration frame,
+        immediately under the Everpure logo (column 5, row 3+).
 
         Cycles through FB-Green.png \u2192 FA-Green.png \u2192 everpure_logo.png
         (and wraps) on successive invocations so each logo gets equal
-        screen time. When an image is available the window is shown
-        chrome-less with a chroma-keyed transparent background (Windows)
-        so only the rotating logo itself is visible. Falls back to a titled
-        window with an indeterminate ttk.Progressbar if Pillow isn't
-        available or none of the candidate images exist. Safe to call
-        repeatedly \u2014 subsequent calls while a spinner is already visible
-        are no-ops.
+        screen time. Silent no-op when Pillow isn't available or none
+        of the candidate images exist. Safe to call repeatedly \u2014
+        subsequent calls while a spinner is already visible are no-ops.
+        The *message* argument is currently unused (kept for call-site
+        compatibility) since the main text output already announces
+        "Polling arrays...".
         """
         try:
             if getattr(self, '_busy_spinner_win', None) is not None:
                 return
-            top = tk.Toplevel(self)
-            top.title("Working")
-            top.transient(self)
-            top.resizable(False, False)
-            top.protocol("WM_DELETE_WINDOW", lambda: None)
+            parent = getattr(self, '_config_frame', None)
+            if parent is None or not HAS_PIL:
+                return
 
             import math
             _img_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
@@ -3085,16 +3427,15 @@ class PureMonitorApp(tk.Tk):
             _existing = [os.path.join(_img_dir, n)
                          for n in _candidates
                          if os.path.exists(os.path.join(_img_dir, n))]
+            if not _existing:
+                return
             # Round-robin selection: advance an instance counter each call
-            # so the three logos rotate 1 \u2192 2 \u2192 3 \u2192 1 \u2026 instead of random,
-            # which historically favored the first two by chance.
-            if _existing:
-                idx = getattr(self, '_busy_img_idx', -1) + 1
-                idx %= len(_existing)
-                self._busy_img_idx = idx
-                img_path = _existing[idx]
-            else:
-                img_path = None
+            # so the three logos rotate 1 \u2192 2 \u2192 3 \u2192 1 \u2026.
+            idx = getattr(self, '_busy_img_idx', -1) + 1
+            idx %= len(_existing)
+            self._busy_img_idx = idx
+            img_path = _existing[idx]
+
             self._busy_pil_img   = None
             self._busy_tk_img    = None
             self._busy_angle     = 0
@@ -3102,106 +3443,74 @@ class PureMonitorApp(tk.Tk):
             self._busy_img_label = None
             self._busy_canvas_sz = 0
 
-            if HAS_PIL and img_path is not None:
-                # Image-only mode: strip window chrome and chroma-key the
-                # background so only the rotating logo is visible on screen.
-                # overrideredirect(True) takes the window out of the WM's
-                # control, which also neutralizes transient()/focus and can
-                # leave it behind the main window \u2014 force -topmost so it
-                # actually appears in front.
-                _chroma = "#ff00fe"
-                try:
-                    top.overrideredirect(True)
-                    top.configure(bg=_chroma)
-                    top.attributes("-transparentcolor", _chroma)
-                    top.attributes("-topmost", True)
-                except Exception:
-                    pass
+            # Per-image target widths \u2014 the logos are all wider than tall
+            # (e.g. everpure_logo is ~997x183, ~5.4:1), so forcing them
+            # all to 96x96 squished them. Preserve aspect ratio and give
+            # the very-wide everpure logo double the nominal width.
+            _target_widths = {
+                "everpure_logo.png": 192,
+                "FB-Green.png":       96,
+                "FA-Green.png":       96,
+            }
+            orig = Image.open(img_path).convert("RGBA")
+            tw = _target_widths.get(os.path.basename(img_path), 96)
+            th = max(1, int(round(tw * orig.height / orig.width)))
+            pil = orig.resize((tw, th), Image.Resampling.LANCZOS)
+            self._busy_pil_img = pil
+            # Fixed canvas >= image diagonal so rotation never clips the
+            # corners or resizes the Label as the angle changes.
+            diag = int(math.ceil(math.sqrt(tw * tw + th * th)))
+            self._busy_canvas_sz = diag + 4
 
-                # Per-image target widths \u2014 the logos are all wider than tall
-                # (e.g. everpure_logo is ~997x183, ~5.4:1), so forcing them
-                # all to 96x96 squished them. Preserve aspect ratio and give
-                # the very-wide everpure logo double the nominal width.
-                _target_widths = {
-                    "everpure_logo.png": 192,
-                    "FB-Green.png":       96,
-                    "FA-Green.png":       96,
-                }
-                orig = Image.open(img_path).convert("RGBA")
-                tw = _target_widths.get(os.path.basename(img_path), 96)
-                th = max(1, int(round(tw * orig.height / orig.width)))
-                pil = orig.resize((tw, th), Image.Resampling.LANCZOS)
-                self._busy_pil_img = pil
-                # Fixed canvas >= image diagonal so rotation never clips the
-                # corners or resizes the Label as the angle changes.
-                diag = int(math.ceil(math.sqrt(tw * tw + th * th)))
-                self._busy_canvas_sz = diag + 4
+            sz = self._busy_canvas_sz
+            initial = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+            ox = (sz - tw) // 2
+            oy = (sz - th) // 2
+            initial.paste(pil, (ox, oy), pil)
+            self._busy_tk_img = ImageTk.PhotoImage(initial)
 
-                sz = self._busy_canvas_sz
-                initial = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
-                ox = (sz - tw) // 2
-                oy = (sz - th) // 2
-                initial.paste(pil, (ox, oy), pil)
-                self._busy_tk_img = ImageTk.PhotoImage(initial)
-
-                lbl = tk.Label(top, image=self._busy_tk_img, bg=_chroma,
-                               borderwidth=0, highlightthickness=0)
-                lbl.pack(padx=0, pady=0)
-                self._busy_img_label = lbl
-            else:
-                pb = ttk.Progressbar(top, mode="indeterminate", length=180)
-                pb.pack(padx=24, pady=(20, 8))
-                pb.start(10)
-                ttk.Label(top, text=message).pack(padx=24, pady=(0, 20))
-
-            # Compute target position: horizontally centered on the main
-            # window, vertically 1/4 of the way down from its top edge.
-            # winfo_* on the root requires that the window actually exists
-            # on screen, which it does by the time Run Report is clicked;
-            # update_idletasks() flushes any pending geometry changes so
-            # the values returned are current.
-            def _place_spinner():
-                try:
-                    self.update_idletasks()
-                    sz   = self._busy_canvas_sz if self._busy_canvas_sz else 160
-                    half = sz // 2
-                    rx = self.winfo_rootx()
-                    ry = self.winfo_rooty()
-                    rw = self.winfo_width()
-                    rh = self.winfo_height()
-                    # Fall back to screen-center when the root hasn't
-                    # reported a real size yet (rare; can happen if the
-                    # method is called before the app is fully mapped).
-                    if rw <= 1 or rh <= 1:
-                        rx, ry = 0, 0
-                        rw = self.winfo_screenwidth()
-                        rh = self.winfo_screenheight()
-                    x = rx + (rw // 2)     - half
-                    y = ry + (rh // 4)     - half
-                    if self._busy_canvas_sz:
-                        top.geometry(f"{sz}x{sz}+{max(0, x)}+{max(0, y)}")
-                    else:
-                        top.geometry(f"+{max(0, x)}+{max(0, y)}")
-                except Exception:
-                    pass
-
-            _place_spinner()
-            self._busy_spinner_win = top
-            # Force the window to be mapped and raised now \u2014 without this,
-            # overrideredirect() Toplevels sometimes defer their first
-            # on-screen paint until the next idle cycle, which may not happen
-            # before the worker thread blocks on SSH.
+            # Match the Configuration LabelFrame's background so the
+            # square bounding box of the rotation canvas blends in
+            # with the rest of the frame.
             try:
-                top.lift()
-                top.update()
+                bg = ttk.Style().lookup("TLabelframe", "background") or ""
             except Exception:
-                pass
-            # Re-apply geometry after the window is actually mapped: on
-            # some Windows Tk builds an overrideredirect() Toplevel ignores
-            # the first .geometry() call (made pre-map) and lands at 0,0.
-            _place_spinner()
-            if self._busy_pil_img is not None:
-                self._spin_busy_tick()
+                bg = ""
+            # Wrap the spinning image and the per-phase status text in a
+            # single container so both live as one grid cell directly
+            # under the Everpure logo (column 5, rows 3\u20137).
+            container = tk.Frame(parent)
+            if bg:
+                try:
+                    container.configure(bg=bg)
+                except Exception:
+                    pass
+            container.grid(row=3, column=5, rowspan=5,
+                           sticky=tk.NE, padx=10, pady=(2, 5))
+            lbl = tk.Label(container, image=self._busy_tk_img,
+                           borderwidth=0, highlightthickness=0)
+            if bg:
+                try:
+                    lbl.configure(bg=bg)
+                except Exception:
+                    pass
+            lbl.pack(side=tk.TOP)
+            # Status line printed underneath the spinner by
+            # _update_busy_status() as collection progresses.
+            status = tk.Label(container, text="",
+                              font=("Segoe UI", 10, "bold"),
+                              wraplength=max(self._busy_canvas_sz, 180),
+                              justify=tk.CENTER)
+            if bg:
+                try:
+                    status.configure(bg=bg)
+                except Exception:
+                    pass
+            status.pack(side=tk.TOP, pady=(2, 0))
+            self._busy_img_label    = lbl
+            self._busy_status_label = status
+            self._busy_spinner_win  = container
+            self._spin_busy_tick()
         except Exception:
             pass
 
@@ -3226,12 +3535,17 @@ class PureMonitorApp(tk.Tk):
             canvas.paste(rot, (x, y), rot)
             self._busy_tk_img = ImageTk.PhotoImage(canvas)
             lbl.configure(image=self._busy_tk_img)
-            self.after(60, self._spin_busy_tick)
+            self.after(120, self._spin_busy_tick)
         except Exception:
             return
 
     def _hide_busy_spinner(self):
-        """Tear down the busy spinner window if it's currently shown."""
+        """Tear down the inline busy spinner if it's currently shown.
+        Destroying the container Frame also removes its spinner and
+        status-text children from the Configuration grid, so the slot
+        under the Everpure logo is freed until the next Run Report
+        click creates a fresh spinner.
+        """
         self._busy_stop = True
         win = getattr(self, '_busy_spinner_win', None)
         if win is not None:
@@ -3239,10 +3553,36 @@ class PureMonitorApp(tk.Tk):
                 win.destroy()
             except Exception:
                 pass
-        self._busy_spinner_win = None
-        self._busy_pil_img     = None
-        self._busy_tk_img      = None
-        self._busy_img_label   = None
+        self._busy_spinner_win  = None
+        self._busy_pil_img      = None
+        self._busy_tk_img       = None
+        self._busy_img_label    = None
+        self._busy_status_label = None
+
+    def _update_busy_status(self, text):
+        """Thread-safe update of the status line under the busy spinner.
+        Called indirectly from the worker thread via the ``progress_cb``
+        passed into ``run_collection_core`` \u2014 that callback uses
+        self.after(0, ...) so all Tk widget writes happen on the main
+        thread. Silent no-op when the spinner isn't currently shown.
+        Also mirrors the message into the main output text box as a
+        running log of phases so the user can scroll back through the
+        sequence after the run completes (_update_gui replaces the
+        contents with the finished report text on completion).
+        """
+        lbl = getattr(self, '_busy_status_label', None)
+        if lbl is not None:
+            try:
+                lbl.configure(text=text)
+            except Exception:
+                pass
+        out = getattr(self, 'text_out', None)
+        if out is not None:
+            try:
+                out.insert(tk.END, text + "\n")
+                out.see(tk.END)
+            except Exception:
+                pass
 
     def run_report(self):
         self.run_btn.config(state=tk.NORMAL) # Reset in thread
@@ -3252,7 +3592,8 @@ class PureMonitorApp(tk.Tk):
         self._show_busy_spinner("Polling arrays... Please wait.")
         # Unified arrays list (name, location). SSH-based classification happens
         # inside run_collection_core, which fans out arr_fb/arr_faf/arr_fab.
-        _arrays = [{'name': n, 'location': l} for n, l in self._get_arrays_from_sheet()]
+        _arrays = [{'name': n, 'location': l, 'notes': nt}
+                   for n, l, nt in self._get_arrays_from_sheet()]
         cfg = {
             'user_fb': self.user_fb_entry.get().strip(),
             'user_faf': self.user_faf_entry.get().strip(),
@@ -3268,7 +3609,16 @@ class PureMonitorApp(tk.Tk):
 
     def _run_collection(self, config):
         try:
-            final, detailed, stats = run_collection_core(config, nogui=False)
+            # Progress callback: invoked from the worker thread, marshals
+            # the status update to the main thread via self.after(0, ...)
+            # so Tk widget writes stay on the UI thread.
+            def _progress(msg):
+                try:
+                    self.after(0, lambda m=msg: self._update_busy_status(m))
+                except Exception:
+                    pass
+            final, detailed, stats = run_collection_core(
+                config, nogui=False, progress_cb=_progress)
             # Stash the post-classification config so _auto_save_reports can reuse
             # the populated arr_fb / arr_faf / arr_fab buckets when building HTML.
             self._last_cfg = config
@@ -3610,8 +3960,22 @@ class PureMonitorApp(tk.Tk):
         cmap    = plt.get_cmap('tab10')
         colours = {a: cmap(i % 10) for i, a in enumerate(arrays_set)}
 
+        def _axes_x_frac(fig, ax):
+            """Return (left, right, xmin, xmax) for the axes bbox after
+            tight_layout(): left/right are figure-width fractions of the
+            data axes' edges; xmin/xmax are the data-coord x-axis limits.
+            JS uses these to map a mouse-x fraction to a bar index.
+            """
+            fig.canvas.draw()
+            pos = ax.get_position()
+            xmin, xmax = ax.get_xlim()
+            return float(pos.x0), float(pos.x1), float(xmin), float(xmax)
+
         def _sla_bar_b64(period_dates, x_labels, sla_agg, title):
-            """SLA chart – stacked by array (unchanged)."""
+            """SLA chart – stacked by array. Returns (b64, meta) where meta
+            carries per-bar array contributions and axes geometry so the
+            HTML report can render hover tooltips listing the arrays that
+            contributed violations on each day."""
             n = len(period_dates)
             fig, ax = plt.subplots(figsize=(max(7, n * 0.55), 4.2))
             x = np.arange(n); bottom = np.zeros(n); any_bar = False
@@ -3627,11 +3991,22 @@ class PureMonitorApp(tk.Tk):
             if any_bar: ax.legend(loc='upper right', fontsize=8, framealpha=0.7)
             ax.grid(axis='y', linestyle='--', alpha=0.4)
             fig.tight_layout()
+            left, right, xmin, xmax = _axes_x_frac(fig, ax)
             buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=130); plt.close(fig); buf.seek(0)
-            return base64.b64encode(buf.read()).decode('ascii')
+            bars = []
+            for i, d in enumerate(period_dates):
+                contribs = [{"name": a, "value": int(sla_agg[d][a])}
+                            for a in arrays_set if sla_agg[d][a]]
+                bars.append({"label": x_labels[i], "arrays": contribs})
+            meta = {"left": left, "right": right,
+                    "xlim": [xmin, xmax], "bars": bars}
+            return base64.b64encode(buf.read()).decode('ascii'), meta
 
         def _alrt_bar_b64(period_dates, x_labels, alrt_agg, title, show_info, show_warn):
-            """Alert chart – stacked by severity (Info / Warning / Critical)."""
+            """Alert chart – stacked by severity. Returns (b64, meta) where
+            meta lists the arrays contributing to each day's visible alerts
+            (filtered by the show_info / show_warn flags) so hover tooltips
+            in the HTML report can name them."""
             n = len(period_dates)
             fig, ax = plt.subplots(figsize=(max(7, n * 0.55), 4.2))
             x = np.arange(n); bottom = np.zeros(n); any_bar = False
@@ -3656,8 +4031,21 @@ class PureMonitorApp(tk.Tk):
             if any_bar: ax.legend(loc='upper right', fontsize=8, framealpha=0.7)
             ax.grid(axis='y', linestyle='--', alpha=0.4)
             fig.tight_layout()
+            left, right, xmin, xmax = _axes_x_frac(fig, ax)
             buf = io.BytesIO(); fig.savefig(buf, format='png', dpi=130); plt.close(fig); buf.seek(0)
-            return base64.b64encode(buf.read()).decode('ascii')
+            bars = []
+            for i, d in enumerate(period_dates):
+                contribs = []
+                for a in arrays_set:
+                    cnt = int(alrt_agg[d][a]['c'])
+                    if show_warn: cnt += int(alrt_agg[d][a]['w'])
+                    if show_info: cnt += int(alrt_agg[d][a]['i'])
+                    if cnt:
+                        contribs.append({"name": a, "value": cnt})
+                bars.append({"label": x_labels[i], "arrays": contribs})
+            meta = {"left": left, "right": right,
+                    "xlim": [xmin, xmax], "bars": bars}
+            return base64.b64encode(buf.read()).decode('ascii'), meta
 
         def _lag_line_b64(period_dates, x_labels, arr_daily_lag, title,
                           sla_min=None):
@@ -3783,35 +4171,47 @@ class PureMonitorApp(tk.Tk):
         # ── Generate one chart-set per period (SLA + 4 alert severity combos) ─
         period_labels = []
         sla_charts    = []
+        sla_meta      = []
         alrt_ii = []; alrt_ic = []; alrt_wc = []; alrt_c = []   # ii=Info+Warn, ic=Info, wc=Warn, c=Critical-only
+        alrt_ii_meta = []; alrt_ic_meta = []; alrt_wc_meta = []; alrt_c_meta = []
         lag_charts = {}   # {label: {array: b64_line_chart}}
         for label, period_dates, x_labels, sla_agg, alrt_agg in periods:
             period_labels.append(label)
             pt = label if use_months else "Daily"
 
-            # Check chart cache (monthly mode only)
+            # Check chart cache (monthly mode only). Cache hit also requires
+            # the meta payloads added with the hover-tooltip feature; entries
+            # written by older builds lack them and must be regenerated so
+            # the JS overlay has bar geometry to work with.
             _ph     = _period_hash(period_dates) if use_months else None
             _cached = _chart_cache.get(label, {}) if _ph else {}
-            _hit    = bool(_ph and _cached.get('hash') == _ph)
+            _hit    = bool(_ph and _cached.get('hash') == _ph
+                           and 'sla_meta' in _cached
+                           and 'alrt_ii_meta' in _cached)
 
             if _hit:
                 sla_charts.append(_cached['sla'])
+                sla_meta.append(_cached['sla_meta'])
                 alrt_ii.append(_cached['alrt_ii'])
                 alrt_ic.append(_cached['alrt_ic'])
                 alrt_wc.append(_cached['alrt_wc'])
                 alrt_c.append(_cached['alrt_c'])
+                alrt_ii_meta.append(_cached['alrt_ii_meta'])
+                alrt_ic_meta.append(_cached['alrt_ic_meta'])
+                alrt_wc_meta.append(_cached['alrt_wc_meta'])
+                alrt_c_meta.append(_cached['alrt_c_meta'])
                 lag_charts[label] = _cached['lag']
             else:
-                _sla = _sla_bar_b64(period_dates, x_labels, sla_agg,
-                                    f"SLA Violations – {pt}")
-                _aii = _alrt_bar_b64(period_dates, x_labels, alrt_agg,
-                                     f"Alerts – {pt}", True,  True)
-                _aic = _alrt_bar_b64(period_dates, x_labels, alrt_agg,
-                                     f"Alerts – {pt}", True,  False)
-                _awc = _alrt_bar_b64(period_dates, x_labels, alrt_agg,
-                                     f"Alerts – {pt}", False, True)
-                _ac  = _alrt_bar_b64(period_dates, x_labels, alrt_agg,
-                                     f"Alerts – {pt}", False, False)
+                _sla, _sla_m = _sla_bar_b64(period_dates, x_labels, sla_agg,
+                                            f"SLA Violations – {pt}")
+                _aii, _aii_m = _alrt_bar_b64(period_dates, x_labels, alrt_agg,
+                                             f"Alerts – {pt}", True,  True)
+                _aic, _aic_m = _alrt_bar_b64(period_dates, x_labels, alrt_agg,
+                                             f"Alerts – {pt}", True,  False)
+                _awc, _awc_m = _alrt_bar_b64(period_dates, x_labels, alrt_agg,
+                                             f"Alerts – {pt}", False, True)
+                _ac,  _ac_m  = _alrt_bar_b64(period_dates, x_labels, alrt_agg,
+                                             f"Alerts – {pt}", False, False)
                 _arr = {}
                 for a in arrays_set:
                     # Pass the per-day SLA list so the bands and threshold
@@ -3822,15 +4222,19 @@ class PureMonitorApp(tk.Tk):
                         period_dates, x_labels, {d: daily_lag[d][a] for d in period_dates},
                         f"{a}  \u2013  {pt}  Avg Replication Lag",
                         sla_min=_sla_list)
-                sla_charts.append(_sla)
+                sla_charts.append(_sla); sla_meta.append(_sla_m)
                 alrt_ii.append(_aii); alrt_ic.append(_aic)
                 alrt_wc.append(_awc); alrt_c.append(_ac)
+                alrt_ii_meta.append(_aii_m); alrt_ic_meta.append(_aic_m)
+                alrt_wc_meta.append(_awc_m); alrt_c_meta.append(_ac_m)
                 lag_charts[label] = _arr
                 if _ph:
                     _chart_cache[label] = {
-                        'hash': _ph, 'sla': _sla,
+                        'hash': _ph, 'sla': _sla, 'sla_meta': _sla_m,
                         'alrt_ii': _aii, 'alrt_ic': _aic,
                         'alrt_wc': _awc, 'alrt_c': _ac,
+                        'alrt_ii_meta': _aii_m, 'alrt_ic_meta': _aic_m,
+                        'alrt_wc_meta': _awc_m, 'alrt_c_meta': _ac_m,
                         'lag': _arr,
                     }
 
@@ -3878,10 +4282,15 @@ class PureMonitorApp(tk.Tk):
         import json
         js_labels      = json.dumps(period_labels)
         js_sla         = json.dumps(sla_charts)
+        js_sla_meta    = json.dumps(sla_meta)
         js_alrt_ii     = json.dumps(alrt_ii)   # Info + Warning + Critical
         js_alrt_ic     = json.dumps(alrt_ic)   # Info + Critical
         js_alrt_wc     = json.dumps(alrt_wc)   # Warning + Critical
         js_alrt_c      = json.dumps(alrt_c)    # Critical only
+        js_alrt_ii_meta = json.dumps(alrt_ii_meta)
+        js_alrt_ic_meta = json.dumps(alrt_ic_meta)
+        js_alrt_wc_meta = json.dumps(alrt_wc_meta)
+        js_alrt_c_meta  = json.dumps(alrt_c_meta)
         js_cal         = json.dumps(cal_data)
         js_lag_cal     = json.dumps(lag_cal_data)
         js_lag_charts  = json.dumps(lag_charts)
@@ -3916,8 +4325,20 @@ class PureMonitorApp(tk.Tk):
     h2             {{ font-size: 11pt; margin: 18px 0 6px 0; color: #2E4D8C; }}
     .chart-wrap    {{ background: #fff; border-radius: 8px;
                      box-shadow: 0 1px 4px rgba(0,0,0,.12);
-                     padding: 10px; display: inline-block; }}
+                     padding: 10px; display: inline-block; position: relative; }}
     img            {{ display: block; }}
+    /* ── chart bar hover tooltip ───────────────────────────────────────── */
+    .chart-tip     {{ position: absolute; pointer-events: none; display: none;
+                     background: rgba(28,38,64,.94); color: #fff;
+                     font-size: 9pt; line-height: 1.35;
+                     padding: 6px 10px; border-radius: 5px;
+                     box-shadow: 0 4px 14px rgba(0,0,0,.28);
+                     max-width: 320px; z-index: 50; }}
+    .chart-tip-head {{ font-weight: bold; color: #ffd96b;
+                      border-bottom: 1px solid rgba(255,255,255,.18);
+                      padding-bottom: 3px; margin-bottom: 4px; }}
+    .chart-tip ul   {{ margin: 0; padding-left: 16px; }}
+    .chart-tip li   {{ font-size: 8.5pt; }}
     /* ── calendars ─────────────────────────────────────────────────────── */
     .cal-row       {{ display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 18px; }}
     .cal-block     {{ background: #fff; border-radius: 8px;
@@ -4000,13 +4421,15 @@ class PureMonitorApp(tk.Tk):
   </div>
 
   <h2>SLA Violations</h2>
-  <div class="chart-wrap">
+  <div class="chart-wrap" id="wrap-sla">
     <img id="img-sla" src="" alt="SLA violations chart">
+    <div class="chart-tip" id="tip-sla"></div>
   </div>
 
   <h2>Support Alerts</h2>
-  <div class="chart-wrap">
+  <div class="chart-wrap" id="wrap-alrt">
     <img id="img-alrt" src="" alt="Alert count chart">
+    <div class="chart-tip" id="tip-alrt"></div>
   </div>
 
   <h2>Array Replication Lag</h2>
@@ -4027,10 +4450,15 @@ class PureMonitorApp(tk.Tk):
   <script>
     var LABELS       = {js_labels};
     var SLA          = {js_sla};
+    var SLA_META     = {js_sla_meta};
     var ALRT_II      = {js_alrt_ii};
     var ALRT_IC      = {js_alrt_ic};
     var ALRT_WC      = {js_alrt_wc};
     var ALRT_C       = {js_alrt_c};
+    var ALRT_II_META = {js_alrt_ii_meta};
+    var ALRT_IC_META = {js_alrt_ic_meta};
+    var ALRT_WC_META = {js_alrt_wc_meta};
+    var ALRT_C_META  = {js_alrt_c_meta};
     var CAL_DATA     = {js_cal};
     var LAG_CAL_DATA = {js_lag_cal};
     var LAG_CHARTS      = {js_lag_charts};
@@ -4048,6 +4476,16 @@ class PureMonitorApp(tk.Tk):
       if  (si && !sw) return ALRT_IC;
       if (!si &&  sw) return ALRT_WC;
       return ALRT_C;
+    }}
+
+    /* Return the META array matching the currently visible alert chart. */
+    function getAlrtMeta() {{
+      var si = document.getElementById('chk-info').checked;
+      var sw = document.getElementById('chk-warn').checked;
+      if  (si &&  sw) return ALRT_II_META;
+      if  (si && !sw) return ALRT_IC_META;
+      if (!si &&  sw) return ALRT_WC_META;
+      return ALRT_C_META;
     }}
 
     /* Visible alert total for a day given current checkbox state. */
@@ -4209,6 +4647,70 @@ class PureMonitorApp(tk.Tk):
       render();
     }}
 
+    /* ─── Hover tooltip plumbing for SLA / Alerts bar charts ─────────────
+       Each chart's meta carries:
+         left, right  : x-fraction (0..1) of the data axes inside the PNG
+         xlim         : data-coord x-range matching those fractions
+         bars[i]      : {{label, arrays:[{{name, value}}, ...]}}
+       We map mouse-x over the rendered <img> to a bar index and show
+       a tooltip listing the contributing arrays for that day. */
+    function findBarIndex(meta, xfrac) {{
+      if (!meta || !meta.bars) return -1;
+      if (xfrac < meta.left || xfrac > meta.right) return -1;
+      var t = (xfrac - meta.left) / (meta.right - meta.left);
+      var x_data = meta.xlim[0] + t * (meta.xlim[1] - meta.xlim[0]);
+      var i = Math.round(x_data);
+      if (i < 0 || i >= meta.bars.length) return -1;
+      return i;
+    }}
+
+    function renderTipBody(bar, kind) {{
+      var unit = kind === 'sla' ? 'violation' : 'alert';
+      var arrs = (bar && bar.arrays) ? bar.arrays : [];
+      var head = '<div class="chart-tip-head">' + (bar.label || '') + '</div>';
+      if (!arrs.length) {{
+        return head + '<div style="font-size:8.5pt;color:#cfd6e6;">'
+             + 'No ' + unit + 's</div>';
+      }}
+      var lis = arrs.map(function(a) {{
+        var s = a.value === 1 ? '' : 's';
+        return '<li>' + a.name + ' &mdash; '
+             + a.value + ' ' + unit + s + '</li>';
+      }}).join('');
+      return head + '<ul>' + lis + '</ul>';
+    }}
+
+    function attachChartHover(wrapId, imgId, tipId, getMeta, kind) {{
+      var wrap = document.getElementById(wrapId);
+      var img  = document.getElementById(imgId);
+      var tip  = document.getElementById(tipId);
+      if (!wrap || !img || !tip) return;
+      function onMove(e) {{
+        var meta = getMeta();
+        if (!meta) {{ tip.style.display = 'none'; return; }}
+        var rect = img.getBoundingClientRect();
+        var xfrac = (e.clientX - rect.left) / rect.width;
+        var i = findBarIndex(meta, xfrac);
+        if (i < 0) {{ tip.style.display = 'none'; return; }}
+        tip.innerHTML = renderTipBody(meta.bars[i], kind);
+        tip.style.display = 'block';
+        /* Position tooltip relative to chart-wrap; offset slightly so it
+           never sits under the cursor and never spills past the right edge. */
+        var wrapRect = wrap.getBoundingClientRect();
+        var tipW = tip.offsetWidth;
+        var rawX = (e.clientX - wrapRect.left) + 14;
+        var maxX = wrapRect.width - tipW - 6;
+        if (rawX > maxX) rawX = maxX;
+        if (rawX < 4)    rawX = 4;
+        var rawY = (e.clientY - wrapRect.top) + 14;
+        tip.style.left = rawX + 'px';
+        tip.style.top  = rawY + 'px';
+      }}
+      function onLeave() {{ tip.style.display = 'none'; }}
+      img.addEventListener('mousemove', onMove);
+      img.addEventListener('mouseleave', onLeave);
+    }}
+
     function render() {{
       document.getElementById('period-label').textContent = LABELS[idx];
       document.getElementById('img-sla').src   = 'data:image/png;base64,' + SLA[idx];
@@ -4218,7 +4720,20 @@ class PureMonitorApp(tk.Tk):
       document.getElementById('counter').textContent = (idx + 1) + ' / ' + LABELS.length;
       renderCalendars(LABELS[idx]);
       renderLagCalendars(LABELS[idx]);
+      /* Hide any stale tooltip when navigating between periods. */
+      var ts = document.getElementById('tip-sla');
+      var ta = document.getElementById('tip-alrt');
+      if (ts) ts.style.display = 'none';
+      if (ta) ta.style.display = 'none';
     }}
+
+    /* Wire hover handlers once on load; they look up SLA_META[idx] /
+       alert meta on every mousemove so they always reflect the current
+       period and severity-filter state. */
+    attachChartHover('wrap-sla',  'img-sla',  'tip-sla',
+                     function() {{ return SLA_META[idx]; }}, 'sla');
+    attachChartHover('wrap-alrt', 'img-alrt', 'tip-alrt',
+                     function() {{ return getAlrtMeta()[idx]; }}, 'alrt');
 
     idx = LABELS.length - 1;
     render();
@@ -4277,6 +4792,10 @@ Three array types are supported:
   * FA-File (FlashArray)   - file replication via 'purepod replica-link'
   * FA-Block (FlashArray)  - block snapshot replication via 'purevol'
 
+Array type is auto-detected at report time by issuing 'purearray list',
+'purepod list' and 'purepgroup list' against each configured array — you
+no longer enter arrays into separate per-type lists.
+
 
 CONFIGURATION FIELDS
 --------------------
@@ -4284,7 +4803,7 @@ CONFIGURATION FIELDS
       SSH username used to connect to each array type.
       The ideal method is to use SSH keys, from the user/computer running
       the script to each array.  But if some/all of the arrays do not have
-      this setup, the user will be prompted to enter the password for each 
+      this setup, the user will be prompted to enter the password for each
       array not using keys.
 
   Excluded Alerts
@@ -4293,10 +4812,24 @@ CONFIGURATION FIELDS
       a matching value will be suppressed from the output.  These should be
       used sparingly as they will suppress any alert in the GUI or Report.
 
-  FB / FA-File / FA-Block Arrays
-      Comma- or newline-separated list of array hostnames or IP addresses.
-      If the same array name appears in both FA-File and FA-Block, its
-      alerts are checked only once.
+  Arrays (spreadsheet editor)
+      A single two-column sheet with "Array" and "Location" columns
+      replaces the old per-type array lists. Enter each array's hostname
+      or IP in the Array column and an optional free-text site/location
+      label in the Location column. The platform (FB, FA-File, FA-Block)
+      is discovered automatically when you click Run Report.
+
+      Sheet features:
+        * Column widths can be dragged to any size (double-click a
+          separator to auto-fit); widths are persisted in
+          monitor_config.json under "arrays_col_widths".
+        * The gutter to the left of "Array" shows a 1-based running
+          count of rows that actually contain an array name.
+        * Blank rows are maintained at the bottom automatically, so
+          you can paste or type continuously without inserting rows.
+        * Copy / paste / undo / right-click row-insert / row-delete
+          are all enabled. Paste always writes starting at the caret
+          cell (single-cell paste semantics).
 
   SLA FB / SLA FA-File / SLA FA-Block
       Maximum acceptable replication lag. Accepts values like:
@@ -4395,12 +4928,35 @@ In this mode:
 
 SSH COMMANDS USED
 -----------------
-This script interacts with the arrays via three remote SSH commands only.
-These are:
+All interaction with the arrays is read-only. No configuration changes
+are ever issued. The script runs the following commands over SSH:
 
-    purepod replica-link list --historical 24h --lag
-    purefs replica-link list
-    purealert list --filter "state='open'"
+  Type detection (run against every configured array)
+    purearray list --csv              - identify FlashBlade vs FlashArray
+    purepod list --csv                - detect FA-File capability
+    purepgroup list --csv             - detect FA-Block capability
+
+  Hardware health
+    purehw list --csv                 - enumerate hardware components
+
+  Replication partners
+    purearray list --connect --csv    - FlashBlade partners
+    purearray connection list --csv   - FlashArray partners
+
+  Alerts
+    purealert list --filter "state='open'" --csv
+
+  Replication lag
+    purefs replica-link list --csv                              (FB)
+    purepod replica-link list --historical 24h --lag --csv      (FA-File)
+    purearray list --time                                       (FA-Block clock)
+    purevol list --snap --transfer --filter "created >= '...'" --csv  (FA-Block)
+
+RUN REPORT UX
+-------------
+While a report is in progress a small spinning logo appears directly
+under the Everpure logo inside the Configuration panel, cycling through
+the FlashBlade, FlashArray and Everpure logos on successive runs.
 
 EMAILING REPORTS
 ----------------
@@ -4497,16 +5053,38 @@ EXAMPLES:
 
 SSH COMMANDS USED
 -----------------
-This script interacts with the arrays via three remote SSH commands only.
-These are:
+All interaction with the arrays is read-only. No configuration changes
+are ever issued. The script runs the following commands over SSH:
 
-    purepod replica-link list --historical 24h --lag
-    purefs replica-link list
-    purealert list --filter "state='open'"
+  Type detection (run against every configured array)
+    purearray list --csv              - identify FlashBlade vs FlashArray
+    purepod list --csv                - detect FA-File capability
+    purepgroup list --csv             - detect FA-Block capability
+
+  Hardware health
+    purehw list --csv                 - enumerate hardware components
+
+  Replication partners
+    purearray list --connect --csv    - FlashBlade partners
+    purearray connection list --csv   - FlashArray partners
+
+  Alerts
+    purealert list --filter "state='open'" --csv
+
+  Replication lag
+    purefs replica-link list --csv                              (FB)
+    purepod replica-link list --historical 24h --lag --csv      (FA-File)
+    purearray list --time                                       (FA-Block clock)
+    purevol list --snap --transfer --filter "created >= '...'" --csv  (FA-Block)
 
 CONFIGURATION:
     Launch the GUI at least once and click "Save Config" to create
-    monitor_config.json before using --nogui mode.
+    monitor_config.json before using --nogui mode. The GUI presents a
+    single Arrays spreadsheet (Array + Location columns) instead of
+    separate per-type lists — the platform of each array is detected
+    automatically via the SSH commands listed above. Column widths
+    in the sheet can be dragged to resize and are persisted to the
+    JSON file under "arrays_col_widths".
 """)
     elif '--nogui' in sys.argv:
         run_nogui()
