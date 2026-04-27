@@ -1372,8 +1372,11 @@ def run_collection_core(config, nogui=False, progress_cb=None):
                 f"- Error: {_info['error']}")
             continue
         _plat_a = _info.get('platform', '')
-        for _p in _info.get('partners', []):
-            _b      = _p['remote']
+        # NOTE: loop variable is _part (not _p) because _p is the progress
+        # callback in this function's scope; binding it to a partner dict
+        # here would break the _p("Compiling Reports...") call below.
+        for _part in _info.get('partners', []):
+            _b      = _part['remote']
             _plat_b = rel_by_array.get(_b, {}).get('platform', _plat_a)
             _key    = tuple(sorted((_a, _b)))
             if _key in _pair_seen:
@@ -1382,7 +1385,7 @@ def run_collection_core(config, nogui=False, progress_cb=None):
             _pa = _plat_a if _key[0] == _a else _plat_b
             _pb = _plat_b if _key[1] == _b else _plat_a
             _suffix = ''
-            _st = (_p.get('status') or '').strip()
+            _st = (_part.get('status') or '').strip()
             if _st and _st.lower() != 'connected':
                 _suffix = f"  [{_st}]"
             rel_lines.append(
