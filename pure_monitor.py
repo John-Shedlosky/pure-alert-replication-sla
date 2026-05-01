@@ -2856,8 +2856,46 @@ def _fake_protection_data_for(array):
         if _direction == '-->':
             connections.append({'name': f'{_lp}::db_data',
                                 'host': f'{_lp}-cluster'})
+    # Schedule + retention profiles for each pgroup. Pod-scoped pgroups
+    # carry a 2-target retention (this array + peer) so the / split is
+    # exercised in the demo. Local pgroups have a single retention row.
+    pgroup_schedules = {}
+    pgroup_retentions = {}
+    for pg in pgroups:
+        pgname = pg['name']
+        if pg['name'].endswith('_hourly'):
+            pgroup_schedules[pgname] = {
+                'Schedule': ['snap', 'replicate'],
+                'Enabled':  ['True', 'True'],
+                'Frequency': ['3600', '3600'],
+                'At':        ['', ''],
+                'Blackout':  ['', '']}
+        else:
+            pgroup_schedules[pgname] = {
+                'Schedule': ['snap', 'replicate'],
+                'Enabled':  ['True', 'True'],
+                'Frequency': ['86400', '86400'],
+                'At':        ['09:00:00', '09:30:00'],
+                'Blackout':  ['', '']}
+        if pg['pod'] is not None and array in pod_pairs:
+            _peer = pod_pairs[array][0]
+            pgroup_retentions[pgname] = {
+                'Array':         [array, _peer],
+                'All For':       ['1d', '1d'],
+                'Per Period':    ['4', '4'],
+                'Period Length': ['1d', '1d'],
+                'Days':          ['7', '7']}
+        else:
+            pgroup_retentions[pgname] = {
+                'Array':         [array],
+                'All For':       ['1d'],
+                'Per Period':    ['4'],
+                'Period Length': ['1d'],
+                'Days':          ['7']}
     return {'volumes': volumes, 'pod_links': pod_links, 'snapshots': snapshots,
             'pgroups': pgroups, 'pgroup_locks': pgroup_locks,
+            'pgroup_schedules': pgroup_schedules,
+            'pgroup_retentions': pgroup_retentions,
             'connections': connections, 'error': None}
 
 
@@ -3253,7 +3291,13 @@ def aggregate_fa_volume_rows(per_array):
             if key3 in drop:
                 continue
 
+            # `source_array` is the array on which the volume physically
+            # resides (and therefore where its pgroup profile lives). For
+            # plain volumes this is `arr`; for stretched-pod source-side
+            # rows it stays `arr`. The displayed 'array' column may show
+            # 'src --> dest' but `source_array` always points at src.
             row = {'array': arr, 'volume': vol, 'pod_name': pod or '',
+                   'source_array': arr,
                    'in_pod': bool(pod),
                    'pod_direction': '', 'remote_pod': '',
                    'local_snaps': 0, 'pod_snaps': 0,
@@ -3344,6 +3388,7 @@ def build_protection_html(per_array, config):
     """
     import html as _html
     import time as _time
+    import json as _json
 
     tz      = _time.tzname[_time.daylight]
     now_str = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p")
@@ -3355,6 +3400,22 @@ def build_protection_html(per_array, config):
         info = per_array[arr]
         if info.get('error'):
             err_lines.append(f"{_html.escape(arr)}: {_html.escape(str(info['error']))}")
+
+    # Per-(array, pgroup) Schedule + Retention profile — drives the modal
+    # popup that opens when a Protection Group name is clicked. Only the
+    # source array's profile is published for each row; identical pgroup
+    # names on other arrays are not exposed via this row's link.
+    pg_profiles = {}
+    for arr, info in per_array.items():
+        sched = info.get('pgroup_schedules') or {}
+        rete  = info.get('pgroup_retentions') or {}
+        keys  = set(sched.keys()) | set(rete.keys())
+        if not keys:
+            continue
+        pg_profiles[arr] = {
+            k: {'schedule': sched.get(k, {}), 'retention': rete.get(k, {})}
+            for k in keys}
+    profiles_json = _json.dumps(pg_profiles)
 
     # ── Build Table 1 rows ────────────────────────────────────────────────
     tr_html = ""
@@ -3374,8 +3435,16 @@ def build_protection_html(per_array, config):
                      if dests_ok else _DASH)
             pgs_list = r.get('protection_groups', [])
             pgs_ok = bool(pgs_list)
-            pgs = (', '.join(_html.escape(p) for p in pgs_list)
-                   if pgs_ok else _DASH)
+            # Each pgroup name renders as a clickable link bound to the
+            # row's source array; the modal popup pulls schedule and
+            # retention from PG_PROFILES[source][pgname].
+            _src = r.get('source_array', r['array'])
+            pgs = (', '.join(
+                f'<a href="#" class="pg-link" '
+                f'data-arr="{_html.escape(_src, quote=True)}" '
+                f'data-pg="{_html.escape(p, quote=True)}" '
+                f'onclick="showPg(this);return false;">{_html.escape(p)}</a>'
+                for p in pgs_list) if pgs_ok else _DASH)
             pod_ok = bool(r['in_pod'] and r.get('pod_name'))
             pod_cell = _html.escape(r['pod_name']) if pod_ok else _DASH
             remote_ok = bool(r['remote_pod'])
@@ -3418,6 +3487,58 @@ def build_protection_html(per_array, config):
     placeholder = ('<p style="color:#666;font-style:italic;">'
                    'Specification pending &mdash; coming in next update.</p>')
 
+    # Modal markup + JS for the Protection Group detail popup. Rendered
+    # only when at least one array has profile data so empty datasets
+    # don't ship dead JS.
+    if pg_profiles:
+        modal_block = (
+            '<div id="pg-modal" class="modal" '
+            'onclick="closeModalIfBg(event)">'
+            '<div class="modal-content">'
+            '<span class="modal-close" onclick="closeModal()">&times;</span>'
+            '<h3 id="pg-title"></h3>'
+            '<p class="meta" id="pg-array"></p>'
+            '<h4>Schedule</h4><div id="pg-schedule"></div>'
+            '<h4>Retention</h4><div id="pg-retention"></div>'
+            '</div></div>')
+        script_block = (
+            '<script>\n'
+            'const PG_PROFILES = ' + profiles_json + ';\n'
+            'function escHtml(s){'
+            'return String(s).replace(/[&<>\"\\\']/g,'
+            'ch=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","\\\'":"&#39;"})[ch]);'
+            '}\n'
+            'function renderTable(o){'
+            'if(!o)return \'<p style="color:#888;">No data.</p>\';'
+            'const cols=Object.keys(o);'
+            'if(cols.length===0)return \'<p style="color:#888;">No data.</p>\';'
+            'const n=Math.max(0,...cols.map(c=>(o[c]||[]).length));'
+            'if(n===0)return \'<p style="color:#888;">No data.</p>\';'
+            'let h=\'<table class="pg-detail"><thead><tr>\';'
+            'cols.forEach(c=>{h+=\'<th>\'+escHtml(c)+\'</th>\';});'
+            'h+=\'</tr></thead><tbody>\';'
+            'for(let i=0;i<n;i++){'
+            'h+=\'<tr>\';'
+            'cols.forEach(c=>{const v=(o[c]||[])[i];'
+            'h+=\'<td>\'+(v?escHtml(v):\'<span style="color:#888;">&mdash;</span>\')+\'</td>\';});'
+            'h+=\'</tr>\';}'
+            'return h+\'</tbody></table>\';}\n'
+            'function showPg(el){'
+            'const arr=el.getAttribute("data-arr"),pg=el.getAttribute("data-pg");'
+            'const data=(PG_PROFILES[arr]||{})[pg]||null;'
+            'document.getElementById("pg-title").textContent=pg;'
+            'document.getElementById("pg-array").textContent="Source array: "+arr;'
+            'document.getElementById("pg-schedule").innerHTML=renderTable(data&&data.schedule);'
+            'document.getElementById("pg-retention").innerHTML=renderTable(data&&data.retention);'
+            'document.getElementById("pg-modal").style.display="flex";}\n'
+            'function closeModal(){document.getElementById("pg-modal").style.display="none";}\n'
+            'function closeModalIfBg(e){if(e.target.id==="pg-modal")closeModal();}\n'
+            'document.addEventListener("keydown",e=>{if(e.key==="Escape")closeModal();});\n'
+            '</script>')
+    else:
+        modal_block = ''
+        script_block = ''
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -3436,6 +3557,25 @@ def build_protection_html(per_array, config):
     .err-banner {{ background: #fff4f4; border: 1px solid #e0a0a0;
                   padding: 6px 10px; margin: 8px 0; border-radius: 4px;
                   color: #802020; }}
+    .pg-link {{ color: #1a5fb4; cursor: pointer; text-decoration: underline; }}
+    .pg-link:hover {{ color: #0b3d8c; }}
+    .modal {{ display: none; position: fixed; inset: 0;
+             background: rgba(0,0,0,0.45);
+             align-items: flex-start; justify-content: center;
+             z-index: 1000; overflow: auto; padding-top: 60px; }}
+    .modal-content {{ background: white; padding: 16px 20px;
+                     border-radius: 6px; width: min(90%, 760px);
+                     box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+                     position: relative; }}
+    .modal-close {{ position: absolute; top: 6px; right: 12px;
+                   font-size: 20px; cursor: pointer; color: #666; }}
+    .modal-close:hover {{ color: #000; }}
+    .modal-content h3 {{ margin: 0 0 4px 0; color: #1f3a5c; }}
+    .modal-content h4 {{ margin: 14px 0 4px 0; color: #1f3a5c; }}
+    .pg-detail {{ width: 100%; border-collapse: collapse; margin-top: 0; }}
+    .pg-detail th, .pg-detail td {{ border: 1px solid #b8cfe8;
+                                   padding: 4px 8px; font-size: 9pt; }}
+    .pg-detail th {{ background: #dce6f1; }}
   </style>
 </head>
 <body>
@@ -3471,6 +3611,9 @@ def build_protection_html(per_array, config):
 
   <h2>3. FlashBlade Filesystems</h2>
   {placeholder}
+
+  {modal_block}
+  {script_block}
 </body>
 </html>
 """
