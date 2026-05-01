@@ -3549,11 +3549,13 @@ def build_protection_html(per_array, config):
                 f'data-orig="{_html.escape(_ctxt, quote=True)}">'
                 f'<textarea class="comment-input" rows="2" '
                 f'oninput="commentEdited(this)" '
-                f'onchange="commentEdited(this)">{_html.escape(_ctxt)}</textarea>'
+                f'onchange="commentEdited(this)" '
+                f'onblur="commentEdited(this,true)">{_html.escape(_ctxt)}</textarea>'
                 f'<div class="comment-meta">'
-                f'<span class="comment-updated">{_html.escape(_cupd)}</span>'
-                f'<button type="button" class="comment-save" '
-                f'onclick="saveComments()">Save</button>'
+                f'<span class="comment-meta-lbl">Last updated:</span> '
+                f'<span class="comment-updated">'
+                f'{_html.escape(_cupd) if _cupd else "&mdash;"}'
+                f'</span>'
                 f'</div>'
                 f'</td>'
                 '</tr>\n')
@@ -3565,6 +3567,27 @@ def build_protection_html(per_array, config):
 
     placeholder = ('<p style="color:#666;font-style:italic;">'
                    'Specification pending &mdash; coming in next update.</p>')
+
+    # Global Save All Comments toolbar above Table 1. The button calls
+    # the same saveComments() the per-row buttons use; the JS prefers
+    # the File System Access API so the JSON can be written directly
+    # into reports/protection/. Only rendered when there's something
+    # to save (i.e., at least one volume row).
+    if rows:
+        comments_toolbar = (
+            '<div class="comments-toolbar">'
+            '<button type="button" class="comment-save-all" '
+            'onclick="saveComments(true)">Save All Comments</button>'
+            '<span id="comments-status" class="comments-status warn">'
+            'Autosave: not configured</span>'
+            '<span class="comments-toolbar-hint">Edits autosave to '
+            '<code>reports/protection/comments_active.json</code>. The '
+            'first save prompts once for the folder; the choice is '
+            'remembered so future edits and report runs save and load '
+            'silently.</span>'
+            '</div>')
+    else:
+        comments_toolbar = ''
 
     # Modal markup + JS for the Protection Group detail popup. Rendered
     # only when at least one array has profile data so empty datasets
@@ -3673,7 +3696,7 @@ def build_protection_html(per_array, config):
         'Volume Name', 'Array Name', 'Replication Destinations',
         'Pod', 'Remote Pod', 'Local Snapshots', 'Pod Snapshots',
         'Replicated Snapshots', 'Safemode', 'Protection Groups',
-        'Connected Hosts', 'Comments']
+        'Connected Hosts', 'Non Protection Reasoning']
     thead_t1 = ('<thead><tr>' + ''.join(
         f'<th class="sortable" onclick="sfHeaderClick(event,{i})">'
         f'<div class="th-lbl">{_html.escape(c)}'
@@ -3868,11 +3891,11 @@ def build_protection_html(per_array, config):
   document.addEventListener('DOMContentLoaded', function(){
     document.querySelectorAll('table.sf').forEach(initTable);
   });
-  // --- Comments column: per-row textarea + Save button. -------------
-  // Saving downloads a JSON file the next report run will pick up via
-  // _load_recent_comments(). Mirroring textarea.value into textContent
-  // also makes a browser "Save Page As" capture the user's edits in the
-  // saved HTML.
+  // --- Comments column: debounced autosave to reports/protection/. -
+  // Edits flush automatically ~600 ms after the last keystroke. The
+  // chosen reports/protection/ directory handle is persisted in
+  // IndexedDB so subsequent page loads only need a one-click
+  // permission grant (no folder picker again).
   function _stamp(d){
     function p(n){ return (n<10?'0':'')+n; }
     return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())
@@ -3883,19 +3906,102 @@ def build_protection_html(per_array, config):
     return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())
          +'_'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());
   }
-  window.commentEdited = function(el){
-    try { el.textContent = el.value; } catch(e) {}
-    var cell = el.closest && el.closest('.comment-cell');
-    if(!cell) return;
-    var orig = cell.getAttribute('data-orig') || '';
-    if((el.value || '') !== orig) cell.classList.add('comment-dirty');
-    else cell.classList.remove('comment-dirty');
-  };
-  window.saveComments = function(){
+  // ---- IndexedDB shim for the directory handle ---------------------
+  function _idbOpen(){
+    return new Promise(function(res, rej){
+      if(!window.indexedDB){ rej(new Error('no idb')); return; }
+      var r = indexedDB.open('pure-comments', 1);
+      r.onupgradeneeded = function(){ r.result.createObjectStore('h'); };
+      r.onsuccess = function(){ res(r.result); };
+      r.onerror   = function(){ rej(r.error); };
+    });
+  }
+  async function _idbGet(key){
+    try {
+      var db = await _idbOpen();
+      return await new Promise(function(res, rej){
+        var t = db.transaction('h','readonly').objectStore('h').get(key);
+        t.onsuccess = function(){ res(t.result); };
+        t.onerror   = function(){ rej(t.error); };
+      });
+    } catch(e){ return null; }
+  }
+  async function _idbPut(key, val){
+    try {
+      var db = await _idbOpen();
+      return await new Promise(function(res, rej){
+        var t = db.transaction('h','readwrite').objectStore('h').put(val, key);
+        t.onsuccess = function(){ res(); };
+        t.onerror   = function(){ rej(t.error); };
+      });
+    } catch(e){}
+  }
+  // ---- Directory handle resolver -----------------------------------
+  // _ensureDir(false) → silent: returns the cached handle iff the page
+  // already has 'granted' read/write permission for it; never prompts.
+  // _ensureDir(true)  → may invoke requestPermission (one click) or
+  // showDirectoryPicker (one folder pick) on a user gesture.
+  var _dirHandle    = null;
+  var _dirLoaded    = false;
+  async function _loadCachedDir(){
+    if(_dirLoaded) return;
+    _dirLoaded = true;
+    try { _dirHandle = await _idbGet('dir') || null; } catch(e){}
+  }
+  async function _ensureDir(promptOk){
+    await _loadCachedDir();
+    if(_dirHandle && _dirHandle.queryPermission){
+      var p = await _dirHandle.queryPermission({mode:'readwrite'});
+      if(p === 'granted') return _dirHandle;
+      if(promptOk){
+        try { p = await _dirHandle.requestPermission({mode:'readwrite'}); }
+        catch(e){ p = 'denied'; }
+        if(p === 'granted') return _dirHandle;
+      }
+    }
+    if(promptOk && window.showDirectoryPicker){
+      try {
+        var h = await window.showDirectoryPicker({
+          id:    'pure-reports-protection',
+          mode:  'readwrite',
+          startIn: 'documents'});
+        _dirHandle = h;
+        await _idbPut('dir', h);
+        return _dirHandle;
+      } catch(e){
+        if(e && e.name === 'AbortError') return null;
+        return null;
+      }
+    }
+    return null;
+  }
+  // ---- Status indicator + button flash -----------------------------
+  function _setStatus(msg, kind){
+    var s = document.getElementById('comments-status');
+    if(!s) return;
+    s.textContent = msg;
+    s.classList.remove('ok','warn','err');
+    if(kind) s.classList.add(kind);
+  }
+  function _flashSaved(){
+    var btns = document.querySelectorAll('button.comment-save-all');
+    btns.forEach(function(b){
+      var prev = b.textContent;
+      b.textContent = 'Saved \u2713';
+      b.classList.add('saved-flash');
+      setTimeout(function(){
+        b.textContent = prev;
+        b.classList.remove('saved-flash');
+      }, 1200);
+    });
+  }
+  // ---- Per-row gather: stamp changed cells, build payload ----------
+  function _gather(){
     var cells = document.querySelectorAll('td.comment-cell');
-    var now = new Date();
+    var now   = new Date();
     var stamp = _stamp(now);
     var entries = [];
+    var changed = 0;
     cells.forEach(function(cell){
       var ta = cell.querySelector('textarea.comment-input');
       if(!ta) return;
@@ -3905,8 +4011,10 @@ def build_protection_html(per_array, config):
       var orig = cell.getAttribute('data-orig') || '';
       var lbl  = cell.querySelector('.comment-updated');
       var upd  = lbl ? (lbl.textContent || '') : '';
+      if(upd === '\u2014') upd = '';
       if(val !== orig){
         upd = stamp;
+        changed += 1;
         cell.setAttribute('data-orig', val);
         cell.classList.remove('comment-dirty');
         if(lbl) lbl.textContent = upd;
@@ -3917,18 +4025,127 @@ def build_protection_html(per_array, config):
                       comment:val, last_updated:upd});
       }
     });
-    var payload = {generated: stamp, comments: entries};
-    var blob = new Blob([JSON.stringify(payload, null, 2)],
-                        {type:'application/json'});
-    var url  = URL.createObjectURL(blob);
-    var a    = document.createElement('a');
+    return {now:now, stamp:stamp, changed:changed,
+            payload:{generated:stamp, comments:entries}};
+  }
+  // ---- Write the payload to comments_active.json -------------------
+  // Always uses the same filename inside the chosen reports/protection/
+  // directory so the loader's "newest-mtime wins" picker keeps finding
+  // the same file across runs.
+  async function _writeJson(json, promptOk){
+    var dir = await _ensureDir(promptOk);
+    if(!dir) return false;
+    try {
+      var fh = await dir.getFileHandle('comments_active.json',
+                                       {create: true});
+      var w  = await fh.createWritable();
+      await w.write(json);
+      await w.close();
+      return true;
+    } catch(e){
+      // Permission expired or write failed — drop the handle if it
+      // looks unrecoverable so the next prompt-allowed call re-picks.
+      if(e && (e.name === 'NotAllowedError' ||
+               e.name === 'SecurityError')){
+        _dirHandle = null;
+        try { await _idbPut('dir', null); } catch(_){}
+      }
+      return false;
+    }
+  }
+  // ---- Debounced autosave on every edit ----------------------------
+  var _autosaveTimer = null;
+  function _scheduleAutosave(immediate){
+    if(_autosaveTimer){ clearTimeout(_autosaveTimer); _autosaveTimer = null; }
+    var delay = immediate ? 0 : 600;
+    _autosaveTimer = setTimeout(function(){
+      _autosaveTimer = null;
+      window.saveComments(false);
+    }, delay);
+  }
+  window.commentEdited = function(el, immediate){
+    try { el.textContent = el.value; } catch(e) {}
+    var cell = el.closest && el.closest('.comment-cell');
+    if(cell){
+      var orig = cell.getAttribute('data-orig') || '';
+      if((el.value || '') !== orig) cell.classList.add('comment-dirty');
+      else cell.classList.remove('comment-dirty');
+    }
+    _scheduleAutosave(!!immediate);
+  };
+  // saveComments(prompt) — prompt=true is the user-driven path
+  // (Save All Comments button or first-time setup); prompt=false is
+  // the autosave path that never invokes a picker.
+  window.saveComments = async function(promptOk){
+    var g = _gather();
+    var json = JSON.stringify(g.payload, null, 2);
+    if(window.showDirectoryPicker){
+      var ok = await _writeJson(json, !!promptOk);
+      if(ok){
+        _setStatus('Autosave \u2713 ' + g.stamp
+                   + ' \u2192 reports/protection/comments_active.json',
+                   'ok');
+        if(promptOk) _flashSaved();
+        return;
+      }
+      if(!promptOk){
+        _setStatus('Autosave paused \u2014 click '
+                   + '\u201cSave All Comments\u201d to grant folder access',
+                   'warn');
+        return;
+      }
+      // Prompt path failed (user cancelled or browser refused) — fall
+      // through to the download below so the edits aren't lost.
+    } else if(!promptOk){
+      _setStatus('Autosave unsupported in this browser \u2014 '
+                 + 'use \u201cSave All Comments\u201d to download',
+                 'warn');
+      return;
+    }
+    // Fallback: traditional download (browsers without
+    // showDirectoryPicker, or after the user declined the picker).
+    var fname = 'comments_' + _fnstamp(g.now) + '.json';
+    var blob  = new Blob([json], {type:'application/json'});
+    var url   = URL.createObjectURL(blob);
+    var a     = document.createElement('a');
     a.href     = url;
-    a.download = 'comments_' + _fnstamp(now) + '.json';
+    a.download = fname;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     setTimeout(function(){ URL.revokeObjectURL(url); }, 0);
+    _setStatus('Downloaded ' + fname
+               + ' \u2014 move it into reports/protection/',
+               'warn');
+    _flashSaved();
   };
+  // ---- Page-load probe: silently mount cached folder if granted ----
+  async function _initAutosave(){
+    if(!document.getElementById('comments-status')) return;
+    if(!window.showDirectoryPicker){
+      _setStatus('Autosave unsupported \u2014 use Save All Comments to download',
+                 'warn');
+      return;
+    }
+    var dir = await _ensureDir(false);
+    if(dir){
+      _setStatus('Autosave enabled \u2192 ' + (dir.name || 'saved folder'),
+                 'ok');
+    } else {
+      var saved = null;
+      try { saved = await _idbGet('dir'); } catch(e){}
+      if(saved){
+        _setStatus('Autosave: click \u201cSave All Comments\u201d once '
+                   + 'to re-grant access to ' + (saved.name || 'saved folder'),
+                   'warn');
+      } else {
+        _setStatus('Autosave: click \u201cSave All Comments\u201d to '
+                   + 'pick reports/protection/ (one-time)',
+                   'warn');
+      }
+    }
+  }
+  document.addEventListener('DOMContentLoaded', _initAutosave);
 })();
 </script>"""
 
@@ -3956,6 +4173,45 @@ def build_protection_html(per_array, config):
     thead th {{ position: sticky; top: 0; z-index: 2;
                 box-shadow: inset 0 1px 0 #b8cfe8,
                             inset 0 -1px 0 #b8cfe8; }}
+    /* Volumes table: own scroll container so the sticky thead and
+       the frozen left columns both anchor to this wrap (not the
+       page). min-width on the table forces horizontal overflow on
+       narrow viewports; box-sizing makes the fixed widths on the
+       frozen columns match the left offsets exactly. */
+    .t1-wrap {{ overflow: auto; max-height: calc(100vh - 220px);
+                border: 1px solid #b8cfe8; margin-top: 6px; }}
+    .t1-wrap > table.t1 {{ margin-top: 0; min-width: 1700px; }}
+    .t1-wrap > table.t1 th,
+    .t1-wrap > table.t1 td {{ box-sizing: border-box; }}
+    /* Freeze "Volume Name" (col 1) and "Array Name" (col 2). Sticky
+       cells need an opaque background since rows scroll under them;
+       the inset right-edge shadow draws the seam between the frozen
+       pane and the scrolling body. */
+    .t1-wrap > table.t1 th:nth-child(1),
+    .t1-wrap > table.t1 td:nth-child(1) {{
+        position: sticky; left: 0; width: 220px;
+        background: #fff; z-index: 1;
+        box-shadow: inset -1px 0 0 #b8cfe8; }}
+    .t1-wrap > table.t1 th:nth-child(2),
+    .t1-wrap > table.t1 td:nth-child(2) {{
+        position: sticky; left: 220px; width: 170px;
+        background: #fff; z-index: 1;
+        box-shadow: inset -1px 0 0 #b8cfe8; }}
+    /* Re-apply the even-row tint on the frozen cells so the body
+       stripe doesn't show through the opaque sticky background. */
+    .t1-wrap > table.t1 tbody tr:nth-child(even) td:nth-child(1),
+    .t1-wrap > table.t1 tbody tr:nth-child(even) td:nth-child(2) {{
+        background: #f7faff; }}
+    /* Header corner cells: sticky on both axes. z-index 3 keeps
+       them above plain sticky-top headers (z-index 2) and plain
+       sticky-left body cells (z-index 1). Re-add the top/bottom
+       inset edges plus the right-edge seam. */
+    .t1-wrap > table.t1 thead th:nth-child(1),
+    .t1-wrap > table.t1 thead th:nth-child(2) {{
+        background: #dce6f1; z-index: 3;
+        box-shadow: inset 0 1px 0 #b8cfe8,
+                    inset 0 -1px 0 #b8cfe8,
+                    inset -1px 0 0 #b8cfe8; }}
     .err-banner {{ background: #fff4f4; border: 1px solid #e0a0a0;
                   padding: 6px 10px; margin: 8px 0; border-radius: 4px;
                   color: #802020; }}
@@ -4020,10 +4276,10 @@ def build_protection_html(per_array, config):
     table.sf thead th .color-sort .cs-r.active {{
         opacity: 1; background: #f8d7da;
         outline: 1px solid #dc3545; }}
-    /* Comments column: a per-row <textarea> for free-form notes, with a
-       per-row Save button that downloads the full comments_*.json. The
-       Last Updated label below the textarea reflects the timestamp
-       persisted from the most recent comments JSON. */
+    /* Comments column: per-row <textarea> with a per-cell Last Updated
+       timestamp directly underneath. Edits autosave to a single file
+       under reports/protection/ via the File System Access API; the
+       per-row Save button is gone in favor of debounced autosave. */
     td.comment-cell {{ min-width: 220px; padding: 4px; }}
     td.comment-cell textarea.comment-input {{
         width: 100%; box-sizing: border-box; resize: vertical;
@@ -4035,18 +4291,40 @@ def build_protection_html(per_array, config):
     td.comment-cell.comment-dirty textarea.comment-input {{
         border-color: #d49a00; background: #fffbe6; }}
     td.comment-cell .comment-meta {{
-        display: flex; align-items: center; justify-content: space-between;
-        gap: 6px; margin-top: 3px; font-size: 8.5pt; color: #555; }}
-    td.comment-cell .comment-updated {{
-        flex: 1; white-space: nowrap; overflow: hidden;
+        margin-top: 3px; font-size: 8.5pt; color: #555;
+        white-space: nowrap; overflow: hidden;
         text-overflow: ellipsis; }}
-    td.comment-cell .comment-save {{
-        font: 8.5pt 'Segoe UI', Arial, sans-serif;
-        padding: 1px 8px; border: 1px solid #1a5fb4;
-        background: #e6efff; color: #1f3a5c; border-radius: 2px;
+    td.comment-cell .comment-meta-lbl {{ color: #888; }}
+    td.comment-cell .comment-updated {{ color: #1f3a5c; }}
+    /* Global Save-All toolbar + autosave status indicator above
+       Table 1. The button drives the one-time folder pick; the
+       coloured status pill reflects autosave state. */
+    .comments-toolbar {{ display: flex; align-items: center;
+                         gap: 12px; margin: 6px 0 8px 0;
+                         flex-wrap: wrap; }}
+    .comments-toolbar button.comment-save-all {{
+        font: 10pt 'Segoe UI', Arial, sans-serif; font-weight: bold;
+        padding: 5px 16px; border: 1px solid #1a5fb4;
+        background: #e6efff; color: #1f3a5c; border-radius: 3px;
         cursor: pointer; }}
-    td.comment-cell .comment-save:hover {{
+    .comments-toolbar button.comment-save-all:hover {{
         background: #d4e2f7; }}
+    .comments-toolbar button.comment-save-all.saved-flash {{
+        background: #d4edda; border-color: #28a745; color: #1f5c2f; }}
+    .comments-toolbar .comments-status {{
+        font-size: 9pt; padding: 2px 8px; border-radius: 3px;
+        border: 1px solid transparent; }}
+    .comments-toolbar .comments-status.ok {{
+        background: #d4edda; border-color: #28a745; color: #1f5c2f; }}
+    .comments-toolbar .comments-status.warn {{
+        background: #fff4d6; border-color: #d49a00; color: #6b4a00; }}
+    .comments-toolbar .comments-status.err {{
+        background: #f8d7da; border-color: #dc3545; color: #6b1f29; }}
+    .comments-toolbar .comments-toolbar-hint {{
+        font-size: 9pt; color: #666; }}
+    .comments-toolbar .comments-toolbar-hint code {{
+        background: #f0f4fa; padding: 0 4px; border-radius: 2px;
+        font-family: Consolas, 'Courier New', monospace; }}
   </style>
 </head>
 <body>
@@ -4057,11 +4335,14 @@ def build_protection_html(per_array, config):
   {err_banner}
 
   <h2>1. FlashArray Volumes</h2>
-  <table class="sf">
-    {thead_t1}
-    <tbody>
-{tr_html}    </tbody>
-  </table>
+  {comments_toolbar}
+  <div class="t1-wrap">
+    <table class="sf t1">
+      {thead_t1}
+      <tbody>
+{tr_html}      </tbody>
+    </table>
+  </div>
 
   <h2>2. FlashArray Filesystems</h2>
   {placeholder}
