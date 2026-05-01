@@ -3331,6 +3331,9 @@ def aggregate_fa_volume_rows(per_array):
                     peer_pod_snaps = pod_snaps.get((peer_arr, peer_pod, vol), 0)
                     if peer_arr:
                         dests.add(peer_arr)
+                        # Record the replica array so the HTML renderer can
+                        # resolve pgroup links that live only on the peer.
+                        row['peer_array'] = peer_arr
                     # Pod-scoped pgroups replicate with the pod, so the
                     # same pgroup may appear on both sides. Union them.
                     pgs |= pg_membership.get((peer_arr, peer_pod, vol), set())
@@ -3435,13 +3438,23 @@ def build_protection_html(per_array, config):
                      if dests_ok else _DASH)
             pgs_list = r.get('protection_groups', [])
             pgs_ok = bool(pgs_list)
-            # Each pgroup name renders as a clickable link bound to the
-            # row's source array; the modal popup pulls schedule and
-            # retention from PG_PROFILES[source][pgname].
-            _src = r.get('source_array', r['array'])
+            # Each pgroup name renders as a clickable link. For a plain
+            # volume the link is bound to source_array; for a pod-stretched
+            # volume the pgroup may have been defined only on the replica
+            # array, so resolve per pgroup: prefer source if it owns the
+            # profile, else fall back to peer_array. The modal popup then
+            # pulls schedule and retention from PG_PROFILES[arr][pgname].
+            _src  = r.get('source_array', r['array'])
+            _peer = r.get('peer_array')
+            def _pg_owner(pname, _src=_src, _peer=_peer):
+                if pname in (pg_profiles.get(_src) or {}):
+                    return _src
+                if _peer and pname in (pg_profiles.get(_peer) or {}):
+                    return _peer
+                return _src
             pgs = (', '.join(
                 f'<a href="#" class="pg-link" '
-                f'data-arr="{_html.escape(_src, quote=True)}" '
+                f'data-arr="{_html.escape(_pg_owner(p), quote=True)}" '
                 f'data-pg="{_html.escape(p, quote=True)}" '
                 f'onclick="showPg(this);return false;">{_html.escape(p)}</a>'
                 for p in pgs_list) if pgs_ok else _DASH)
@@ -3584,6 +3597,125 @@ def build_protection_html(per_array, config):
         modal_block = ''
         script_block = ''
 
+    # Sort/filter wiring. The thead is built programmatically so the
+    # column count, sort indicators, and per-column filter inputs stay
+    # aligned. Any table marked class="sf" with a sibling thead row of
+    # th[onclick="sfHeaderClick(...)"] cells inherits the behavior, so
+    # Tables 2/3 will participate once they grow real columns.
+    _T1_COLS = [
+        'Volume Name', 'Array Name', 'Replication Destinations',
+        'Pod', 'Remote Pod', 'Local Snapshots', 'Pod Snapshots',
+        'Replicated Snapshots', 'Safemode', 'Protection Groups',
+        'Connected Hosts']
+    thead_t1 = ('<thead><tr>' + ''.join(
+        f'<th class="sortable" onclick="sfHeaderClick(event,{i})">'
+        f'<div class="th-lbl">{_html.escape(c)}'
+        f'<span class="sort-ind"> \u21d5</span></div>'
+        f'<input class="filter-input" type="text" placeholder="filter\u2026" '
+        f'oninput="sfFilter(this,{i})" '
+        f'onclick="event.stopPropagation()"></th>'
+        for i, c in enumerate(_T1_COLS)) + '</tr></thead>')
+
+    sf_script = r"""<script>
+(function(){
+  function cellVal(c){
+    if(!c) return '';
+    var t = c.textContent.trim();
+    if(t === '\u2014' || t === '-') return '';
+    return t;
+  }
+  function isNumLike(s){
+    if(s === '') return false;
+    return /^[-+]?[0-9]+(\.[0-9]+)?$/.test(
+      s.replace(/,/g,'').replace(/\s+/g,''));
+  }
+  function cmp(a,b,dir){
+    if(a==='' && b==='') return 0;
+    if(a==='') return 1;
+    if(b==='') return -1;
+    if(isNumLike(a) && isNumLike(b)){
+      return (parseFloat(a.replace(/,/g,''))
+            - parseFloat(b.replace(/,/g,''))) * dir;
+    }
+    return a.toLowerCase().localeCompare(b.toLowerCase()) * dir;
+  }
+  function setInd(th, dir){
+    var ind = th.querySelector('.sort-ind');
+    if(!ind) return;
+    ind.textContent = dir === 1 ? ' \u25b2'
+                    : (dir === -1 ? ' \u25bc' : ' \u21d5');
+  }
+  function applyTable(tbl){
+    var tbody = tbl.tBodies[0];
+    var s = tbl._sf;
+    if(!s) return;
+    var filtered = s.orig.filter(function(r){
+      for(var i=0;i<s.filters.length;i++){
+        var f = s.filters[i];
+        if(!f) continue;
+        var c = r.cells[i];
+        if(!c) return false;
+        if(c.textContent.toLowerCase().indexOf(f) < 0) return false;
+      }
+      return true;
+    });
+    if(s.col >= 0 && s.dir !== 0){
+      filtered = filtered.slice().sort(function(a,b){
+        return cmp(cellVal(a.cells[s.col]),
+                   cellVal(b.cells[s.col]), s.dir);
+      });
+    }
+    var ths = tbl.tHead.rows[0].cells;
+    for(var i=0;i<ths.length;i++){
+      ths[i].classList.remove('sort-asc','sort-desc');
+      if(i === s.col && s.dir !== 0){
+        ths[i].classList.add(s.dir === 1 ? 'sort-asc' : 'sort-desc');
+        setInd(ths[i], s.dir);
+      } else {
+        setInd(ths[i], 0);
+      }
+    }
+    var ds = new Set(filtered);
+    for(var j=0;j<s.orig.length;j++){
+      s.orig[j].style.display = ds.has(s.orig[j]) ? '' : 'none';
+    }
+    for(var k=0;k<filtered.length;k++){
+      tbody.appendChild(filtered[k]);
+    }
+  }
+  function initTable(tbl){
+    var tbody = tbl.tBodies[0];
+    if(!tbody) return;
+    var orig = [];
+    for(var i=0;i<tbody.rows.length;i++) orig.push(tbody.rows[i]);
+    var ncols = (tbl.tHead && tbl.tHead.rows[0])
+              ? tbl.tHead.rows[0].cells.length : 0;
+    tbl._sf = {orig:orig, col:-1, dir:0,
+               filters:new Array(ncols).fill('')};
+  }
+  window.sfHeaderClick = function(e, idx){
+    if(e.target.tagName === 'INPUT') return;
+    var tbl = e.currentTarget.closest('table');
+    if(!tbl || !tbl._sf) return;
+    var s = tbl._sf;
+    if(s.col !== idx){ s.col = idx; s.dir = 1; }
+    else if(s.dir === 1) s.dir = -1;
+    else if(s.dir === -1){ s.dir = 0; s.col = -1; }
+    else s.dir = 1;
+    applyTable(tbl);
+  };
+  window.sfFilter = function(input, idx){
+    var tbl = input.closest('table');
+    if(!tbl || !tbl._sf) return;
+    tbl._sf.filters[idx] = input.value.toLowerCase();
+    applyTable(tbl);
+  };
+  document.addEventListener('DOMContentLoaded', function(){
+    document.querySelectorAll('table.sf').forEach(initTable);
+  });
+})();
+</script>"""
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -3630,6 +3762,27 @@ def build_protection_html(per_array, config):
     .pg-detail th, .pg-detail td {{ border: 1px solid #b8cfe8;
                                    padding: 4px 8px; font-size: 9pt; }}
     .pg-detail th {{ background: #dce6f1; }}
+    /* Sort/filter chrome for tables marked class="sf". Each header cell
+       stacks a clickable label (with sort indicator) above a per-column
+       filter input; the input swallows its own clicks so typing into it
+       does not also toggle the column's sort. */
+    table.sf thead th {{ vertical-align: top; padding-top: 4px; }}
+    table.sf thead th.sortable {{ cursor: pointer; user-select: none; }}
+    table.sf thead th.sortable:hover {{ background: #c8d8ec; }}
+    table.sf thead th .th-lbl {{ white-space: nowrap; }}
+    table.sf thead th .sort-ind {{ color: #6b89ad; font-weight: normal;
+                                   font-size: 9pt; }}
+    table.sf thead th.sort-asc .sort-ind,
+    table.sf thead th.sort-desc .sort-ind {{ color: #1f3a5c;
+                                             font-weight: bold; }}
+    table.sf thead th .filter-input {{
+        display: block; box-sizing: border-box; width: 100%;
+        margin-top: 3px; padding: 1px 3px;
+        font: 9pt 'Segoe UI', Arial, sans-serif; font-weight: normal;
+        border: 1px solid #b8cfe8; border-radius: 2px;
+        background: #fff; }}
+    table.sf thead th .filter-input:focus {{
+        outline: 1px solid #1a5fb4; }}
   </style>
 </head>
 <body>
@@ -3640,22 +3793,8 @@ def build_protection_html(per_array, config):
   {err_banner}
 
   <h2>1. FlashArray Volumes</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Volume Name</th>
-        <th>Array Name</th>
-        <th>Replication Destinations</th>
-        <th>Pod</th>
-        <th>Remote Pod</th>
-        <th>Local Snapshots</th>
-        <th>Pod Snapshots</th>
-        <th>Replicated Snapshots</th>
-        <th>Safemode</th>
-        <th>Protection Groups</th>
-        <th>Connected Hosts</th>
-      </tr>
-    </thead>
+  <table class="sf">
+    {thead_t1}
     <tbody>
 {tr_html}    </tbody>
   </table>
@@ -3668,6 +3807,7 @@ def build_protection_html(per_array, config):
 
   {modal_block}
   {script_block}
+  {sf_script}
 </body>
 </html>
 """
