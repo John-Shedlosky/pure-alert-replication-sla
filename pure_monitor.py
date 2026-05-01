@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import sys
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 
 try:
@@ -57,7 +58,12 @@ _alert_collection_lock = threading.Lock()
 # Set to True when --alert-debug is passed on the command line.
 # In this mode SSH calls are bypassed and synthetic alert / lag data are injected
 # so that the daily HTML report and history CSV can be tested without live arrays.
-ALERT_DEBUG = '--alert-debug' in sys.argv
+# --fake-arrays additionally injects a synthetic 12-array / 5-location configuration
+# (see _fake_arrays_config) so the GUI / report can be exercised without any real
+# monitor_config.json. Fake-arrays mode implies alert-debug because the synthetic
+# arrays cannot be reached over SSH.
+FAKE_ARRAYS = '--fake-arrays' in sys.argv
+ALERT_DEBUG = ('--alert-debug' in sys.argv) or FAKE_ARRAYS
 
 def ask_password_in_main(msg):
     global global_password_request_msg
@@ -332,6 +338,74 @@ def _fmt_alert_str(stat):
     if w_c: parts.append(f"{w_c} Warning")
     if i_c: parts.append(f"{i_c} Info")
     return ", ".join(parts)
+
+def _fake_arrays_config():
+    """Return a synthetic config dict with 12 arrays across 5 locations.
+
+    Used by --fake-arrays mode so the GUI / Daily HTML report / History
+    page can be demonstrated without any saved monitor_config.json or
+    reachable live arrays. Names follow a city-prefix convention so the
+    grouped sections in the daily report visibly cluster by location.
+
+    Returned shape matches what _load_config / run_nogui consume: the
+    new-style "arrays" list-of-dicts (with name + location + notes), plus
+    SLA targets, default usernames, and a few replication pairs that
+    cross sites so the Replication Pairs panel is non-empty.
+    """
+    arrays = [
+        # New York (3)
+        {'name': 'nyc-pure-fa-01', 'location': 'New York, NY',
+         'notes': 'Primary VMware datastores'},
+        {'name': 'nyc-pure-fa-02', 'location': 'New York, NY',
+         'notes': 'SQL prod cluster'},
+        {'name': 'nyc-pure-fb-01', 'location': 'New York, NY',
+         'notes': 'Analytics + nightly backup target'},
+        # Chicago (3)
+        {'name': 'chi-pure-fa-01', 'location': 'Chicago, IL',
+         'notes': 'DR target for NYC FA-Block'},
+        {'name': 'chi-pure-fa-02', 'location': 'Chicago, IL',
+         'notes': 'Oracle prod'},
+        {'name': 'chi-pure-fb-01', 'location': 'Chicago, IL',
+         'notes': 'NFS shares + DR for NYC FB'},
+        # Dallas (2)
+        {'name': 'dal-pure-fa-01', 'location': 'Dallas, TX',
+         'notes': 'Mixed workload, Tier-2'},
+        {'name': 'dal-pure-fb-01', 'location': 'Dallas, TX',
+         'notes': 'S3 object storage'},
+        # Seattle (2)
+        {'name': 'sea-pure-fa-01', 'location': 'Seattle, WA',
+         'notes': 'West-coast primary'},
+        {'name': 'sea-pure-fa-02', 'location': 'Seattle, WA',
+         'notes': 'Dev / test'},
+        # London (2)
+        {'name': 'lon-pure-fa-01', 'location': 'London, UK',
+         'notes': 'EMEA primary'},
+        {'name': 'lon-pure-fb-01', 'location': 'London, UK',
+         'notes': 'EMEA backup target'},
+    ]
+    return {
+        'user_fb':  'pureuser',
+        'user_faf': 'pureuser',
+        'user_fab': 'pureuser',
+        'sla_fb':   '1h 30m',
+        'sla_faf':  '1h',
+        'sla_fab':  '1h',
+        'arrays':   arrays,
+        'alerts_excluded': '',
+        'ignore_source_lag': False,
+        'replication_pairs': [
+            {'name': 'NYC FA \u2192 Chi FA',
+             'source': 'nyc-pure-fa-01', 'destination': 'chi-pure-fa-01',
+             'type': 'FA-Block'},
+            {'name': 'NYC FB \u2192 Chi FB',
+             'source': 'nyc-pure-fb-01', 'destination': 'chi-pure-fb-01',
+             'type': 'FB'},
+            {'name': 'Sea FA \u2192 Dal FA',
+             'source': 'sea-pure-fa-01', 'destination': 'dal-pure-fa-01',
+             'type': 'FA-Block'},
+        ],
+    }
+
 
 def _get_debug_alerts(array, idx):
     """Return (counts_dict, log_lines) with synthetic alert data for --alert-debug mode.
@@ -827,6 +901,16 @@ def run_collection_core(config, nogui=False, progress_cb=None):
         for _k, _v in _d.items():
             if _k not in _loc_by_array or (not _loc_by_array[_k] and _v):
                 _loc_by_array[_k] = _v
+
+    # Array -> notes map. Sourced from the unified ``arrays`` list-of-dicts
+    # (the per-type arr_fb/arr_faf/arr_fab buckets do not carry notes).
+    _notes_by_array = {}
+    for _item in (config.get('arrays') or []):
+        if isinstance(_item, dict):
+            _n = str(_item.get('name', '') or '').strip()
+            _nt = str(_item.get('notes', '') or '').strip()
+            if _n and _nt:
+                _notes_by_array[_n] = _nt
 
     # ── Hardware health (purehw list) — run once per unique array ────────────
     # FA-File and FA-Block share the same FlashArray hardware columns, so an
@@ -1358,6 +1442,7 @@ def run_collection_core(config, nogui=False, progress_cb=None):
         _s['hw']  = hw_by_array.get(_s['name'])
         _s['rel'] = rel_by_array.get(_s['name'])
         _s['location'] = _loc_by_array.get(_s['name'], '')
+        _s['notes']    = _notes_by_array.get(_s['name'], '')
 
     # Build a deduplicated pair list for the Replication Relationships section.
     def _loc_suffix(_name):
@@ -1443,19 +1528,25 @@ def build_nogui_header(config):
 
 
 def run_nogui():
-    config_path = "monitor_config.json"
-    if not os.path.exists(config_path):
-        print(f"Error: {config_path} not found. Please run the GUI first to save a configuration.")
-        return
-    with open(config_path, 'r', encoding='utf-8') as f:
-        raw = json.load(f)
+    # --fake-arrays --nogui produces a Daily HTML report from the synthetic
+    # 12-array dataset and skips disk I/O for the source config entirely.
+    if FAKE_ARRAYS:
+        print("Running in --nogui --fake-arrays mode (synthetic 12-array config).")
+        raw = _fake_arrays_config()
+    else:
+        config_path = "monitor_config.json"
+        if not os.path.exists(config_path):
+            print(f"Error: {config_path} not found. Please run the GUI first to save a configuration.")
+            return
+        with open(config_path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
 
-    _arrays = unified_arrays_from_config(raw)
+    _arrays = unified_arrays_from_config_full(raw)
     cfg = {
         'user_fb':  raw.get('user_fb',  'pureuser'),
         'user_faf': raw.get('user_faf', 'pureuser'),
         'user_fab': raw.get('user_fab', 'pureuser'),
-        'arrays':   [{'name': n, 'location': l} for n, l in _arrays],
+        'arrays':   [{'name': n, 'location': l, 'notes': nt} for n, l, nt in _arrays],
         'sla_fb':   parse_time_to_seconds(raw.get('sla_fb',  '1h 30m')),
         'sla_faf':  parse_time_to_seconds(raw.get('sla_faf', '1h')),
         'sla_fab':  parse_time_to_seconds(raw.get('sla_fab', '1h')),
@@ -1615,7 +1706,7 @@ def build_status_html(stats, config):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    import io as _io, base64, os, time as _time
+    import io as _io, base64, os, time as _time, html as _html
 
     tz         = _time.tzname[_time.daylight]
     now_str    = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p")
@@ -1901,10 +1992,14 @@ def build_status_html(stats, config):
         _loc_txt = stat.get('location', '') or ''
         _loc_td = (f'<td>{_loc_txt}</td>' if _loc_txt
                    else '<td style="text-align:center;color:#888;">\u2014</td>')
+        _notes_txt = stat.get('notes', '') or ''
+        _notes_td = (f'<td>{_html.escape(_notes_txt)}</td>' if _notes_txt
+                     else '<td style="text-align:center;color:#888;">\u2014</td>')
         rows_html += (f'      <tr>'
                       f'<td style="text-align:center;">{status_td}</td>'
                       f'<td>{stat["name"]}</td>'
                       f'{_loc_td}'
+                      f'{_notes_td}'
                       f'<td>{stat["type"]}</td>'
                       f'{c_td}{w_td}{i_td}'
                       f'{hw_td}'
@@ -1927,6 +2022,7 @@ def build_status_html(stats, config):
     th, td {{ border: 1px solid #999; padding: 4px 6px; vertical-align: middle; word-wrap: break-word; }}
     th    {{ background: #dce6f1; font-weight: bold; font-size: 10pt; }}
     col.c0  {{ width: 96px; }}  col.c1  {{ width: 144px; }} col.c1a {{ width: 110px; }}
+    col.c1b {{ width: 180px; }}
     col.c2  {{ width: 67px; }}
     col.c3  {{ width: 52px; }}  col.c4  {{ width: 52px; }}  col.c5  {{ width: 52px; }}
     col.c6  {{ width: 80px; }}  col.c8  {{ width: 80px; }}  col.c9  {{ width: 80px; }}
@@ -2067,13 +2163,13 @@ def build_status_html(stats, config):
   </div>
 {summary_html}  <table>
     <colgroup>
-      <col class="c0"><col class="c1"><col class="c1a"><col class="c2">
+      <col class="c0"><col class="c1"><col class="c1a"><col class="c1b"><col class="c2">
       <col class="c3"><col class="c4"><col class="c5"><col class="c6">
       <col class="c7"><col class="c8"><col class="c9">
     </colgroup>
     <thead>
       <tr>
-        <th>Array Status</th><th>Array Name</th><th>Location</th><th>Type</th>
+        <th>Array Status</th><th>Array Name</th><th>Location</th><th>Notes</th><th>Type</th>
         <th style="color:#c00000;">Critical</th>
         <th style="color:#c07000;">Warning</th>
         <th style="color:#004490;">Info</th>
@@ -2651,10 +2747,466 @@ def build_status_html(stats, config):
 </html>"""
 
 
+# =========================================================
+# VOLUME & SNAPSHOT PROTECTION REPORT
+# =========================================================
+# Independent collection path used by the "Volume & Snapshot Protection"
+# button. Issues purevol list / purepod replica-link list / purevol list
+# --snap on each FlashArray, aggregates pod stretch + snapshot counts,
+# and emits a separate HTML page (Tables 2 and 3 are placeholders).
+
+def _csv_to_dicts(text):
+    """Parse CSV blob into [{header: cell}, ...]; tolerant of empty input."""
+    rows = _parse_csv_text(text)
+    if not rows:
+        return []
+    header = [c.strip() for c in rows[0]]
+    out = []
+    for r in rows[1:]:
+        if not r:
+            continue
+        d = {}
+        for i, h in enumerate(header):
+            d[h] = (r[i].strip() if i < len(r) else '')
+        out.append(d)
+    return out
+
+
+def _fake_protection_data_for(array):
+    """Synthetic per-array protection data used when ALERT_DEBUG is set.
+    Generates a small but representative mix of plain volumes, pod
+    volumes (with a stretched pair), and three snapshot kinds so the
+    aggregator and HTML can be exercised without live arrays.
+    """
+    # Two stretched pod pairs across the 12 fake arrays:
+    #   nyc-pure-fa-01 <-> chi-pure-fa-01  (pod 'vmware_pod')
+    #   dal-pure-fa-01 <-> sea-pure-fa-01  (pod 'oracle_pod')
+    pod_pairs = {
+        'nyc-pure-fa-01': ('chi-pure-fa-01', 'vmware_pod', 'vmware_pod', '-->'),
+        'chi-pure-fa-01': ('nyc-pure-fa-01', 'vmware_pod', 'vmware_pod', '<--'),
+        'dal-pure-fa-01': ('sea-pure-fa-01', 'oracle_pod', 'oracle_pod', '-->'),
+        'sea-pure-fa-01': ('dal-pure-fa-01', 'oracle_pod', 'oracle_pod', '<--'),
+    }
+    volumes  = [{'name': f'{array}_vol01', 'pod': None, 'volume': f'{array}_vol01'},
+                {'name': f'{array}_vol02', 'pod': None, 'volume': f'{array}_vol02'}]
+    pod_links = []
+    snapshots = []
+    if array in pod_pairs:
+        rem, lp, rp, direction = pod_pairs[array]
+        for vname in ('db_data', 'db_log'):
+            volumes.append({'name': f'{lp}::{vname}', 'pod': lp, 'volume': vname})
+            for _i in range(2):
+                snapshots.append({'source': f'{lp}::{vname}', 'name': f'{lp}::{vname}.snap{_i}'})
+        pod_links.append({'local_pod': lp, 'direction': direction,
+                          'remote_pod': rp, 'remote_array': rem, 'status': 'replicating'})
+    # Two local snapshots of vol01, one replicated snapshot from a peer.
+    snapshots.append({'source': f'{array}_vol01', 'name': f'{array}_vol01.snap1'})
+    snapshots.append({'source': f'{array}_vol01', 'name': f'{array}_vol01.snap2'})
+    # Each FA receives a replicated snapshot from the next FA in the list
+    # (forms a ring) so Replicated Snapshots / Destinations get populated.
+    _peers = ['nyc-pure-fa-01', 'nyc-pure-fa-02', 'chi-pure-fa-01', 'chi-pure-fa-02',
+              'dal-pure-fa-01', 'sea-pure-fa-01', 'sea-pure-fa-02', 'lon-pure-fa-01']
+    if array in _peers:
+        _idx  = _peers.index(array)
+        _peer = _peers[(_idx + 1) % len(_peers)]
+        snapshots.append({'source': f'{_peer}:{_peer}_vol02',
+                          'name': f'{_peer}:{_peer}_vol02.snap1'})
+    return {'volumes': volumes, 'pod_links': pod_links, 'snapshots': snapshots,
+            'error': None}
+
+
+def _parse_purevol_list_csv(text):
+    """Parse `purevol list --csv` -> [{'name','pod','volume'}, ...].
+    Pod separator is `::`; absent -> pod=None, volume=name.
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        if '::' in name:
+            pod, vol = name.split('::', 1)
+            out.append({'name': name, 'pod': pod, 'volume': vol})
+        else:
+            out.append({'name': name, 'pod': None, 'volume': name})
+    return out
+
+
+def _parse_purepod_replica_link_csv(text):
+    """Parse `purepod replica-link list --csv` rows.
+    Returns list of {'local_pod','direction','remote_pod','remote_array','status'}.
+    Column names vary slightly across Purity versions; this matches loosely.
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        local_pod = (d.get('Name') or d.get('Local Pod') or '').strip()
+        direction = (d.get('Direction') or '').strip()
+        remote_pod = (d.get('Remote Pod') or '').strip()
+        remote_array = (d.get('Remote') or d.get('Remote Array') or '').strip()
+        status = (d.get('Status') or '').strip()
+        if not local_pod:
+            continue
+        out.append({'local_pod': local_pod, 'direction': direction,
+                    'remote_pod': remote_pod, 'remote_array': remote_array,
+                    'status': status})
+    return out
+
+
+def _parse_purevol_snap_csv(text):
+    """Parse `purevol list --snap --csv` rows -> [{'name','source'}, ...]."""
+    out = []
+    for d in _csv_to_dicts(text):
+        out.append({'name': (d.get('Name') or '').strip(),
+                    'source': (d.get('Source') or '').strip()})
+    return out
+
+
+def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
+    """Issue the three FlashArray protection commands and parse their output.
+    Returns {'volumes', 'pod_links', 'snapshots', 'error'}. Errors on a
+    single command are non-fatal: that section returns [] and the error
+    text is recorded in 'error'.
+    """
+    if ALERT_DEBUG:
+        return _fake_protection_data_for(array)
+    out = {'volumes': [], 'pod_links': [], 'snapshots': [], 'error': None}
+    _errs = []
+    try:
+        out['volumes'] = _parse_purevol_list_csv(run_ssh_command(
+            array, user, "purevol list --csv",
+            log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purevol list: {e}")
+    try:
+        out['pod_links'] = _parse_purepod_replica_link_csv(run_ssh_command(
+            array, user, "purepod replica-link list --csv",
+            log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purepod replica-link list: {e}")
+    try:
+        out['snapshots'] = _parse_purevol_snap_csv(run_ssh_command(
+            array, user, "purevol list --snap --csv",
+            log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purevol list --snap: {e}")
+    if _errs:
+        out['error'] = "; ".join(_errs)
+    return out
+
+
+def run_protection_collection_core(config, nogui=False, progress_cb=None):
+    """Detect array types, then collect protection data for each FA.
+    Returns (per_array, detailed_logs):
+        per_array : {array_name: {platform, user, error, volumes, pod_links, snapshots}}
+        detailed_logs : list of SSH command-log strings (matches Daily Report log style)
+    """
+    detailed_logs = []
+    def _p(msg):
+        if progress_cb:
+            try: progress_cb(msg)
+            except Exception: pass
+
+    _unified = config.get('arrays', [])
+    _arrays_in_order = list(parse_unified_arrays(_unified)) if _unified else []
+    if not _arrays_in_order:
+        _seen = set(); _arrays_in_order = []
+        for _a in (list(config.get('arr_fb',  []))
+                  + list(config.get('arr_faf', []))
+                  + list(config.get('arr_fab', []))):
+            if _a and _a not in _seen:
+                _seen.add(_a); _arrays_in_order.append((_a, ''))
+
+    _users = [('FlashBlade',         config.get('user_fb',  'pureuser')),
+              ('FlashArray Pod',     config.get('user_faf', 'pureuser')),
+              ('FlashArray Async',   config.get('user_fab', 'pureuser'))]
+
+    # ── Step 1: Array-type detection (4 workers) ─────────────────────────
+    detect_results = [None] * len(_arrays_in_order)
+    def _detect_one(_idx_pair):
+        _idx, (_name, _loc) = _idx_pair
+        _p(f"Detecting array {_name} type...")
+        try:
+            info = detect_array_type(_name, _users,
+                                     detailed_logs=detailed_logs, nogui=nogui)
+        except Exception as e:
+            info = {'is_fb': False, 'is_faf': False, 'is_fab': False,
+                    'is_nrp': False, 'user': None, 'error': str(e)}
+        return _idx, _name, info
+
+    if _arrays_in_order:
+        _workers = min(4, len(_arrays_in_order))
+        with ThreadPoolExecutor(max_workers=_workers) as _ex:
+            for _idx, _name, info in _ex.map(_detect_one,
+                                             list(enumerate(_arrays_in_order))):
+                detect_results[_idx] = (_name, info)
+
+    # ── Step 2: Collect FlashArray protection (4 workers) ────────────────
+    per_array = {}
+    fa_targets = []
+    for _entry in detect_results:
+        if not _entry: continue
+        _name, info = _entry
+        platform = ('FB' if info.get('is_fb') else
+                    ('FA' if (info.get('is_faf') or info.get('is_fab')
+                              or info.get('is_nrp')) else None))
+        per_array[_name] = {'platform': platform, 'user': info.get('user'),
+                            'error': info.get('error'), 'volumes': [],
+                            'pod_links': [], 'snapshots': []}
+        if platform == 'FA':
+            fa_targets.append((_name, info.get('user')
+                                      or config.get('user_fab', 'pureuser')))
+
+    def _collect_one(_arg):
+        _idx, (_name, _u) = _arg
+        _p(f"Collecting array {_name} volumes & snapshots...")
+        return _name, _collect_one_fa_protection(
+            _name, _u, detailed_logs, nogui=nogui)
+
+    if fa_targets:
+        _workers = min(4, len(fa_targets))
+        with ThreadPoolExecutor(max_workers=_workers) as _ex:
+            for _name, data in _ex.map(_collect_one,
+                                       list(enumerate(fa_targets))):
+                per_array[_name].update(data)
+
+    return per_array, detailed_logs
+
+
+def aggregate_fa_volume_rows(per_array):
+    """Build Table 1 rows from per-array protection data.
+
+    Returns list of dicts:
+        array, volume, in_pod, pod_direction, remote_pod,
+        local_snaps, pod_snaps, replicated_snaps, replication_destinations
+    """
+    # ── Tally snapshot counts keyed by (array, pod_or_None, volume) ─────
+    local_snaps = {}      # (arr, None, vol) -> int (no-colon source)
+    pod_snaps   = {}      # (arr, pod,  vol) -> int (pod::vol source)
+    repl_snaps  = {}      # (src_arr, None, vol) -> int (one-colon source)
+    repl_dests  = {}      # (src_arr, None, vol) -> set of dest arrays
+
+    for arr, data in per_array.items():
+        for snap in data.get('snapshots', []):
+            src = snap.get('source', '')
+            if not src:
+                continue
+            if '::' in src:
+                pod, vol = src.split('::', 1)
+                pod_snaps[(arr, pod, vol)] = pod_snaps.get((arr, pod, vol), 0) + 1
+            elif ':' in src:
+                src_arr, vol = src.split(':', 1)
+                k = (src_arr, None, vol)
+                repl_snaps[k] = repl_snaps.get(k, 0) + 1
+                repl_dests.setdefault(k, set()).add(arr)
+            else:
+                k = (arr, None, src)
+                local_snaps[k] = local_snaps.get(k, 0) + 1
+
+    # ── Build pod-stretch map. Only 'replicating' links count; the
+    # destination side will be folded into the source side so each
+    # stretched pod-volume appears in the table only once. ──────────────
+    # stretch[(arr, pod)] = (peer_arr, peer_pod, role) where role is
+    # 'source' if direction is '-->' (this side replicates outward) and
+    # 'dest' if direction is '<--' (this side receives the replica).
+    stretch = {}
+    for arr, data in per_array.items():
+        for link in data.get('pod_links', []):
+            if (link.get('status') or '').lower() != 'replicating':
+                continue
+            local_pod    = link.get('local_pod', '')
+            remote_pod   = link.get('remote_pod', '')
+            remote_array = link.get('remote_array', '')
+            direction    = link.get('direction', '')
+            if not (local_pod and remote_array):
+                continue
+            role = 'source' if direction == '-->' else (
+                   'dest' if direction == '<--' else '')
+            stretch[(arr, local_pod)] = (remote_array, remote_pod, role)
+
+    # ── Assemble rows. Track which (arr, pod, vol) keys to skip because
+    # they belong to the dest side of a stretched pod. ──────────────────
+    drop = set()
+    for arr, data in per_array.items():
+        for v in data.get('volumes', []):
+            if v.get('pod') is None:
+                continue
+            key = (arr, v['pod'])
+            if key in stretch and stretch[key][2] == 'dest':
+                drop.add((arr, v['pod'], v['volume']))
+
+    rows = []
+    seen_pod_volume_pairs = set()  # (source_arr, pod, vol) — dedup source side
+    for arr, data in per_array.items():
+        for v in data.get('volumes', []):
+            pod, vol = v.get('pod'), v['volume']
+            key3 = (arr, pod, vol)
+            if key3 in drop:
+                continue
+
+            row = {'array': arr, 'volume': vol, 'in_pod': bool(pod),
+                   'pod_direction': '', 'remote_pod': '',
+                   'local_snaps': 0, 'pod_snaps': 0,
+                   'replicated_snaps': 0, 'replication_destinations': []}
+
+            if pod is None:
+                row['local_snaps']      = local_snaps.get((arr, None, vol), 0)
+                row['replicated_snaps'] = repl_snaps.get((arr, None, vol), 0)
+                row['replication_destinations'] = sorted(
+                    repl_dests.get((arr, None, vol), set()))
+            else:
+                # Pod volume. Combine pod_snaps from this side + the
+                # stretched peer (if any) so the source-side row carries
+                # the unified count.
+                count = pod_snaps.get((arr, pod, vol), 0)
+                stretch_info = stretch.get((arr, pod))
+                if stretch_info:
+                    peer_arr, peer_pod, role = stretch_info
+                    count += pod_snaps.get((peer_arr, peer_pod, vol), 0)
+                    # Show "source --> dest" in the Array column. If our
+                    # role is 'dest' this row should already be dropped
+                    # above; defensive in case direction was odd.
+                    if role == 'source':
+                        row['array']         = f'{arr} \u2192 {peer_arr}'
+                        row['pod_direction'] = f'{arr} \u2192 {peer_arr}'
+                        row['remote_pod']    = peer_pod
+                    elif role == 'dest':
+                        row['array']         = f'{peer_arr} \u2192 {arr}'
+                        row['pod_direction'] = f'{peer_arr} \u2192 {arr}'
+                        row['remote_pod']    = peer_pod
+                # Dedup pod-volume rows that may appear because both sides
+                # exposed identical (pod, volume) names but only one had a
+                # 'replicating' link recorded (rare but possible).
+                src_key = (row['array'], pod, vol)
+                if src_key in seen_pod_volume_pairs:
+                    continue
+                seen_pod_volume_pairs.add(src_key)
+                row['pod_snaps'] = count
+            rows.append(row)
+
+    rows.sort(key=lambda r: (r['array'].lower(), (0 if r['in_pod'] else 1),
+                             r['volume'].lower()))
+    return rows
+
+
+def build_protection_html(per_array, config):
+    """Generate the Volume & Snapshot Protection HTML report.
+
+    Three sections:
+      1. FlashArray Volumes  (fully populated)
+      2. FlashArray Filesystems  (placeholder, spec pending)
+      3. FlashBlade Filesystems  (placeholder, spec pending)
+    """
+    import html as _html
+    import time as _time
+
+    tz      = _time.tzname[_time.daylight]
+    now_str = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p")
+    rows    = aggregate_fa_volume_rows(per_array)
+
+    # Per-array error banner contents.
+    err_lines = []
+    for arr in sorted(per_array.keys()):
+        info = per_array[arr]
+        if info.get('error'):
+            err_lines.append(f"{_html.escape(arr)}: {_html.escape(str(info['error']))}")
+
+    # ── Build Table 1 rows ────────────────────────────────────────────────
+    tr_html = ""
+    if not rows:
+        tr_html = ('<tr><td colspan="9" style="text-align:center;color:#888;">'
+                   'No FlashArray volumes discovered.</td></tr>')
+    else:
+        _check = '<span style="color:#1a7f37;font-weight:bold;">&#10003;</span>'
+        for r in rows:
+            dests = ', '.join(_html.escape(d) for d in r['replication_destinations']) \
+                    if r['replication_destinations'] else \
+                    '<span style="color:#888;">&mdash;</span>'
+            pod_cell = (_check if r['in_pod']
+                        else '<span style="color:#888;">&mdash;</span>')
+            remote_pod = (_html.escape(r['remote_pod']) if r['remote_pod']
+                          else '<span style="color:#888;">&mdash;</span>')
+            tr_html += (
+                '<tr>'
+                f'<td>{_html.escape(r["array"])}</td>'
+                f'<td>{_html.escape(r["volume"])}</td>'
+                f'<td style="text-align:center;">{pod_cell}</td>'
+                f'<td>{remote_pod}</td>'
+                f'<td style="text-align:right;">{r["local_snaps"]}</td>'
+                f'<td style="text-align:right;">{r["pod_snaps"]}</td>'
+                f'<td style="text-align:right;">{r["replicated_snaps"]}</td>'
+                f'<td>{dests}</td>'
+                '</tr>\n')
+
+    err_banner = ''
+    if err_lines:
+        err_banner = ('<div class="err-banner"><strong>Collection errors:</strong><br>'
+                      + '<br>'.join(err_lines) + '</div>')
+
+    placeholder = ('<p style="color:#666;font-style:italic;">'
+                   'Specification pending &mdash; coming in next update.</p>')
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Volume &amp; Snapshot Protection</title>
+  <style>
+    body {{ font-family: 'Segoe UI', Arial, sans-serif; font-size: 10pt; margin: 16px; }}
+    h1   {{ color: #1f3a5c; margin: 0 0 4px 0; }}
+    h2   {{ color: #1f3a5c; margin: 24px 0 8px 0; border-bottom: 1px solid #b8cfe8;
+           padding-bottom: 4px; }}
+    p.meta {{ margin: 2px 0; color: #444; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 6px; }}
+    th, td {{ border: 1px solid #b8cfe8; padding: 4px 8px; vertical-align: top; }}
+    th    {{ background: #dce6f1; font-weight: bold; }}
+    tr:nth-child(even) td {{ background: #f7faff; }}
+    .err-banner {{ background: #fff4f4; border: 1px solid #e0a0a0;
+                  padding: 6px 10px; margin: 8px 0; border-radius: 4px;
+                  color: #802020; }}
+  </style>
+</head>
+<body>
+  <h1>Everpure &mdash; Volume &amp; Snapshot Protection</h1>
+  <p class="meta">Generated {now_str} {tz}</p>
+  <p class="meta">Arrays inventoried: {len(per_array)} &middot;
+                  FlashArray volume rows: {len(rows)}</p>
+  {err_banner}
+
+  <h2>1. FlashArray Volumes</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Array</th>
+        <th>Volume</th>
+        <th>Pod</th>
+        <th>Remote Pod</th>
+        <th>Local Snapshots</th>
+        <th>Pod Snapshots</th>
+        <th>Replicated Snapshots</th>
+        <th>Replication Destinations</th>
+      </tr>
+    </thead>
+    <tbody>
+{tr_html}    </tbody>
+  </table>
+
+  <h2>2. FlashArray Filesystems</h2>
+  {placeholder}
+
+  <h2>3. FlashBlade Filesystems</h2>
+  {placeholder}
+</body>
+</html>
+"""
+
+
 class PureMonitorApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Everpure (Pure Storage) - Alert and Replication SLA Status Report")
+        _title = "Everpure (Pure Storage) - Alert and Replication SLA Status Report"
+        if FAKE_ARRAYS:
+            _title += "  [DEMO: 12 fake arrays, 5 locations]"
+        self.title(_title)
         # 1000 px tall fits the 660 px Configuration pane (3 user rows +
         # alerts + 15-row Arrays sheet + checkbox + LabelFrame chrome) and
         # leaves room for the button bar plus an 8-row output log without
@@ -3120,8 +3672,8 @@ class PureMonitorApp(tk.Tk):
         # Label wraplength roughly 100px.
         WL = 100
         
-        # Row 0: FB User
-        ttk.Label(config_frame, text="FB User:", wraplength=WL, justify=tk.LEFT).grid(row=0, column=0, sticky=tk.W, pady=2)
+        # Row 0: FlashBlade User
+        ttk.Label(config_frame, text="FlashBlade User:", wraplength=WL, justify=tk.LEFT).grid(row=0, column=0, sticky=tk.W, pady=2)
         self.user_fb_entry = ttk.Entry(config_frame, width=20)
         self.user_fb_entry.insert(0, config.get("user_fb", config.get("user", "pureuser")))
         self.user_fb_entry.grid(row=0, column=1, sticky=tk.W, pady=2)
@@ -3151,14 +3703,14 @@ class PureMonitorApp(tk.Tk):
                 logo_label.grid(row=0, column=5, rowspan=3, sticky=tk.NE, padx=10, pady=5)
              except: pass
         
-        # Row 1: FA-Files User
-        ttk.Label(config_frame, text="FA-Files User:", wraplength=WL, justify=tk.LEFT).grid(row=1, column=0, sticky=tk.W, pady=2)
+        # Row 1: FlashArray Pod User
+        ttk.Label(config_frame, text="FlashArray Pod User:", wraplength=WL, justify=tk.LEFT).grid(row=1, column=0, sticky=tk.W, pady=2)
         self.user_faf_entry = ttk.Entry(config_frame, width=20)
         self.user_faf_entry.insert(0, config.get("user_faf", config.get("user", "pureuser")))
         self.user_faf_entry.grid(row=1, column=1, sticky=tk.W, pady=2)
-        
-        # Row 2: FA-Block User
-        ttk.Label(config_frame, text="FA-Block User:", wraplength=WL, justify=tk.LEFT).grid(row=2, column=0, sticky=tk.W, pady=2)
+
+        # Row 2: FlashArray Async User
+        ttk.Label(config_frame, text="FlashArray Async User:", wraplength=WL, justify=tk.LEFT).grid(row=2, column=0, sticky=tk.W, pady=2)
         self.user_fab_entry = ttk.Entry(config_frame, width=20)
         self.user_fab_entry.insert(0, config.get("user_fab", config.get("user", "pureuser")))
         self.user_fab_entry.grid(row=2, column=1, sticky=tk.W, pady=2)
@@ -3169,24 +3721,51 @@ class PureMonitorApp(tk.Tk):
         self.alerts_entry.insert(tk.END, config.get("alerts_excluded", DEFAULT_EXCLUDED_ALERTS))
         self.alerts_entry.grid(row=3, column=1, sticky=tk.W, pady=2)
 
+        # Quick-reference links to Pure Storage alert catalogues, placed to the
+        # right of the Excluded Alerts box so the user can look up alert IDs.
+        alerts_links_frame = ttk.Frame(config_frame)
+        alerts_links_frame.grid(row=3, column=2, columnspan=3, sticky=tk.NW,
+                                padx=(10, 5), pady=2)
+        def _make_link(parent, text, url):
+            lbl = tk.Label(parent, text=text, fg="#1a5fb4", cursor="hand2",
+                           font=("TkDefaultFont", 9, "underline"))
+            lbl.bind("<Button-1>", lambda _e, u=url: webbrowser.open_new_tab(u))
+            return lbl
+        _fb_alerts_url = ("https://support.purestorage.com/bundle/m_purityfb_alerts/"
+                          "page/FlashBlade/Purity_FB/topics/concept/c_purityfb_alerts.html")
+        _fa_alerts_url = ("https://support.purestorage.com/bundle/m_purityfa_alerts/"
+                          "page/FlashArray/PurityFA/topics/concept/c_purityfa_alerts.html")
+        _make_link(alerts_links_frame, "FlashBlade Alert Code Reference", _fb_alerts_url).pack(side=tk.TOP, anchor=tk.W)
+        _make_link(alerts_links_frame, "FlashArray Alert Code Reference", _fa_alerts_url).pack(side=tk.TOP, anchor=tk.W, pady=(2, 0))
+
         # Rows 4-6: unified Arrays / Location sheet on the left, SLA entries on the right
         ttk.Label(config_frame, text="Arrays:", wraplength=WL, justify=tk.LEFT).grid(row=4, column=0, sticky=tk.NW, pady=2)
         self._build_arrays_sheet(config_frame, config)
 
-        ttk.Label(config_frame, text="SLA FB:", justify=tk.LEFT).grid(row=4, column=3, sticky=tk.W, padx=(10, 5), pady=2)
-        self.sla_fb_entry = ttk.Entry(config_frame, width=10)
+        # SLA inputs: label stacked above the entry so longer label text fits
+        # without forcing the configuration column to grow. Each row reuses a
+        # small frame at column 3 spanning the previous label+entry footprint.
+        SLA_WL = 140
+        sla_fb_frame = ttk.Frame(config_frame)
+        sla_fb_frame.grid(row=4, column=3, columnspan=2, sticky=tk.W, padx=(10, 10), pady=2)
+        ttk.Label(sla_fb_frame, text="FlashBlade Target SLA:", wraplength=SLA_WL, justify=tk.LEFT).pack(side=tk.TOP, anchor=tk.W)
+        self.sla_fb_entry = ttk.Entry(sla_fb_frame, width=10)
         self.sla_fb_entry.insert(0, config.get("sla_fb", "1h 30m"))
-        self.sla_fb_entry.grid(row=4, column=4, sticky=tk.W, padx=(5, 10), pady=2)
+        self.sla_fb_entry.pack(side=tk.TOP, anchor=tk.W)
 
-        ttk.Label(config_frame, text="SLA FA-File:", justify=tk.LEFT).grid(row=5, column=3, sticky=tk.W, padx=(10, 5), pady=2)
-        self.sla_faf_entry = ttk.Entry(config_frame, width=10)
+        sla_faf_frame = ttk.Frame(config_frame)
+        sla_faf_frame.grid(row=5, column=3, columnspan=2, sticky=tk.W, padx=(10, 10), pady=2)
+        ttk.Label(sla_faf_frame, text="FlashArray Pod Target SLA:", wraplength=SLA_WL, justify=tk.LEFT).pack(side=tk.TOP, anchor=tk.W)
+        self.sla_faf_entry = ttk.Entry(sla_faf_frame, width=10)
         self.sla_faf_entry.insert(0, config.get("sla_faf", "1h"))
-        self.sla_faf_entry.grid(row=5, column=4, sticky=tk.W, padx=(5, 10), pady=2)
+        self.sla_faf_entry.pack(side=tk.TOP, anchor=tk.W)
 
-        ttk.Label(config_frame, text="SLA FA-Block:", justify=tk.LEFT).grid(row=6, column=3, sticky=tk.W, padx=(10, 5), pady=2)
-        self.sla_fab_entry = ttk.Entry(config_frame, width=10)
+        sla_fab_frame = ttk.Frame(config_frame)
+        sla_fab_frame.grid(row=6, column=3, columnspan=2, sticky=tk.W, padx=(10, 10), pady=2)
+        ttk.Label(sla_fab_frame, text="FlashArray Async Target SLA:", wraplength=SLA_WL, justify=tk.LEFT).pack(side=tk.TOP, anchor=tk.W)
+        self.sla_fab_entry = ttk.Entry(sla_fab_frame, width=10)
         self.sla_fab_entry.insert(0, config.get("sla_fab", "1h"))
-        self.sla_fab_entry.grid(row=6, column=4, sticky=tk.W, padx=(5, 10), pady=2)
+        self.sla_fab_entry.pack(side=tk.TOP, anchor=tk.W)
         
         # Row 7: Ignore Source Lag Checkbox for FA-Block
         self.ignore_source_lag_var = tk.BooleanVar(value=config.get("ignore_source_lag", False))
@@ -3265,6 +3844,14 @@ class PureMonitorApp(tk.Tk):
         self.open_daily_btn.pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Open History Report",
                    command=self._show_health_history).pack(side=tk.LEFT, padx=5)
+        # Independent of Run Report; does its own type detection so users
+        # can jump straight to volume/snapshot protection without first
+        # running the daily collection.
+        self.protect_btn = tk.Button(btn_frame, text="Volume & Snapshot Protection",
+                                     command=self._run_protection_report,
+                                     relief=tk.RAISED, padx=6, pady=3)
+        self.protect_btn.pack(side=tk.LEFT, padx=5)
+        self.last_protection_path = None
         
         # height=8 (rows) caps the ScrolledText's natural requested height
         # so it doesn't out-bid the Configuration pane for vertical space
@@ -3283,6 +3870,11 @@ class PureMonitorApp(tk.Tk):
         self.after(200, self.check_queue)
         
     def _load_config(self):
+        # --fake-arrays bypasses monitor_config.json entirely so a real saved
+        # config is never read or overwritten when previewing the synthetic
+        # 12-array / 5-location dataset.
+        if FAKE_ARRAYS:
+            return _fake_arrays_config()
         if os.path.exists("monitor_config.json"):
             try:
                 with open("monitor_config.json", "r", encoding="utf-8") as f:
@@ -3291,6 +3883,15 @@ class PureMonitorApp(tk.Tk):
         return {}
 
     def _save_config(self):
+        # Hard guard against clobbering the real monitor_config.json with the
+        # synthetic dataset when the GUI was launched in --fake-arrays mode.
+        if FAKE_ARRAYS:
+            messagebox.showwarning(
+                "Save disabled in --fake-arrays mode",
+                "The GUI is running with the synthetic 12-array dataset.\n"
+                "Saving is disabled to protect your real monitor_config.json.\n\n"
+                "Restart without --fake-arrays to edit and save your config.")
+            return
         arrays = [{"name": n, "location": l, "notes": nt}
                   for n, l, nt in self._get_arrays_from_sheet()]
         # Capture the current Arrays-sheet column widths so any user-driven
@@ -3647,6 +4248,63 @@ class PureMonitorApp(tk.Tk):
         if self.last_html_path and os.path.exists(self.last_html_path):
             os.startfile(os.path.abspath(self.last_html_path))
 
+    # ── Volume & Snapshot Protection ────────────────────────────────────
+    def _run_protection_report(self):
+        """Kick off the independent protection-report collection in a
+        worker thread so the GUI stays responsive."""
+        self.protect_btn.config(state=tk.DISABLED)
+        self.text_out.insert(tk.END,
+            "\nCollecting volume & snapshot protection data... Please wait.\n")
+        self.text_out.see(tk.END)
+        self._show_busy_spinner("Collecting volume & snapshot protection data...")
+        _arrays = [{'name': n, 'location': l, 'notes': nt}
+                   for n, l, nt in self._get_arrays_from_sheet()]
+        cfg = {
+            'user_fb':  self.user_fb_entry.get().strip(),
+            'user_faf': self.user_faf_entry.get().strip(),
+            'user_fab': self.user_fab_entry.get().strip(),
+            'arrays':   _arrays,
+        }
+        threading.Thread(target=self._run_protection_collection,
+                         args=(cfg,), daemon=True).start()
+
+    def _run_protection_collection(self, config):
+        try:
+            def _progress(msg):
+                try:
+                    self.after(0, lambda m=msg: self._update_busy_status(m))
+                except Exception:
+                    pass
+            per_array, _logs = run_protection_collection_core(
+                config, nogui=False, progress_cb=_progress)
+            html = build_protection_html(per_array, config)
+            date_str   = datetime.datetime.now().strftime("%Y-%m-%d")
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            out_dir    = os.path.join(script_dir, "reports", "protection")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(
+                out_dir, f"Pure_Volume_Snapshot_Protection_{date_str}.html")
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(html)
+            self.last_protection_path = out_path
+            def _done():
+                self.text_out.insert(tk.END,
+                    f"Protection report saved to: {os.path.abspath(out_path)}\n")
+                self.text_out.see(tk.END)
+                try: os.startfile(os.path.abspath(out_path))
+                except Exception: pass
+            self.after(0, _done)
+        except Exception as e:
+            self.after(0, lambda err=e: self.text_out.insert(
+                tk.END, f"Protection report failed: {err}\n"))
+        finally:
+            self.after(0, self._hide_busy_spinner)
+            self.after(0, lambda: self.protect_btn.config(state=tk.NORMAL))
+
+    def _open_protection_report(self):
+        if self.last_protection_path and os.path.exists(self.last_protection_path):
+            os.startfile(os.path.abspath(self.last_protection_path))
+
     def _auto_save_reports(self, text, detailed, stats):
         """Auto-save summary log, detailed log, and HTML report after each run."""
         date_str    = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -4000,8 +4658,8 @@ class PureMonitorApp(tk.Tk):
             for i, d in enumerate(period_dates):
                 contribs = [{"name": a, "value": int(sla_agg[d][a])}
                             for a in arrays_set if sla_agg[d][a]]
-                bars.append({"label": x_labels[i], "arrays": contribs})
-            meta = {"left": left, "right": right,
+                bars.append({"label": x_labels[i], "date": d, "arrays": contribs})
+            meta = {"v": 2, "left": left, "right": right,
                     "xlim": [xmin, xmax], "bars": bars}
             return base64.b64encode(buf.read()).decode('ascii'), meta
 
@@ -4045,8 +4703,8 @@ class PureMonitorApp(tk.Tk):
                     if show_info: cnt += int(alrt_agg[d][a]['i'])
                     if cnt:
                         contribs.append({"name": a, "value": cnt})
-                bars.append({"label": x_labels[i], "arrays": contribs})
-            meta = {"left": left, "right": right,
+                bars.append({"label": x_labels[i], "date": d, "arrays": contribs})
+            meta = {"v": 2, "left": left, "right": right,
                     "xlim": [xmin, xmax], "bars": bars}
             return base64.b64encode(buf.read()).decode('ascii'), meta
 
@@ -4183,14 +4841,17 @@ class PureMonitorApp(tk.Tk):
             pt = label if use_months else "Daily"
 
             # Check chart cache (monthly mode only). Cache hit also requires
-            # the meta payloads added with the hover-tooltip feature; entries
-            # written by older builds lack them and must be regenerated so
-            # the JS overlay has bar geometry to work with.
+            # the meta payloads added with the hover-tooltip feature, and the
+            # v2 schema (per-bar 'date' field used by the daily-report links);
+            # entries written by older builds lack one or both and must be
+            # regenerated so the JS overlay has the data it needs.
             _ph     = _period_hash(period_dates) if use_months else None
             _cached = _chart_cache.get(label, {}) if _ph else {}
             _hit    = bool(_ph and _cached.get('hash') == _ph
-                           and 'sla_meta' in _cached
-                           and 'alrt_ii_meta' in _cached)
+                           and isinstance(_cached.get('sla_meta'), dict)
+                           and _cached['sla_meta'].get('v') == 2
+                           and isinstance(_cached.get('alrt_ii_meta'), dict)
+                           and _cached['alrt_ii_meta'].get('v') == 2)
 
             if _hit:
                 sla_charts.append(_cached['sla'])
@@ -4281,6 +4942,24 @@ class PureMonitorApp(tk.Tk):
                     arr_lag[a] = day_lag
                 lag_cal_data[label] = arr_lag
 
+        # ── Inventory existing per-day Daily HTML reports ─────────────────────
+        # The history HTML lives at reports/Pure_Array_History.html; the daily
+        # reports live at reports/daily/Pure Array Report YYYY-MM-DD.html. The
+        # URL map below uses paths relative to the history HTML so the links
+        # work whether the file is served, opened from disk, or zipped up.
+        from urllib.parse import quote as _urlquote
+        _daily_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "reports", "daily")
+        _daily_re = re.compile(r"^Pure Array Report (\d{4}-\d{2}-\d{2})\.html$")
+        daily_reports = {}
+        try:
+            for _fn in os.listdir(_daily_dir):
+                _m = _daily_re.match(_fn)
+                if _m:
+                    daily_reports[_m.group(1)] = "daily/" + _urlquote(_fn)
+        except (FileNotFoundError, OSError):
+            pass   # no reports/daily/ yet — links simply aren't rendered
+
         # ── Serialise chart arrays for JS ──────────────────────────────────────
         import json
         js_labels      = json.dumps(period_labels)
@@ -4298,6 +4977,7 @@ class PureMonitorApp(tk.Tk):
         js_lag_cal     = json.dumps(lag_cal_data)
         js_lag_charts  = json.dumps(lag_charts)
         js_array_names = json.dumps(sorted(arrays_set))
+        js_daily_rpts  = json.dumps(daily_reports)
         nav_note       = ("Grouped by month &mdash; use arrows to navigate"
                           if use_months else "Showing all days")
 
@@ -4342,6 +5022,29 @@ class PureMonitorApp(tk.Tk):
                       padding-bottom: 3px; margin-bottom: 4px; }}
     .chart-tip ul   {{ margin: 0; padding-left: 16px; }}
     .chart-tip li   {{ font-size: 8.5pt; }}
+    /* ── per-bar Daily-report links + clickable bars ──────────────────── */
+    .chart-wrap img      {{ cursor: pointer; }}
+    .daily-link-row      {{ position: relative; height: 18px;
+                            user-select: none; }}
+    .daily-link          {{ position: absolute; top: 0;
+                            transform: translateX(-50%);
+                            font-size: 7.5pt; font-weight: bold;
+                            color: #2E4D8C; text-decoration: none;
+                            padding: 1px 4px; border-radius: 3px;
+                            background: rgba(46,77,140,.10);
+                            white-space: nowrap; cursor: pointer; }}
+    .daily-link:hover    {{ background: rgba(46,77,140,.22);
+                            text-decoration: underline; }}
+    /* ── transient toast for "No report exists for that day." ─────────── */
+    #chart-toast         {{ position: fixed; bottom: 32px; left: 50%;
+                            transform: translateX(-50%);
+                            background: rgba(28,38,64,.94); color: #fff;
+                            padding: 9px 18px; border-radius: 6px;
+                            font-size: 9.5pt;
+                            box-shadow: 0 4px 14px rgba(0,0,0,.28);
+                            opacity: 0; transition: opacity .2s;
+                            pointer-events: none; z-index: 200; }}
+    #chart-toast.show    {{ opacity: 1; }}
     /* ── calendars ─────────────────────────────────────────────────────── */
     .cal-row       {{ display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 18px; }}
     .cal-block     {{ background: #fff; border-radius: 8px;
@@ -4427,13 +5130,18 @@ class PureMonitorApp(tk.Tk):
   <div class="chart-wrap" id="wrap-sla">
     <img id="img-sla" src="" alt="SLA violations chart">
     <div class="chart-tip" id="tip-sla"></div>
+    <div class="daily-link-row" id="dlr-sla"></div>
   </div>
 
   <h2>Support Alerts</h2>
   <div class="chart-wrap" id="wrap-alrt">
     <img id="img-alrt" src="" alt="Alert count chart">
     <div class="chart-tip" id="tip-alrt"></div>
+    <div class="daily-link-row" id="dlr-alrt"></div>
   </div>
+
+  <!-- Transient notification when a clicked bar has no daily report -->
+  <div id="chart-toast"></div>
 
   <h2>Array Replication Lag</h2>
   <p style="font-size:8.5pt;color:#666;margin:-4px 0 10px 0;">
@@ -4466,6 +5174,11 @@ class PureMonitorApp(tk.Tk):
     var LAG_CAL_DATA = {js_lag_cal};
     var LAG_CHARTS      = {js_lag_charts};
     var ARRAY_NAMES     = {js_array_names};
+    /* Map of YYYY-MM-DD -> relative URL of an on-disk Daily HTML report.
+       Populated at history-page generation time by inventorying
+       reports/daily/ — see _health_history_impl. Empty if no daily
+       reports exist yet. */
+    var DAILY_RPTS      = {js_daily_rpts};
     var idx          = 0;
 
     var MONTH_NAMES = ['January','February','March','April','May','June',
@@ -4710,8 +5423,77 @@ class PureMonitorApp(tk.Tk):
         tip.style.top  = rawY + 'px';
       }}
       function onLeave() {{ tip.style.display = 'none'; }}
+      function onClick(e) {{
+        var meta = getMeta();
+        if (!meta) return;
+        var rect = img.getBoundingClientRect();
+        var xfrac = (e.clientX - rect.left) / rect.width;
+        var i = findBarIndex(meta, xfrac);
+        if (i < 0) return;
+        openDaily(meta.bars[i].date);
+      }}
       img.addEventListener('mousemove', onMove);
       img.addEventListener('mouseleave', onLeave);
+      img.addEventListener('click', onClick);
+    }}
+
+    /* ─── Daily-report links + toast ─────────────────────────────────────
+       For each bar whose underlying date has a matching file in
+       reports/daily/, drop a small "Daily" link below the bar in an
+       absolutely-positioned overlay row. Bar-pixel positions are
+       recomputed on every render and on window resize so the links
+       follow the chart at any rendered width. */
+    function showToast(msg) {{
+      var t = document.getElementById('chart-toast');
+      if (!t) return;
+      t.textContent = msg;
+      t.classList.add('show');
+      if (t._timer) clearTimeout(t._timer);
+      t._timer = setTimeout(function() {{ t.classList.remove('show'); }}, 1800);
+    }}
+
+    function openDaily(date) {{
+      if (!date) return;
+      var url = DAILY_RPTS[date];
+      if (url) window.open(url, '_blank');
+      else     showToast('No report exists for that day.');
+    }}
+
+    function renderDailyLinks(rowId, imgId, getMeta) {{
+      var row = document.getElementById(rowId);
+      var img = document.getElementById(imgId);
+      if (!row || !img) return;
+      var meta = getMeta();
+      if (!meta || !meta.bars || !meta.xlim) {{ row.innerHTML = ''; return; }}
+      var imgRect  = img.getBoundingClientRect();
+      var wrapRect = row.parentElement.getBoundingClientRect();
+      var W = imgRect.width;
+      if (!W) {{ row.innerHTML = ''; return; }}
+      /* Image may be horizontally inset inside chart-wrap by its padding
+         (10px). offX captures that so the links align with the bars. */
+      var offX = imgRect.left - wrapRect.left;
+      var span = (meta.xlim[1] - meta.xlim[0]);
+      if (!span) {{ row.innerHTML = ''; return; }}
+      var html = '';
+      for (var i = 0; i < meta.bars.length; i++) {{
+        var bar = meta.bars[i];
+        if (!bar.date || !DAILY_RPTS[bar.date]) continue;
+        var t = (i - meta.xlim[0]) / span;
+        var xfrac = meta.left + t * (meta.right - meta.left);
+        var px = offX + xfrac * W;
+        html += '<a class="daily-link" style="left:' + px.toFixed(1)
+              + 'px;" href="' + DAILY_RPTS[bar.date]
+              + '" target="_blank" title="Open Daily Report for '
+              + bar.date + '">Daily</a>';
+      }}
+      row.innerHTML = html;
+    }}
+
+    function renderAllDailyLinks() {{
+      renderDailyLinks('dlr-sla',  'img-sla',
+                       function() {{ return SLA_META[idx]; }});
+      renderDailyLinks('dlr-alrt', 'img-alrt',
+                       function() {{ return getAlrtMeta()[idx]; }});
     }}
 
     function render() {{
@@ -4728,6 +5510,10 @@ class PureMonitorApp(tk.Tk):
       var ta = document.getElementById('tip-alrt');
       if (ts) ts.style.display = 'none';
       if (ta) ta.style.display = 'none';
+      /* Clear stale daily links immediately, then refresh once each new
+         chart image has actually loaded (we need its rendered width). */
+      document.getElementById('dlr-sla').innerHTML  = '';
+      document.getElementById('dlr-alrt').innerHTML = '';
     }}
 
     /* Wire hover handlers once on load; they look up SLA_META[idx] /
@@ -4738,8 +5524,21 @@ class PureMonitorApp(tk.Tk):
     attachChartHover('wrap-alrt', 'img-alrt', 'tip-alrt',
                      function() {{ return getAlrtMeta()[idx]; }}, 'alrt');
 
+    /* The daily-link overlay needs the image's rendered width to map
+       data x-coordinates to pixels, so it has to refresh whenever:
+         (a) a new chart image finishes loading (after navigate / filter), or
+         (b) the window is resized (the chart is fluid-width). */
+    document.getElementById('img-sla').addEventListener('load',
+        renderAllDailyLinks);
+    document.getElementById('img-alrt').addEventListener('load',
+        renderAllDailyLinks);
+    window.addEventListener('resize', renderAllDailyLinks);
+
     idx = LABELS.length - 1;
     render();
+    /* If chart images were already cached, the load events above may have
+       fired before our listeners were attached. Force one refresh. */
+    renderAllDailyLinks();
   </script>
 </body>
 </html>"""
@@ -4983,6 +5782,13 @@ COMMAND-LINE OPTIONS
     python pure_monitor.py --alert-debug Launch GUI with synthetic alert data
                                          (no live arrays needed — tests the
                                          daily report alert columns & modal)
+    python pure_monitor.py --fake-arrays Launch GUI with a synthetic
+                                         12-array / 5-location demo dataset
+                                         (real monitor_config.json is never
+                                         read or overwritten in this mode)
+    python pure_monitor.py --fake-arrays --nogui
+                                         Generate the Daily HTML report
+                                         from the synthetic dataset and exit
     python pure_monitor.py --help        Show command-line help
 """
         text.insert(tk.END, help_text)
@@ -5035,6 +5841,16 @@ OPTIONS:
                    live arrays. Each array is assigned a different alert mix
                    and plausible lag values so the history chart is populated.
 
+    --fake-arrays  Launch the GUI loaded with a synthetic 12-array / 5-location
+                   demo dataset (New York, Chicago, Dallas, Seattle, London).
+                   Implies --alert-debug. monitor_config.json is neither read
+                   nor written, and Save Config is disabled, so an existing
+                   real configuration is never touched. Useful for previewing
+                   the Daily HTML report and Array Health History pages with
+                   a fully populated dataset before deploying to real arrays.
+                   Combine with --nogui to generate the Daily report headlessly:
+                     python pure_monitor.py --fake-arrays --nogui
+
     --email        (Use with --nogui) Email the daily HTML report after saving it.
                    SMTP settings must be saved in monitor_config.json via the GUI's
                    Email Configuration section. The SMTP password must be supplied
@@ -5052,6 +5868,8 @@ EXAMPLES:
     python pure_monitor.py --nogui
     python pure_monitor.py --nogui --email
     python pure_monitor.py --alert-debug
+    python pure_monitor.py --fake-arrays
+    python pure_monitor.py --fake-arrays --nogui
     python pure_monitor.py --help
 
 SSH COMMANDS USED
@@ -5091,6 +5909,11 @@ CONFIGURATION:
 """)
     elif '--nogui' in sys.argv:
         run_nogui()
+    elif FAKE_ARRAYS:
+        # GUI mode loaded with the synthetic 12-array / 5-location dataset.
+        # Real monitor_config.json is neither read nor written; saving is
+        # blocked from inside _save_config to protect a real configuration.
+        PureMonitorApp().mainloop()
     elif '--alert-debug' in sys.argv:
         # GUI mode with synthetic alert data — no live arrays required.
         PureMonitorApp().mainloop()
