@@ -3517,6 +3517,40 @@ def build_protection_html(per_array, config):
             'const p=[];if(d)p.push(d+"D");if(h)p.push(h+"H");'
             'if(m)p.push(m+"M");if(n)p.push(n+"S");'
             'return p.join(" ");}\n'
+            # Period Length comes from Purity in milliseconds; divide by
+            # 1000 before handing off to fmtSeconds. Non-numeric strings
+            # (e.g., already-formatted "1d" from older fixtures) pass
+            # through unchanged.
+            'function fmtMsAsSeconds(s){'
+            'if(!/^[0-9]+$/.test(String(s)))return fmtSeconds(s);'
+            'return fmtSeconds(String(Math.floor(parseInt(s,10)/1000)));}\n'
+            # Blackout cells arrive as "<start>-<end>" with each side
+            # being seconds past midnight. Render as "h:mm AM/PM-h:mm AM/PM".
+            'function fmtClock(s){'
+            'if(!/^[0-9]+$/.test(String(s)))return s;'
+            'const t=parseInt(s,10);'
+            'const h24=Math.floor(t/3600)%24,mm=Math.floor((t%3600)/60);'
+            'const ap=h24<12?"AM":"PM";let h=h24%12;if(h===0)h=12;'
+            'return h+":"+(mm<10?"0"+mm:mm)+" "+ap;}\n'
+            'function fmtBlackout(s){'
+            'if(s===""||s==null)return s;'
+            'const m=String(s).match(/^([0-9]+)-([0-9]+)$/);'
+            'if(!m)return s;'
+            'return fmtClock(m[1])+"-"+fmtClock(m[2]);}\n'
+            # Per-column formatters: keys are the Purity-native column
+            # names from the CSV. Anything not listed falls back to
+            # fmtSeconds. Header labels for the popup display only are
+            # remapped via PG_DISPLAY; the underlying profile keys stay
+            # the Purity-native names.
+            'const PG_FMT={'
+            '"Per Period":v=>String(v),'
+            '"Days":v=>String(v),'
+            '"Period Length":v=>fmtMsAsSeconds(v),'
+            '"Blackout":v=>fmtBlackout(v)};\n'
+            'const PG_DISPLAY={"All For":"Retained for",'
+            '"Per Period":"Additional Snaps Retained Per",'
+            '"Days":"For an Additional # of Days",'
+            '"Frequency":"Snapshot/Replication Frequency"};\n'
             'function renderTable(o){'
             'if(!o)return \'<p style="color:#888;">No data.</p>\';'
             'const cols=Object.keys(o);'
@@ -3524,13 +3558,14 @@ def build_protection_html(per_array, config):
             'const n=Math.max(0,...cols.map(c=>(o[c]||[]).length));'
             'if(n===0)return \'<p style="color:#888;">No data.</p>\';'
             'let h=\'<table class="pg-detail"><thead><tr>\';'
-            'cols.forEach(c=>{h+=\'<th>\'+escHtml(c)+\'</th>\';});'
+            'cols.forEach(c=>{h+=\'<th>\'+escHtml(PG_DISPLAY[c]||c)+\'</th>\';});'
             'h+=\'</tr></thead><tbody>\';'
             'for(let i=0;i<n;i++){'
             'h+=\'<tr>\';'
             'cols.forEach(c=>{const v=(o[c]||[])[i];'
-            'const dv=(v===""||v==null)?null:fmtSeconds(v);'
-            'h+=\'<td>\'+(dv!==null?escHtml(dv):\'<span style="color:#888;">&mdash;</span>\')+\'</td>\';});'
+            'const f=PG_FMT[c]||fmtSeconds;'
+            'const dv=(v===""||v==null)?null:f(v);'
+            'h+=\'<td>\'+(dv!==null&&dv!==""?escHtml(dv):\'<span style="color:#888;">&mdash;</span>\')+\'</td>\';});'
             'h+=\'</tr>\';}'
             'return h+\'</tbody></table>\';}\n'
             'function showPg(el){'
