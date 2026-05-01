@@ -2830,8 +2830,35 @@ def _fake_protection_data_for(array):
         pgroups.append({'name': f'pg_{array}_hourly', 'pod': None,
                         'pgname': f'pg_{array}_hourly',
                         'volumes': [f'{array}_vol01']})
+    # Retention-lock map: pod-scoped pgroups are 'ratcheted' so the
+    # stretched-pod source rows demo Safemode=Enabled. Local _hourly
+    # pgroups are also ratcheted on every other array that has them.
+    pgroup_locks = {}
+    for pg in pgroups:
+        if pg['pod'] is not None:
+            pgroup_locks[pg['name']] = 'ratcheted'
+        elif pg['name'].endswith('_hourly') and \
+             array in _peers and _peers.index(array) % 2 == 0:
+            pgroup_locks[pg['name']] = 'ratcheted'
+        else:
+            pgroup_locks[pg['name']] = 'unlocked'
+    # Synthetic host connections: vol01 connected to a single host on
+    # every array; vol02 connected to two hosts on every other array;
+    # pod-resident db_data connected to a cluster host on the source side.
+    connections = []
+    connections.append({'name': f'{array}_vol01', 'host': f'{array}-host01'})
+    if array in _peers and _peers.index(array) % 2 == 0:
+        connections.append({'name': f'{array}_vol02', 'host': f'{array}-host01'})
+        connections.append({'name': f'{array}_vol02', 'host': f'{array}-host02'})
+    if array in pod_pairs:
+        _lp = pod_pairs[array][1]
+        _direction = pod_pairs[array][3]
+        if _direction == '-->':
+            connections.append({'name': f'{_lp}::db_data',
+                                'host': f'{_lp}-cluster'})
     return {'volumes': volumes, 'pod_links': pod_links, 'snapshots': snapshots,
-            'pgroups': pgroups, 'error': None}
+            'pgroups': pgroups, 'pgroup_locks': pgroup_locks,
+            'connections': connections, 'error': None}
 
 
 def _parse_purevol_list_csv(text):
@@ -2903,6 +2930,68 @@ def _parse_purepgroup_list_csv(text):
     return out
 
 
+def _parse_purepgroup_retention_csv(text):
+    """Parse `purepgroup list --retention-lock --csv` rows.
+    Returns {pg_full_name: retention_lock_value_lowercase}. The 'Name'
+    column is preserved verbatim (including any `pod::` prefix).
+    """
+    out = {}
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        rl = (d.get('Retention Lock') or '').strip().lower()
+        out[name] = rl
+    return out
+
+
+def _parse_purevol_connect_csv(text):
+    """Parse `purevol list --connect --csv` rows -> [{'name','host'}, ...].
+    A volume connected to multiple hosts appears on multiple rows. Names
+    containing '::' are pod-qualified (`pod::vol`) and preserved verbatim.
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        host = (d.get('Host') or '').strip()
+        if not name or not host:
+            continue
+        out.append({'name': name, 'host': host})
+    return out
+
+
+def _parse_purepgroup_schedule_csv(text):
+    """Parse `purepgroup list --schedule --csv` rows.
+    Returns {pg_full_name: {col: [vals]}}. Every column other than 'Name'
+    is split on '/' so each parallel index represents one schedule entry.
+    """
+    cols = ('Schedule', 'Enabled', 'Frequency', 'At', 'Blackout')
+    out = {}
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out[name] = {c: [v.strip() for v in (d.get(c) or '').split('/')]
+                     for c in cols}
+    return out
+
+
+def _parse_purepgroup_retention_full_csv(text):
+    """Parse `purepgroup list --retention --csv` rows.
+    Returns {pg_full_name: {col: [vals]}}. Every column other than 'Name'
+    is split on '/' so each parallel index represents one retention entry.
+    """
+    cols = ('Array', 'All For', 'Per Period', 'Period Length', 'Days')
+    out = {}
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out[name] = {c: [v.strip() for v in (d.get(c) or '').split('/')]
+                     for c in cols}
+    return out
+
+
 def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
     """Issue the three FlashArray protection commands and parse their output.
     Returns {'volumes', 'pod_links', 'snapshots', 'error'}. Errors on a
@@ -2912,7 +3001,8 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
     if ALERT_DEBUG:
         return _fake_protection_data_for(array)
     out = {'volumes': [], 'pod_links': [], 'snapshots': [],
-           'pgroups': [], 'error': None}
+           'pgroups': [], 'pgroup_locks': {}, 'pgroup_schedules': {},
+           'pgroup_retentions': {}, 'connections': [], 'error': None}
     _errs = []
     try:
         out['volumes'] = _parse_purevol_list_csv(run_ssh_command(
@@ -2941,6 +3031,30 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
                 log_list=detailed_logs, nogui=nogui))
         except Exception as e:
             _errs.append(f"purepgroup list: {e}")
+        try:
+            out['pgroup_locks'] = _parse_purepgroup_retention_csv(run_ssh_command(
+                array, user, "purepgroup list --retention-lock --csv",
+                log_list=detailed_logs, nogui=nogui))
+        except Exception as e:
+            _errs.append(f"purepgroup list --retention-lock: {e}")
+        try:
+            out['pgroup_schedules'] = _parse_purepgroup_schedule_csv(run_ssh_command(
+                array, user, "purepgroup list --schedule --csv",
+                log_list=detailed_logs, nogui=nogui))
+        except Exception as e:
+            _errs.append(f"purepgroup list --schedule: {e}")
+        try:
+            out['pgroup_retentions'] = _parse_purepgroup_retention_full_csv(run_ssh_command(
+                array, user, "purepgroup list --retention --csv",
+                log_list=detailed_logs, nogui=nogui))
+        except Exception as e:
+            _errs.append(f"purepgroup list --retention: {e}")
+        try:
+            out['connections'] = _parse_purevol_connect_csv(run_ssh_command(
+                array, user, "purevol list --connect --csv",
+                log_list=detailed_logs, nogui=nogui))
+        except Exception as e:
+            _errs.append(f"purevol list --connect: {e}")
     if _errs:
         out['error'] = "; ".join(_errs)
     return out
@@ -3003,7 +3117,9 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
                               or info.get('is_nrp')) else None))
         per_array[_name] = {'platform': platform, 'user': info.get('user'),
                             'error': info.get('error'), 'volumes': [],
-                            'pod_links': [], 'snapshots': [], 'pgroups': []}
+                            'pod_links': [], 'snapshots': [], 'pgroups': [],
+                            'pgroup_locks': {}, 'pgroup_schedules': {},
+                            'pgroup_retentions': {}, 'connections': []}
         if platform == 'FA':
             fa_targets.append((_name, info.get('user')
                                       or config.get('user_fab', 'pureuser')))
@@ -3092,6 +3208,31 @@ def aggregate_fa_volume_rows(per_array):
                     vkey = (arr, None, vent)
                 pg_membership.setdefault(vkey, set()).add(pg_full)
 
+    # ── Set of (array, pgroup_full_name) where Retention Lock is
+    # 'ratcheted'. A volume's Safemode is Enabled when any of its
+    # member pgroups is ratcheted on the array(s) it lives on
+    # (including the stretched-pod peer for pod volumes).
+    pg_ratcheted = set()
+    for arr, data in per_array.items():
+        for pg_name, lock in (data.get('pgroup_locks') or {}).items():
+            if (lock or '').lower() == 'ratcheted':
+                pg_ratcheted.add((arr, pg_name))
+
+    # ── Map (array, pod, volume) -> set of connected host names. The
+    # `purevol list --connect --csv` output emits one row per host so a
+    # multi-host volume contributes multiple entries.
+    vol_to_hosts = {}
+    for arr, data in per_array.items():
+        for c in (data.get('connections') or []):
+            cname, host = c.get('name', ''), c.get('host', '')
+            if not cname or not host:
+                continue
+            if '::' in cname:
+                cp, cv = cname.split('::', 1)
+            else:
+                cp, cv = None, cname
+            vol_to_hosts.setdefault((arr, cp, cv), set()).add(host)
+
     # ── Assemble rows. Track which (arr, pod, vol) keys to skip because
     # they belong to the dest side of a stretched pod. ──────────────────
     drop = set()
@@ -3117,15 +3258,19 @@ def aggregate_fa_volume_rows(per_array):
                    'pod_direction': '', 'remote_pod': '',
                    'local_snaps': 0, 'pod_snaps': 0,
                    'replicated_snaps': 0, 'replication_destinations': [],
-                   'protection_groups': []}
+                   'protection_groups': [], 'safemode': False,
+                   'connected_hosts': []}
 
             if pod is None:
                 row['local_snaps']      = local_snaps.get((arr, None, vol), 0)
                 row['replicated_snaps'] = repl_snaps.get((arr, None, vol), 0)
                 row['replication_destinations'] = sorted(
                     repl_dests.get((arr, None, vol), set()))
-                row['protection_groups'] = sorted(
-                    pg_membership.get((arr, None, vol), set()))
+                pgs = pg_membership.get((arr, None, vol), set())
+                row['protection_groups'] = sorted(pgs)
+                row['safemode'] = any((arr, p) in pg_ratcheted for p in pgs)
+                row['connected_hosts'] = sorted(
+                    vol_to_hosts.get((arr, None, vol), set()))
             else:
                 # Pod volume. Pod snapshots on this side count as both
                 # 'pod' and 'local' snapshots; pod snapshots on the
@@ -3168,6 +3313,20 @@ def aggregate_fa_volume_rows(per_array):
                 row['replicated_snaps'] = peer_pod_snaps
                 row['replication_destinations'] = sorted(dests)
                 row['protection_groups'] = sorted(pgs)
+                # Safemode is enabled if any member pgroup is ratcheted
+                # on either side of the stretched pod.
+                _arrs_to_check = {arr}
+                if stretch_info and stretch_info[0]:
+                    _arrs_to_check.add(stretch_info[0])
+                row['safemode'] = any((a, p) in pg_ratcheted
+                                      for a in _arrs_to_check for p in pgs)
+                # Pod-resident volumes can be host-connected on either
+                # side of the stretch; union both sides' host sets.
+                hosts = set(vol_to_hosts.get((arr, pod, vol), set()))
+                if stretch_info:
+                    hosts |= vol_to_hosts.get(
+                        (stretch_info[0], stretch_info[1], vol), set())
+                row['connected_hosts'] = sorted(hosts)
             rows.append(row)
 
     rows.sort(key=lambda r: (r['array'].lower(), (0 if r['in_pod'] else 1),
@@ -3200,37 +3359,55 @@ def build_protection_html(per_array, config):
     # ── Build Table 1 rows ────────────────────────────────────────────────
     tr_html = ""
     if not rows:
-        tr_html = ('<tr><td colspan="9" style="text-align:center;color:#888;">'
+        tr_html = ('<tr><td colspan="11" style="text-align:center;color:#888;">'
                    'No FlashArray volumes discovered.</td></tr>')
     else:
-        _check = '<span style="color:#1a7f37;font-weight:bold;">&#10003;</span>'
+        # Cells for the seven protection-related columns are shaded based
+        # on whether they carry meaningful content. Numeric snapshot
+        # cells use the "ok" colour when the count is > 0.
+        _OK   = 'background:#d4edda;'  # light green
+        _BAD  = 'background:#f8d7da;'  # light red
+        _DASH = '<span style="color:#888;">&mdash;</span>'
         for r in rows:
-            dests = ', '.join(_html.escape(d) for d in r['replication_destinations']) \
-                    if r['replication_destinations'] else \
-                    '<span style="color:#888;">&mdash;</span>'
-            pgs = ', '.join(_html.escape(p) for p in r.get('protection_groups', [])) \
-                  if r.get('protection_groups') else \
-                  '<span style="color:#888;">&mdash;</span>'
-            pod_cell = (_check if r['in_pod']
-                        else '<span style="color:#888;">&mdash;</span>')
-            remote_pod = (_html.escape(r['remote_pod']) if r['remote_pod']
-                          else '<span style="color:#888;">&mdash;</span>')
+            dests_ok = bool(r['replication_destinations'])
+            dests = (', '.join(_html.escape(d) for d in r['replication_destinations'])
+                     if dests_ok else _DASH)
+            pgs_list = r.get('protection_groups', [])
+            pgs_ok = bool(pgs_list)
+            pgs = (', '.join(_html.escape(p) for p in pgs_list)
+                   if pgs_ok else _DASH)
+            pod_ok = bool(r['in_pod'] and r.get('pod_name'))
+            pod_cell = _html.escape(r['pod_name']) if pod_ok else _DASH
+            remote_ok = bool(r['remote_pod'])
+            remote_pod = _html.escape(r['remote_pod']) if remote_ok else _DASH
             # Pod volumes are displayed with their fully-qualified name
             # (pod::vol) so the pod scope is visible in the Volume Name
             # column even on stretched-pod source-side rows.
             vol_disp = (f'{r["pod_name"]}::{r["volume"]}'
                         if r['in_pod'] and r.get('pod_name') else r['volume'])
+            sm_on = bool(r.get('safemode'))
+            sm_text = 'Enabled' if sm_on else 'Disabled'
+            sm_style = (_OK if sm_on else _BAD) + 'text-align:center;font-weight:bold;'
+            hosts_list = r.get('connected_hosts', [])
+            hosts_ok = bool(hosts_list)
+            hosts = (', '.join(_html.escape(h) for h in hosts_list)
+                     if hosts_ok else _DASH)
+            local_n = int(r['local_snaps'])
+            pod_n   = int(r['pod_snaps'])
+            rep_n   = int(r['replicated_snaps'])
             tr_html += (
                 '<tr>'
                 f'<td>{_html.escape(vol_disp)}</td>'
                 f'<td>{_html.escape(r["array"])}</td>'
-                f'<td>{dests}</td>'
-                f'<td style="text-align:center;">{pod_cell}</td>'
-                f'<td>{remote_pod}</td>'
-                f'<td style="text-align:right;">{r["local_snaps"]}</td>'
-                f'<td style="text-align:right;">{r["pod_snaps"]}</td>'
-                f'<td style="text-align:right;">{r["replicated_snaps"]}</td>'
-                f'<td>{pgs}</td>'
+                f'<td style="{_OK if hosts_ok else _BAD}">{hosts}</td>'
+                f'<td style="{_OK if dests_ok else _BAD}">{dests}</td>'
+                f'<td style="{_OK if pod_ok else _BAD}text-align:center;">{pod_cell}</td>'
+                f'<td style="{_OK if remote_ok else _BAD}text-align:center;">{remote_pod}</td>'
+                f'<td style="{_OK if local_n > 0 else _BAD}text-align:right;">{local_n}</td>'
+                f'<td style="{_OK if pod_n > 0 else _BAD}text-align:right;">{pod_n}</td>'
+                f'<td style="{_OK if rep_n > 0 else _BAD}text-align:right;">{rep_n}</td>'
+                f'<td style="{sm_style}">{sm_text}</td>'
+                f'<td style="{_OK if pgs_ok else _BAD}">{pgs}</td>'
                 '</tr>\n')
 
     err_banner = ''
@@ -3274,12 +3451,14 @@ def build_protection_html(per_array, config):
       <tr>
         <th>Volume Name</th>
         <th>Array Name</th>
+        <th>Connected Hosts</th>
         <th>Replication Destinations</th>
         <th>Pod</th>
         <th>Remote Pod</th>
         <th>Local Snapshots</th>
         <th>Pod Snapshots</th>
         <th>Replicated Snapshots</th>
+        <th>Safemode</th>
         <th>Protection Groups</th>
       </tr>
     </thead>
