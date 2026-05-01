@@ -4053,6 +4053,70 @@ def build_protection_html(per_array, config):
       return false;
     }
   }
+  // ---- Read comments_active.json from the chosen folder ------------
+  // Returns the parsed payload object on success, or null if the file
+  // is absent / unreadable / unparseable / permission missing. Never
+  // prompts (load is silent on page open); the user grants access via
+  // Save All Comments which then triggers the next page-load to pick
+  // it up automatically.
+  async function _readJson(promptOk){
+    var dir = await _ensureDir(promptOk);
+    if(!dir) return null;
+    try {
+      var fh   = await dir.getFileHandle('comments_active.json');
+      var file = await fh.getFile();
+      var text = await file.text();
+      if(!text) return null;
+      return JSON.parse(text);
+    } catch(e){
+      // NotFoundError is normal on a fresh folder; only an explicit
+      // permission failure should drop the cached handle.
+      if(e && (e.name === 'NotAllowedError' ||
+               e.name === 'SecurityError')){
+        _dirHandle = null;
+        try { await _idbPut('dir', null); } catch(_){}
+      }
+      return null;
+    }
+  }
+  // ---- Apply a loaded payload to the table -------------------------
+  // Walks the JSON's comments array and, for each entry whose
+  // (array, volume) matches a row in the page, overlays the textarea
+  // value + last-updated label and refreshes data-orig so the cell
+  // isn't flagged dirty. Cells with no matching JSON entry are left
+  // untouched (they keep whatever the Python-side loader put in at
+  // HTML generation time).
+  function _applyLoaded(payload){
+    if(!payload || !Array.isArray(payload.comments)) return 0;
+    var applied = 0;
+    payload.comments.forEach(function(e){
+      if(!e || typeof e !== 'object') return;
+      var arr = e.array  || '';
+      var vol = e.volume || '';
+      if(!arr || !vol) return;
+      // Attribute-equals selector with CSS.escape on both sides so
+      // names containing quotes or brackets don't break the query.
+      var sel = 'td.comment-cell[data-arr="' + (window.CSS && CSS.escape ? CSS.escape(arr) : arr.replace(/"/g,'\\"')) + '"]'
+              + '[data-vol="' + (window.CSS && CSS.escape ? CSS.escape(vol) : vol.replace(/"/g,'\\"')) + '"]';
+      var cell;
+      try { cell = document.querySelector(sel); }
+      catch(err){ cell = null; }
+      if(!cell) return;
+      var ta  = cell.querySelector('textarea.comment-input');
+      var lbl = cell.querySelector('.comment-updated');
+      var val = (e.comment != null) ? String(e.comment) : '';
+      var upd = (e.last_updated != null) ? String(e.last_updated) : '';
+      if(ta){
+        ta.value = val;
+        try { ta.textContent = val; } catch(_){}
+      }
+      cell.setAttribute('data-orig', val);
+      cell.classList.remove('comment-dirty');
+      if(lbl) lbl.textContent = upd || '\u2014';
+      applied += 1;
+    });
+    return applied;
+  }
   // ---- Debounced autosave on every edit ----------------------------
   var _autosaveTimer = null;
   function _scheduleAutosave(immediate){
@@ -4129,18 +4193,37 @@ def build_protection_html(per_array, config):
     }
     var dir = await _ensureDir(false);
     if(dir){
-      _setStatus('Autosave enabled \u2192 ' + (dir.name || 'saved folder'),
-                 'ok');
+      // Silently overlay any newer comments from the JSON sidecar so
+      // a user who just double-clicks the static .html file sees
+      // their latest edits even though the HTML itself was never
+      // rewritten. The Python loader already pre-populates cells at
+      // generation time; this catches edits made after that point.
+      var loaded = 0;
+      try {
+        var payload = await _readJson(false);
+        loaded = _applyLoaded(payload);
+      } catch(e){}
+      if(loaded > 0){
+        _setStatus('Autosave enabled \u2192 ' + (dir.name || 'saved folder')
+                   + ' \u2014 loaded ' + loaded + ' comment'
+                   + (loaded === 1 ? '' : 's') + ' from JSON',
+                   'ok');
+      } else {
+        _setStatus('Autosave enabled \u2192 ' + (dir.name || 'saved folder'),
+                   'ok');
+      }
     } else {
       var saved = null;
       try { saved = await _idbGet('dir'); } catch(e){}
       if(saved){
         _setStatus('Autosave: click \u201cSave All Comments\u201d once '
-                   + 'to re-grant access to ' + (saved.name || 'saved folder'),
+                   + 'to re-grant access to ' + (saved.name || 'saved folder')
+                   + ' (also loads latest comments)',
                    'warn');
       } else {
         _setStatus('Autosave: click \u201cSave All Comments\u201d to '
-                   + 'pick reports/protection/ (one-time)',
+                   + 'pick reports/protection/ (one-time; also loads '
+                   + 'latest comments)',
                    'warn');
       }
     }
@@ -4186,15 +4269,25 @@ def build_protection_html(per_array, config):
     /* Freeze "Volume Name" (col 1) and "Array Name" (col 2). Sticky
        cells need an opaque background since rows scroll under them;
        the inset right-edge shadow draws the seam between the frozen
-       pane and the scrolling body. */
+       pane and the scrolling body. With table-layout:auto a plain
+       `width` on a cell is only a hint -- the browser may render the
+       column wider or narrower based on content. min-width+max-width
+       lock the rendered width exactly so col 2's `left: 220px`
+       offset matches col 1's actual right edge (otherwise a gap or
+       overlap appears between the two frozen columns). word-break
+       lets long volume names wrap inside the fixed width. */
     .t1-wrap > table.t1 th:nth-child(1),
     .t1-wrap > table.t1 td:nth-child(1) {{
-        position: sticky; left: 0; width: 220px;
+        position: sticky; left: 0;
+        width: 220px; min-width: 220px; max-width: 220px;
+        word-break: break-word;
         background: #fff; z-index: 1;
         box-shadow: inset -1px 0 0 #b8cfe8; }}
     .t1-wrap > table.t1 th:nth-child(2),
     .t1-wrap > table.t1 td:nth-child(2) {{
-        position: sticky; left: 220px; width: 170px;
+        position: sticky; left: 220px;
+        width: 170px; min-width: 170px; max-width: 170px;
+        word-break: break-word;
         background: #fff; z-index: 1;
         box-shadow: inset -1px 0 0 #b8cfe8; }}
     /* Re-apply the even-row tint on the frozen cells so the body
