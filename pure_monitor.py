@@ -3523,12 +3523,12 @@ def build_protection_html(per_array, config):
             '}\n'
             'function fmtSeconds(s){'
             'if(!/^[0-9]+$/.test(String(s)))return s;'
-            'let n=parseInt(s,10);if(n===0)return "0S";'
+            'let n=parseInt(s,10);if(n===0)return "0 Seconds";'
             'const d=Math.floor(n/86400);n-=d*86400;'
             'const h=Math.floor(n/3600);n-=h*3600;'
             'const m=Math.floor(n/60);n-=m*60;'
-            'const p=[];if(d)p.push(d+"D");if(h)p.push(h+"H");'
-            'if(m)p.push(m+"M");if(n)p.push(n+"S");'
+            'const p=[];if(d)p.push(d+" Days");if(h)p.push(h+" Hours");'
+            'if(m)p.push(m+" Minutes");if(n)p.push(n+" Seconds");'
             'return p.join(" ");}\n'
             # Period Length comes from Purity in milliseconds; divide by
             # 1000 before handing off to fmtSeconds. Non-numeric strings
@@ -3584,7 +3584,8 @@ def build_protection_html(per_array, config):
             'function showPg(el){'
             'const arr=el.getAttribute("data-arr"),pg=el.getAttribute("data-pg");'
             'const data=(PG_PROFILES[arr]||{})[pg]||null;'
-            'document.getElementById("pg-title").textContent=pg;'
+            'document.getElementById("pg-title").textContent='
+            '"Protection Group Details - "+pg;'
             'document.getElementById("pg-array").textContent="Source array: "+arr;'
             'document.getElementById("pg-schedule").innerHTML=renderTable(data&&data.schedule);'
             'document.getElementById("pg-retention").innerHTML=renderTable(data&&data.retention);'
@@ -3645,6 +3646,66 @@ def build_protection_html(per_array, config):
     ind.textContent = dir === 1 ? ' \u25b2'
                     : (dir === -1 ? ' \u25bc' : ' \u21d5');
   }
+  // Cell colour detection. Inline styles like background:#d4edda end up
+  // as backgroundColor 'rgb(212, 237, 218)' once parsed by the browser.
+  function colorOf(c){
+    if(!c) return '';
+    var bg = c.style && c.style.backgroundColor;
+    if(bg === 'rgb(212, 237, 218)') return 'g';
+    if(bg === 'rgb(248, 215, 218)') return 'r';
+    return '';
+  }
+  function detectColorCols(tbl){
+    var ncols = tbl.tHead.rows[0].cells.length;
+    var has = new Array(ncols).fill(false);
+    for(var i=0;i<tbl._sf.orig.length;i++){
+      var row = tbl._sf.orig[i];
+      for(var j=0;j<ncols;j++){
+        if(colorOf(row.cells[j])) has[j] = true;
+      }
+    }
+    return has;
+  }
+  // For columns whose body cells use the green/red shading, append a
+  // pair of clickable dots to the header label. Each dot toggles a
+  // "greens first" or "reds first" sort on that column. Dots
+  // stopPropagation so clicking them never triggers the underlying
+  // text-sort cycle on the th.
+  function injectColorWidgets(tbl){
+    var has = detectColorCols(tbl);
+    var ths = tbl.tHead.rows[0].cells;
+    for(let j=0;j<ths.length;j++){
+      if(!has[j]) continue;
+      var lbl = ths[j].querySelector('.th-lbl');
+      if(!lbl) continue;
+      var w = document.createElement('span');
+      w.className = 'color-sort';
+      w.innerHTML = ' <span class="cs-g" title="Sort greens first">'
+                  + '\u25CF</span><span class="cs-r" '
+                  + 'title="Sort reds first">\u25CF</span>';
+      lbl.appendChild(w);
+      w.querySelector('.cs-g').addEventListener('click', function(e){
+        e.stopPropagation();
+        cycleColorSort(tbl, j, 'g');
+      });
+      w.querySelector('.cs-r').addEventListener('click', function(e){
+        e.stopPropagation();
+        cycleColorSort(tbl, j, 'r');
+      });
+    }
+  }
+  function cycleColorSort(tbl, idx, target){
+    var s = tbl._sf;
+    // Selecting a colour sort clears any active text/numeric sort so
+    // the table is only ever ordered by one criterion at a time.
+    s.col = -1; s.dir = 0;
+    if(s.colorCol === idx && s.colorMode === target){
+      s.colorCol = -1; s.colorMode = '';
+    } else {
+      s.colorCol = idx; s.colorMode = target;
+    }
+    applyTable(tbl);
+  }
   function applyTable(tbl){
     var tbody = tbl.tBodies[0];
     var s = tbl._sf;
@@ -3659,7 +3720,17 @@ def build_protection_html(per_array, config):
       }
       return true;
     });
-    if(s.col >= 0 && s.dir !== 0){
+    if(s.colorCol >= 0 && s.colorMode){
+      var cc = s.colorCol, mode = s.colorMode;
+      var rank = function(cell){
+        var col = colorOf(cell);
+        if(mode === 'g') return col === 'g' ? 0 : (col === '' ? 1 : 2);
+        return col === 'r' ? 0 : (col === '' ? 1 : 2);
+      };
+      filtered = filtered.slice().sort(function(a,b){
+        return rank(a.cells[cc]) - rank(b.cells[cc]);
+      });
+    } else if(s.col >= 0 && s.dir !== 0){
       filtered = filtered.slice().sort(function(a,b){
         return cmp(cellVal(a.cells[s.col]),
                    cellVal(b.cells[s.col]), s.dir);
@@ -3668,11 +3739,20 @@ def build_protection_html(per_array, config):
     var ths = tbl.tHead.rows[0].cells;
     for(var i=0;i<ths.length;i++){
       ths[i].classList.remove('sort-asc','sort-desc');
+      var csG = ths[i].querySelector('.cs-g');
+      var csR = ths[i].querySelector('.cs-r');
+      if(csG) csG.classList.remove('active');
+      if(csR) csR.classList.remove('active');
       if(i === s.col && s.dir !== 0){
         ths[i].classList.add(s.dir === 1 ? 'sort-asc' : 'sort-desc');
         setInd(ths[i], s.dir);
       } else {
         setInd(ths[i], 0);
+      }
+      if(i === s.colorCol && s.colorMode){
+        var cs = ths[i].querySelector(
+          s.colorMode === 'g' ? '.cs-g' : '.cs-r');
+        if(cs) cs.classList.add('active');
       }
     }
     var ds = new Set(filtered);
@@ -3691,13 +3771,18 @@ def build_protection_html(per_array, config):
     var ncols = (tbl.tHead && tbl.tHead.rows[0])
               ? tbl.tHead.rows[0].cells.length : 0;
     tbl._sf = {orig:orig, col:-1, dir:0,
+               colorCol:-1, colorMode:'',
                filters:new Array(ncols).fill('')};
+    injectColorWidgets(tbl);
   }
   window.sfHeaderClick = function(e, idx){
     if(e.target.tagName === 'INPUT') return;
+    if(e.target.closest && e.target.closest('.color-sort')) return;
     var tbl = e.currentTarget.closest('table');
     if(!tbl || !tbl._sf) return;
     var s = tbl._sf;
+    // Selecting a text sort clears any active colour sort.
+    s.colorCol = -1; s.colorMode = '';
     if(s.col !== idx){ s.col = idx; s.dir = 1; }
     else if(s.dir === 1) s.dir = -1;
     else if(s.dir === -1){ s.dir = 0; s.col = -1; }
@@ -3783,6 +3868,27 @@ def build_protection_html(per_array, config):
         background: #fff; }}
     table.sf thead th .filter-input:focus {{
         outline: 1px solid #1a5fb4; }}
+    /* Color-sort widget: a pair of clickable green/red dots appended to
+       the header label of any column whose body cells use the green/red
+       shading (Replication Destinations, Pod, Safemode, etc.). The JS
+       injects these only on color-bearing columns. Selecting a color
+       sort clears any text/numeric sort on the same table. */
+    table.sf thead th .color-sort {{
+        margin-left: 4px; user-select: none; font-size: 9pt; }}
+    table.sf thead th .color-sort .cs-g,
+    table.sf thead th .color-sort .cs-r {{
+        cursor: pointer; padding: 0 2px;
+        opacity: 0.55; border-radius: 2px; }}
+    table.sf thead th .color-sort .cs-g {{ color: #28a745; }}
+    table.sf thead th .color-sort .cs-r {{ color: #dc3545; }}
+    table.sf thead th .color-sort .cs-g:hover,
+    table.sf thead th .color-sort .cs-r:hover {{ opacity: 0.9; }}
+    table.sf thead th .color-sort .cs-g.active {{
+        opacity: 1; background: #d4edda;
+        outline: 1px solid #28a745; }}
+    table.sf thead th .color-sort .cs-r.active {{
+        opacity: 1; background: #f8d7da;
+        outline: 1px solid #dc3545; }}
   </style>
 </head>
 <body>
