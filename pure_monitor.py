@@ -3468,7 +3468,6 @@ def build_protection_html(per_array, config):
                 '<tr>'
                 f'<td>{_html.escape(vol_disp)}</td>'
                 f'<td>{_html.escape(r["array"])}</td>'
-                f'<td style="{_OK if hosts_ok else _BAD}">{hosts}</td>'
                 f'<td style="{_OK if dests_ok else _BAD}">{dests}</td>'
                 f'<td style="{_OK if pod_ok else _BAD}text-align:center;">{pod_cell}</td>'
                 f'<td style="{_OK if remote_ok else _BAD}text-align:center;">{remote_pod}</td>'
@@ -3477,6 +3476,7 @@ def build_protection_html(per_array, config):
                 f'<td style="{_OK if rep_n > 0 else _BAD}text-align:right;">{rep_n}</td>'
                 f'<td style="{sm_style}">{sm_text}</td>'
                 f'<td style="{_OK if pgs_ok else _BAD}">{pgs}</td>'
+                f'<td style="{_OK if hosts_ok else _BAD}">{hosts}</td>'
                 '</tr>\n')
 
     err_banner = ''
@@ -3508,6 +3508,15 @@ def build_protection_html(per_array, config):
             'return String(s).replace(/[&<>\"\\\']/g,'
             'ch=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","\\\'":"&#39;"})[ch]);'
             '}\n'
+            'function fmtSeconds(s){'
+            'if(!/^[0-9]+$/.test(String(s)))return s;'
+            'let n=parseInt(s,10);if(n===0)return "0S";'
+            'const d=Math.floor(n/86400);n-=d*86400;'
+            'const h=Math.floor(n/3600);n-=h*3600;'
+            'const m=Math.floor(n/60);n-=m*60;'
+            'const p=[];if(d)p.push(d+"D");if(h)p.push(h+"H");'
+            'if(m)p.push(m+"M");if(n)p.push(n+"S");'
+            'return p.join(" ");}\n'
             'function renderTable(o){'
             'if(!o)return \'<p style="color:#888;">No data.</p>\';'
             'const cols=Object.keys(o);'
@@ -3520,7 +3529,8 @@ def build_protection_html(per_array, config):
             'for(let i=0;i<n;i++){'
             'h+=\'<tr>\';'
             'cols.forEach(c=>{const v=(o[c]||[])[i];'
-            'h+=\'<td>\'+(v?escHtml(v):\'<span style="color:#888;">&mdash;</span>\')+\'</td>\';});'
+            'const dv=(v===""||v==null)?null:fmtSeconds(v);'
+            'h+=\'<td>\'+(dv!==null?escHtml(dv):\'<span style="color:#888;">&mdash;</span>\')+\'</td>\';});'
             'h+=\'</tr>\';}'
             'return h+\'</tbody></table>\';}\n'
             'function showPg(el){'
@@ -3554,6 +3564,15 @@ def build_protection_html(per_array, config):
     th, td {{ border: 1px solid #b8cfe8; padding: 4px 8px; vertical-align: top; }}
     th    {{ background: #dce6f1; font-weight: bold; }}
     tr:nth-child(even) td {{ background: #f7faff; }}
+    /* Pin the table header to the top of the viewport while the body
+       scrolls. `border-collapse: collapse` causes the cell's own borders
+       to scroll away with the content, so we redraw the top + bottom
+       edges with a box-shadow that stays anchored to the sticky cell.
+       z-index keeps the header above body cells but below the modal
+       overlay (which is z-index 1000). */
+    thead th {{ position: sticky; top: 0; z-index: 2;
+                box-shadow: inset 0 1px 0 #b8cfe8,
+                            inset 0 -1px 0 #b8cfe8; }}
     .err-banner {{ background: #fff4f4; border: 1px solid #e0a0a0;
                   padding: 6px 10px; margin: 8px 0; border-radius: 4px;
                   color: #802020; }}
@@ -3591,7 +3610,6 @@ def build_protection_html(per_array, config):
       <tr>
         <th>Volume Name</th>
         <th>Array Name</th>
-        <th>Connected Hosts</th>
         <th>Replication Destinations</th>
         <th>Pod</th>
         <th>Remote Pod</th>
@@ -3600,6 +3618,7 @@ def build_protection_html(per_array, config):
         <th>Replicated Snapshots</th>
         <th>Safemode</th>
         <th>Protection Groups</th>
+        <th>Connected Hosts</th>
       </tr>
     </thead>
     <tbody>
