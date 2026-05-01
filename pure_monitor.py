@@ -3381,6 +3381,49 @@ def aggregate_fa_volume_rows(per_array):
     return rows
 
 
+def _load_recent_comments():
+    """Return saved per-row comments from the most recent comments JSON
+    file under reports/protection/. The file is written by the in-page
+    "Save" button (browser download) and is keyed by source_array +
+    displayed volume name so pod-stretched rows match across runs.
+    Returns {} if no file exists or it cannot be parsed.
+    """
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        script_dir = os.getcwd()
+    out_dir = os.path.join(script_dir, 'reports', 'protection')
+    if not os.path.isdir(out_dir):
+        return {}
+    candidates = []
+    for name in os.listdir(out_dir):
+        if name.startswith('comments_') and name.endswith('.json'):
+            full = os.path.join(out_dir, name)
+            try:
+                candidates.append((os.path.getmtime(full), full))
+            except OSError:
+                continue
+    if not candidates:
+        return {}
+    candidates.sort()
+    path = candidates[-1][1]
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for entry in (data.get('comments') or []):
+        arr = entry.get('array')
+        vol = entry.get('volume')
+        if arr and vol:
+            out[(arr, vol)] = {
+                'comment':      entry.get('comment', '') or '',
+                'last_updated': entry.get('last_updated', '') or '',
+            }
+    return out
+
+
 def build_protection_html(per_array, config):
     """Generate the Volume & Snapshot Protection HTML report.
 
@@ -3396,6 +3439,7 @@ def build_protection_html(per_array, config):
     tz      = _time.tzname[_time.daylight]
     now_str = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p")
     rows    = aggregate_fa_volume_rows(per_array)
+    saved_comments = _load_recent_comments()
 
     # Per-array error banner contents.
     err_lines = []
@@ -3423,7 +3467,7 @@ def build_protection_html(per_array, config):
     # ── Build Table 1 rows ────────────────────────────────────────────────
     tr_html = ""
     if not rows:
-        tr_html = ('<tr><td colspan="11" style="text-align:center;color:#888;">'
+        tr_html = ('<tr><td colspan="12" style="text-align:center;color:#888;">'
                    'No FlashArray volumes discovered.</td></tr>')
     else:
         # Cells for the seven protection-related columns are shaded based
@@ -3477,6 +3521,15 @@ def build_protection_html(per_array, config):
             local_n = int(r['local_snaps'])
             pod_n   = int(r['pod_snaps'])
             rep_n   = int(r['replicated_snaps'])
+            # Comments cell: pre-populated from the most recent
+            # comments_*.json keyed by (source_array, displayed volume).
+            # The textarea's value is what the user types; we mirror it
+            # into the element's textContent on change so a browser
+            # "Save Page As" captures the current text.
+            _src_arr = r.get('source_array', r['array'])
+            _saved   = saved_comments.get((_src_arr, vol_disp), {})
+            _ctxt    = _saved.get('comment', '') or ''
+            _cupd    = _saved.get('last_updated', '') or ''
             tr_html += (
                 '<tr>'
                 f'<td>{_html.escape(vol_disp)}</td>'
@@ -3490,6 +3543,19 @@ def build_protection_html(per_array, config):
                 f'<td style="{sm_style}">{sm_text}</td>'
                 f'<td style="{_OK if pgs_ok else _BAD}">{pgs}</td>'
                 f'<td style="{_OK if hosts_ok else _BAD}">{hosts}</td>'
+                f'<td class="comment-cell" '
+                f'data-arr="{_html.escape(_src_arr, quote=True)}" '
+                f'data-vol="{_html.escape(vol_disp, quote=True)}" '
+                f'data-orig="{_html.escape(_ctxt, quote=True)}">'
+                f'<textarea class="comment-input" rows="2" '
+                f'oninput="commentEdited(this)" '
+                f'onchange="commentEdited(this)">{_html.escape(_ctxt)}</textarea>'
+                f'<div class="comment-meta">'
+                f'<span class="comment-updated">{_html.escape(_cupd)}</span>'
+                f'<button type="button" class="comment-save" '
+                f'onclick="saveComments()">Save</button>'
+                f'</div>'
+                f'</td>'
                 '</tr>\n')
 
     err_banner = ''
@@ -3607,7 +3673,7 @@ def build_protection_html(per_array, config):
         'Volume Name', 'Array Name', 'Replication Destinations',
         'Pod', 'Remote Pod', 'Local Snapshots', 'Pod Snapshots',
         'Replicated Snapshots', 'Safemode', 'Protection Groups',
-        'Connected Hosts']
+        'Connected Hosts', 'Comments']
     thead_t1 = ('<thead><tr>' + ''.join(
         f'<th class="sortable" onclick="sfHeaderClick(event,{i})">'
         f'<div class="th-lbl">{_html.escape(c)}'
@@ -3621,6 +3687,10 @@ def build_protection_html(per_array, config):
 (function(){
   function cellVal(c){
     if(!c) return '';
+    // Comment cells host a <textarea>; sort/filter against the user's
+    // current input rather than the static cell text.
+    var ta = c.querySelector && c.querySelector('textarea');
+    if(ta) return (ta.value || '').trim();
     var t = c.textContent.trim();
     if(t === '\u2014' || t === '-') return '';
     return t;
@@ -3716,7 +3786,7 @@ def build_protection_html(per_array, config):
         if(!f) continue;
         var c = r.cells[i];
         if(!c) return false;
-        if(c.textContent.toLowerCase().indexOf(f) < 0) return false;
+        if(cellVal(c).toLowerCase().indexOf(f) < 0) return false;
       }
       return true;
     });
@@ -3798,6 +3868,67 @@ def build_protection_html(per_array, config):
   document.addEventListener('DOMContentLoaded', function(){
     document.querySelectorAll('table.sf').forEach(initTable);
   });
+  // --- Comments column: per-row textarea + Save button. -------------
+  // Saving downloads a JSON file the next report run will pick up via
+  // _load_recent_comments(). Mirroring textarea.value into textContent
+  // also makes a browser "Save Page As" capture the user's edits in the
+  // saved HTML.
+  function _stamp(d){
+    function p(n){ return (n<10?'0':'')+n; }
+    return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())
+         +' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+  }
+  function _fnstamp(d){
+    function p(n){ return (n<10?'0':'')+n; }
+    return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())
+         +'_'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());
+  }
+  window.commentEdited = function(el){
+    try { el.textContent = el.value; } catch(e) {}
+    var cell = el.closest && el.closest('.comment-cell');
+    if(!cell) return;
+    var orig = cell.getAttribute('data-orig') || '';
+    if((el.value || '') !== orig) cell.classList.add('comment-dirty');
+    else cell.classList.remove('comment-dirty');
+  };
+  window.saveComments = function(){
+    var cells = document.querySelectorAll('td.comment-cell');
+    var now = new Date();
+    var stamp = _stamp(now);
+    var entries = [];
+    cells.forEach(function(cell){
+      var ta = cell.querySelector('textarea.comment-input');
+      if(!ta) return;
+      var arr  = cell.getAttribute('data-arr') || '';
+      var vol  = cell.getAttribute('data-vol') || '';
+      var val  = ta.value || '';
+      var orig = cell.getAttribute('data-orig') || '';
+      var lbl  = cell.querySelector('.comment-updated');
+      var upd  = lbl ? (lbl.textContent || '') : '';
+      if(val !== orig){
+        upd = stamp;
+        cell.setAttribute('data-orig', val);
+        cell.classList.remove('comment-dirty');
+        if(lbl) lbl.textContent = upd;
+        try { ta.textContent = val; } catch(e) {}
+      }
+      if(val !== '' || upd !== ''){
+        entries.push({array:arr, volume:vol,
+                      comment:val, last_updated:upd});
+      }
+    });
+    var payload = {generated: stamp, comments: entries};
+    var blob = new Blob([JSON.stringify(payload, null, 2)],
+                        {type:'application/json'});
+    var url  = URL.createObjectURL(blob);
+    var a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'comments_' + _fnstamp(now) + '.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 0);
+  };
 })();
 </script>"""
 
@@ -3889,6 +4020,33 @@ def build_protection_html(per_array, config):
     table.sf thead th .color-sort .cs-r.active {{
         opacity: 1; background: #f8d7da;
         outline: 1px solid #dc3545; }}
+    /* Comments column: a per-row <textarea> for free-form notes, with a
+       per-row Save button that downloads the full comments_*.json. The
+       Last Updated label below the textarea reflects the timestamp
+       persisted from the most recent comments JSON. */
+    td.comment-cell {{ min-width: 220px; padding: 4px; }}
+    td.comment-cell textarea.comment-input {{
+        width: 100%; box-sizing: border-box; resize: vertical;
+        font: 9pt 'Segoe UI', Arial, sans-serif;
+        border: 1px solid #b8cfe8; border-radius: 2px;
+        padding: 2px 4px; background: #fff; }}
+    td.comment-cell textarea.comment-input:focus {{
+        outline: 1px solid #1a5fb4; }}
+    td.comment-cell.comment-dirty textarea.comment-input {{
+        border-color: #d49a00; background: #fffbe6; }}
+    td.comment-cell .comment-meta {{
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 6px; margin-top: 3px; font-size: 8.5pt; color: #555; }}
+    td.comment-cell .comment-updated {{
+        flex: 1; white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis; }}
+    td.comment-cell .comment-save {{
+        font: 8.5pt 'Segoe UI', Arial, sans-serif;
+        padding: 1px 8px; border: 1px solid #1a5fb4;
+        background: #e6efff; color: #1f3a5c; border-radius: 2px;
+        cursor: pointer; }}
+    td.comment-cell .comment-save:hover {{
+        background: #d4e2f7; }}
   </style>
 </head>
 <body>
