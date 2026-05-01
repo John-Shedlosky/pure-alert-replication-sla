@@ -2791,6 +2791,7 @@ def _fake_protection_data_for(array):
                 {'name': f'{array}_vol02', 'pod': None, 'volume': f'{array}_vol02'}]
     pod_links = []
     snapshots = []
+    pgroups   = []
     if array in pod_pairs:
         rem, lp, rp, direction = pod_pairs[array]
         for vname in ('db_data', 'db_log'):
@@ -2799,6 +2800,10 @@ def _fake_protection_data_for(array):
                 snapshots.append({'source': f'{lp}::{vname}', 'name': f'{lp}::{vname}.snap{_i}'})
         pod_links.append({'local_pod': lp, 'direction': direction,
                           'remote_pod': rp, 'remote_array': rem, 'status': 'replicating'})
+        # Pod-scoped pgroup; identical name on both sides of the stretch.
+        pgroups.append({'name': f'{lp}::pg_{lp}', 'pod': lp,
+                        'pgname': f'pg_{lp}',
+                        'volumes': [f'{lp}::db_data', f'{lp}::db_log']})
     # Two local snapshots of vol01, one replicated snapshot from a peer.
     snapshots.append({'source': f'{array}_vol01', 'name': f'{array}_vol01.snap1'})
     snapshots.append({'source': f'{array}_vol01', 'name': f'{array}_vol01.snap2'})
@@ -2811,8 +2816,22 @@ def _fake_protection_data_for(array):
         _peer = _peers[(_idx + 1) % len(_peers)]
         snapshots.append({'source': f'{_peer}:{_peer}_vol02',
                           'name': f'{_peer}:{_peer}_vol02.snap1'})
+    # Local pgroup covering vol01 (and vol02 on every other array, to vary
+    # multi-pgroup membership in the demo).
+    _local_pg_vols = [f'{array}_vol01']
+    if array in _peers and _peers.index(array) % 2 == 0:
+        _local_pg_vols.append(f'{array}_vol02')
+    pgroups.append({'name': f'pg_{array}_daily', 'pod': None,
+                    'pgname': f'pg_{array}_daily',
+                    'volumes': _local_pg_vols})
+    # A second local pgroup on vol01 only, so a few volumes show two
+    # pgroups in the rendered table.
+    if array in _peers and _peers.index(array) % 3 == 0:
+        pgroups.append({'name': f'pg_{array}_hourly', 'pod': None,
+                        'pgname': f'pg_{array}_hourly',
+                        'volumes': [f'{array}_vol01']})
     return {'volumes': volumes, 'pod_links': pod_links, 'snapshots': snapshots,
-            'error': None}
+            'pgroups': pgroups, 'error': None}
 
 
 def _parse_purevol_list_csv(text):
@@ -2861,6 +2880,29 @@ def _parse_purevol_snap_csv(text):
     return out
 
 
+def _parse_purepgroup_list_csv(text):
+    """Parse `purepgroup list --csv` rows.
+    Returns [{'name','pod','pgname','volumes'}, ...] where 'volumes' is a
+    list of volume entries (split on '/'). If Name contains '::', the
+    first part is the pod name; the full Name string is preserved as
+    'name' (used as the protection group identifier).
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        if '::' in name:
+            pod, pgname = name.split('::', 1)
+        else:
+            pod, pgname = None, name
+        vols_raw = (d.get('Volumes') or '').strip()
+        vols = [v.strip() for v in vols_raw.split('/') if v.strip()]
+        out.append({'name': name, 'pod': pod, 'pgname': pgname,
+                    'volumes': vols})
+    return out
+
+
 def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
     """Issue the three FlashArray protection commands and parse their output.
     Returns {'volumes', 'pod_links', 'snapshots', 'error'}. Errors on a
@@ -2869,7 +2911,8 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
     """
     if ALERT_DEBUG:
         return _fake_protection_data_for(array)
-    out = {'volumes': [], 'pod_links': [], 'snapshots': [], 'error': None}
+    out = {'volumes': [], 'pod_links': [], 'snapshots': [],
+           'pgroups': [], 'error': None}
     _errs = []
     try:
         out['volumes'] = _parse_purevol_list_csv(run_ssh_command(
@@ -2889,6 +2932,15 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
             log_list=detailed_logs, nogui=nogui))
     except Exception as e:
         _errs.append(f"purevol list --snap: {e}")
+    # Only fetch pgroups if we managed to discover any volumes; pgroups are
+    # purely a per-volume annotation and the call is otherwise pointless.
+    if out['volumes']:
+        try:
+            out['pgroups'] = _parse_purepgroup_list_csv(run_ssh_command(
+                array, user, "purepgroup list --csv",
+                log_list=detailed_logs, nogui=nogui))
+        except Exception as e:
+            _errs.append(f"purepgroup list: {e}")
     if _errs:
         out['error'] = "; ".join(_errs)
     return out
@@ -2951,7 +3003,7 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
                               or info.get('is_nrp')) else None))
         per_array[_name] = {'platform': platform, 'user': info.get('user'),
                             'error': info.get('error'), 'volumes': [],
-                            'pod_links': [], 'snapshots': []}
+                            'pod_links': [], 'snapshots': [], 'pgroups': []}
         if platform == 'FA':
             fa_targets.append((_name, info.get('user')
                                       or config.get('user_fab', 'pureuser')))
@@ -3023,6 +3075,23 @@ def aggregate_fa_volume_rows(per_array):
                    'dest' if direction == '<--' else '')
             stretch[(arr, local_pod)] = (remote_array, remote_pod, role)
 
+    # ── Build (array, pod_or_None, volume) -> set(pgroup_name) map from
+    # purepgroup list output. Each pgroup's Volumes column lists volume
+    # entries that may themselves contain '::' (for pod-scoped pgroups).
+    pg_membership = {}
+    for arr, data in per_array.items():
+        for pg in data.get('pgroups', []):
+            pg_full = pg.get('name') or ''
+            if not pg_full:
+                continue
+            for vent in pg.get('volumes', []):
+                if '::' in vent:
+                    vp, vv = vent.split('::', 1)
+                    vkey = (arr, vp, vv)
+                else:
+                    vkey = (arr, None, vent)
+                pg_membership.setdefault(vkey, set()).add(pg_full)
+
     # ── Assemble rows. Track which (arr, pod, vol) keys to skip because
     # they belong to the dest side of a stretched pod. ──────────────────
     drop = set()
@@ -3043,25 +3112,39 @@ def aggregate_fa_volume_rows(per_array):
             if key3 in drop:
                 continue
 
-            row = {'array': arr, 'volume': vol, 'in_pod': bool(pod),
+            row = {'array': arr, 'volume': vol, 'pod_name': pod or '',
+                   'in_pod': bool(pod),
                    'pod_direction': '', 'remote_pod': '',
                    'local_snaps': 0, 'pod_snaps': 0,
-                   'replicated_snaps': 0, 'replication_destinations': []}
+                   'replicated_snaps': 0, 'replication_destinations': [],
+                   'protection_groups': []}
 
             if pod is None:
                 row['local_snaps']      = local_snaps.get((arr, None, vol), 0)
                 row['replicated_snaps'] = repl_snaps.get((arr, None, vol), 0)
                 row['replication_destinations'] = sorted(
                     repl_dests.get((arr, None, vol), set()))
+                row['protection_groups'] = sorted(
+                    pg_membership.get((arr, None, vol), set()))
             else:
-                # Pod volume. Combine pod_snaps from this side + the
-                # stretched peer (if any) so the source-side row carries
-                # the unified count.
-                count = pod_snaps.get((arr, pod, vol), 0)
-                stretch_info = stretch.get((arr, pod))
+                # Pod volume. Pod snapshots on this side count as both
+                # 'pod' and 'local' snapshots; pod snapshots on the
+                # stretched peer (if any) count as 'pod' and 'replicated'
+                # snapshots, and the peer array is recorded as a
+                # replication destination.
+                local_pod_snaps = pod_snaps.get((arr, pod, vol), 0)
+                peer_pod_snaps  = 0
+                dests           = set()
+                pgs             = set(pg_membership.get((arr, pod, vol), set()))
+                stretch_info    = stretch.get((arr, pod))
                 if stretch_info:
                     peer_arr, peer_pod, role = stretch_info
-                    count += pod_snaps.get((peer_arr, peer_pod, vol), 0)
+                    peer_pod_snaps = pod_snaps.get((peer_arr, peer_pod, vol), 0)
+                    if peer_arr:
+                        dests.add(peer_arr)
+                    # Pod-scoped pgroups replicate with the pod, so the
+                    # same pgroup may appear on both sides. Union them.
+                    pgs |= pg_membership.get((peer_arr, peer_pod, vol), set())
                     # Show "source --> dest" in the Array column. If our
                     # role is 'dest' this row should already be dropped
                     # above; defensive in case direction was odd.
@@ -3080,7 +3163,11 @@ def aggregate_fa_volume_rows(per_array):
                 if src_key in seen_pod_volume_pairs:
                     continue
                 seen_pod_volume_pairs.add(src_key)
-                row['pod_snaps'] = count
+                row['pod_snaps']        = local_pod_snaps + peer_pod_snaps
+                row['local_snaps']      = local_pod_snaps
+                row['replicated_snaps'] = peer_pod_snaps
+                row['replication_destinations'] = sorted(dests)
+                row['protection_groups'] = sorted(pgs)
             rows.append(row)
 
     rows.sort(key=lambda r: (r['array'].lower(), (0 if r['in_pod'] else 1),
@@ -3121,20 +3208,29 @@ def build_protection_html(per_array, config):
             dests = ', '.join(_html.escape(d) for d in r['replication_destinations']) \
                     if r['replication_destinations'] else \
                     '<span style="color:#888;">&mdash;</span>'
+            pgs = ', '.join(_html.escape(p) for p in r.get('protection_groups', [])) \
+                  if r.get('protection_groups') else \
+                  '<span style="color:#888;">&mdash;</span>'
             pod_cell = (_check if r['in_pod']
                         else '<span style="color:#888;">&mdash;</span>')
             remote_pod = (_html.escape(r['remote_pod']) if r['remote_pod']
                           else '<span style="color:#888;">&mdash;</span>')
+            # Pod volumes are displayed with their fully-qualified name
+            # (pod::vol) so the pod scope is visible in the Volume Name
+            # column even on stretched-pod source-side rows.
+            vol_disp = (f'{r["pod_name"]}::{r["volume"]}'
+                        if r['in_pod'] and r.get('pod_name') else r['volume'])
             tr_html += (
                 '<tr>'
+                f'<td>{_html.escape(vol_disp)}</td>'
                 f'<td>{_html.escape(r["array"])}</td>'
-                f'<td>{_html.escape(r["volume"])}</td>'
+                f'<td>{dests}</td>'
                 f'<td style="text-align:center;">{pod_cell}</td>'
                 f'<td>{remote_pod}</td>'
                 f'<td style="text-align:right;">{r["local_snaps"]}</td>'
                 f'<td style="text-align:right;">{r["pod_snaps"]}</td>'
                 f'<td style="text-align:right;">{r["replicated_snaps"]}</td>'
-                f'<td>{dests}</td>'
+                f'<td>{pgs}</td>'
                 '</tr>\n')
 
     err_banner = ''
@@ -3176,14 +3272,15 @@ def build_protection_html(per_array, config):
   <table>
     <thead>
       <tr>
-        <th>Array</th>
-        <th>Volume</th>
+        <th>Volume Name</th>
+        <th>Array Name</th>
+        <th>Replication Destinations</th>
         <th>Pod</th>
         <th>Remote Pod</th>
         <th>Local Snapshots</th>
         <th>Pod Snapshots</th>
         <th>Replicated Snapshots</th>
-        <th>Replication Destinations</th>
+        <th>Protection Groups</th>
       </tr>
     </thead>
     <tbody>
