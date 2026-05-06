@@ -1,0 +1,179 @@
+Output from Report run on Wednesday, April 29, 2026 at 04:28:32 PM Eastern Daylight Time
+Defined Replication SLA for SLA FB: 1h 30m 0s
+Defined Replication SLA for SLA FA-File: 1h 0m 0s
+Defined Replication SLA for SLA FA-Block: 1h 0m 0s
+Alert Codes Ignored: None
+Ignore Source Side Replica Reporting setting: Checked
+
+=== Command Log: pureuser@nyc-pure-fa-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+
+=== Command Log: pureuser@nyc-pure-fb-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+CT0.FAN0,critical,off,-,-,-,-,-,Fan failure
+
+=== Command Log: pureuser@nyc-pure-fa-02 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+
+=== Command Log: pureuser@chi-pure-fa-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+CT1.TMP0,degraded,off,-,-,-,72C,-,Temp above threshold
+
+=== Command Log: pureuser@chi-pure-fa-02 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+
+=== Command Log: pureuser@dal-pure-fa-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+CT0.FAN0,critical,off,-,-,-,-,-,Fan failure
+
+=== Command Log: pureuser@chi-pure-fb-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+
+=== Command Log: pureuser@dal-pure-fb-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+
+=== Command Log: pureuser@sea-pure-fa-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+CT1.TMP0,degraded,off,-,-,-,72C,-,Temp above threshold
+
+=== Command Log: pureuser@sea-pure-fa-02 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+
+=== Command Log: pureuser@lon-pure-fa-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+CT0.FAN0,critical,off,-,-,-,-,-,Fan failure
+
+=== Command Log: pureuser@lon-pure-fb-01 ===
+> purehw list --csv
+[OUTPUT-DEBUG]
+Name,Status,Identify,Slot,Index,Speed,Temperature,Voltage,Details
+CH0.BAY0,ok,off,0,0,-,-,-,
+CH0.BAY1,ok,off,0,1,-,-,-,
+CT0,ok,off,-,-,-,-,-,
+
+=== Command Log: pureuser@nyc-pure-fa-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+nyc-pure-fa-02,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@nyc-pure-fb-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+chi-pure-fa-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@nyc-pure-fa-02 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+nyc-pure-fb-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@chi-pure-fa-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+chi-pure-fa-02,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@chi-pure-fa-02 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+chi-pure-fb-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@dal-pure-fa-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+dal-pure-fb-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@chi-pure-fb-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+dal-pure-fa-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@dal-pure-fb-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+sea-pure-fa-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@lon-pure-fa-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+lon-pure-fb-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@lon-pure-fb-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+nyc-pure-fa-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@sea-pure-fa-01 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+sea-pure-fa-02,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0
+
+=== Command Log: pureuser@sea-pure-fa-02 ===
+> purearray connection list --csv
+[OUTPUT-DEBUG]
+Name,Type,Throttled,Status,Management Address,Replication Address,Version
+lon-pure-fa-01,replication,false,connected,10.10.10.10,10.20.20.20,6.5.0

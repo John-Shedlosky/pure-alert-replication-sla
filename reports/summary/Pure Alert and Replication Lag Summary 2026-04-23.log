@@ -1,0 +1,54 @@
+Output from Report run on Thursday, April 23, 2026 at 09:22:24 PM Eastern Daylight Time
+Defined Replication SLA for SLA FB: 0h 45m 0s
+Defined Replication SLA for SLA FA-File: 0h 30m 0s
+Defined Replication SLA for SLA FA-Block: 0h 30m 0s
+Alert Codes Ignored: 9999
+Ignore Source Side Replica Reporting setting: Checked
+
+FB Array - fb
+
+FA-File Array - fa1
+
+FA-Block Array - fa2
+
+Replication Pairs:
+  [FA-Block]  flasharray1  →  flasharray2    (Prod to DR - FlashArray Block)
+  [FA-File]  flasharray1  →  flasharray2    (Prod to DR - FlashArray Files)
+
+=== HARDWARE HEALTH SECTION ===
+fb - Hardware Health: Healthy
+fa1 - Hardware Health: Healthy
+fa2 - Hardware Health: Unhealthy (1 issue(s): CT0.FAN0)
+
+=== ALERTS SECTION ===
+[ALERT-DEBUG] fb - 2 Critical, 2 Warning, 3 Info (synthetic data)
+[ALERT-DEBUG] fb - CRITICAL | S-CON-1001 | Replication link disconnected — no progress for 2 hours
+[ALERT-DEBUG] fb - CRITICAL | S-CON-1002 | Drive failure detected; array is degraded (CH0.BAY3)
+[ALERT-DEBUG] fb - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+[ALERT-DEBUG] fb - WARNING  | S-WRN-2002 | Replication lag exceeds configured warning threshold
+[ALERT-DEBUG] fb - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] fb - INFO     | S-INF-3002 | SSL certificate will expire within 30 days
+[ALERT-DEBUG] fb - INFO     | S-INF-3003 | Replication resync completed successfully
+
+[ALERT-DEBUG] fa1 - 0 Critical, 2 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] fa1 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+[ALERT-DEBUG] fa1 - WARNING  | S-WRN-2003 | Controller temperature elevated — check airflow
+[ALERT-DEBUG] fa1 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] fa1 - INFO     | S-INF-3004 | Volume snapshot count approaching retention limit
+
+[ALERT-DEBUG] fa2 - 1 Critical, 0 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] fa2 - CRITICAL | S-CON-1003 | Network interface link is down (eth0)
+[ALERT-DEBUG] fa2 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] fa2 - INFO     | S-INF-3005 | NFS export access list updated by administrator
+
+=== REPLICATION SECTION ===
+[ALERT-DEBUG] fb - FB Replication SLA exceeded (simulated max lag 1h 15m 0s vs SLA 0h 45m 0s)
+
+[ALERT-DEBUG] fa1 - FA File Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] fa2 - FA Block Replication SLA exceeded (simulated max lag 1h 30m 0s vs SLA 0h 30m 0s)
+
+
+=== REPLICATION RELATIONSHIPS SECTION ===
+fb (FB) <-> fb_dr (FB)
+fa1 (FA) <-> fa2 (FA)

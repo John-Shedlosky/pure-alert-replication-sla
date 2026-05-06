@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Everpure Array Report</title>
+  <style>
+    body  { font-family: Calibri, Arial, sans-serif; margin: 10px; font-size: 11pt; }
+    h1    { font-size: 16pt; margin-bottom: 6px; }
+    p     { margin: 2px 0; }
+    .arrays-heading { font-weight: bold; margin-top: 10px; }
+    ul    { margin: 4px 0 10px 24px; }
+    table { border-collapse: collapse; width: auto; margin-top: 12px; table-layout: auto; }
+    th, td { border: 1px solid #999; padding: 4px 6px; vertical-align: middle; word-wrap: break-word; }
+    th    { background: #dce6f1; font-weight: bold; font-size: 10pt; }
+    col.c0  { width: 96px; }  col.c1  { width: 144px; } col.c1a { width: 110px; }
+    col.c1b { width: 180px; }
+    col.c2  { width: 67px; }
+    col.c3  { width: 52px; }  col.c4  { width: 52px; }  col.c5  { width: 52px; }
+    col.c6  { width: 80px; }  col.c8  { width: 80px; }  col.c9  { width: 80px; }
+    /* SLA summary bar */
+    .sla-summary { margin: 8px 0 4px; padding: 6px 12px; background: #f0f4fa;
+      border: 1px solid #b8cfe8; border-radius: 4px; font-size: 10pt; }
+    /* Severity colour classes (shared by modal rows and panel rows) */
+    .sev-critical { background:#ffd6d6; color:#c00000; font-weight:bold; }
+    .sev-warning  { background:#fff4d6; color:#c07000; font-weight:bold; }
+    .sev-info     { background:#d6eaff; color:#004490; font-weight:bold; }
+    /* Toggle buttons */
+    .filter-bar { margin:14px 0 8px; display:flex; align-items:center; gap:8px; }
+    .filter-bar span { font-weight:bold; margin-right:4px; }
+    .sev-btn { padding:5px 16px; border-radius:4px; border:2px solid; cursor:pointer;
+      font-size:10pt; font-weight:bold; opacity:0.4; transition:opacity 0.15s; background:#fff; }
+    .sev-btn.active { opacity:1; }
+    .info-btn     { border-color:#004490; color:#004490; }
+    .warning-btn  { border-color:#c07000; color:#c07000; }
+    .critical-btn { border-color:#c00000; color:#c00000; }
+    .repl-all-btn { border-color:#2e6da4; color:#2e6da4; }
+    .hw-all-btn   { border-color:#8a2a2a; color:#8a2a2a; }
+    .rel-pairs-btn { border-color:#2a7a2a; color:#2a7a2a; }
+    .rel-pairs-bar { margin-bottom:4px; }
+    /* Replication-relationships pair panel */
+    .rel-panel-section { margin:12px 0 8px; }
+    .rel-panel-section h3 { margin:0 0 6px; font-size:12pt; font-weight:bold;
+      padding:5px 10px; border-radius:3px; background:#dff0d8; color:#2a7a2a; }
+    .rel-panel-section table { border-collapse:collapse; width:auto; margin-top:4px;
+      table-layout:auto; }
+    .rel-panel-section td { border:1px solid #bbb; padding:6px 10px; vertical-align:middle; }
+    .rel-pair-row { cursor:pointer; transition:background 0.15s; }
+    .rel-pair-row:hover { background:#eef5ff; }
+    .rel-array-cell { text-align:center; min-width:160px; }
+    .rel-array-cell img { display:block; width:64px; height:auto; margin:0 auto 4px; }
+    .rel-array-loc  { font-size:9pt; font-weight:bold; color:#2a5a7a;
+      margin-bottom:3px; text-transform:uppercase; letter-spacing:0.3px; }
+    .rel-array-loc.empty { color:#999; font-weight:normal;
+      font-style:italic; text-transform:none; letter-spacing:0; }
+    .rel-array-name { font-weight:bold; font-size:10pt; }
+    .rel-array-stat { font-size:9pt; color:#555; }
+    .rel-arrow { font-size:22pt; color:#444; text-align:center; min-width:50px; }
+    .rel-group-hdr td { background:#eaf2f8; font-weight:bold; color:#24527a;
+      font-size:10pt; padding:4px 10px; letter-spacing:0.3px; }
+    /* Alert panel (bottom of page) */
+    .alert-panel-section { margin-top:20px; }
+    .alert-panel-section h3 { margin:0 0 6px; font-size:12pt; font-weight:bold;
+      padding:5px 10px; border-radius:3px; }
+    .panel-critical h3 { background:#ffd6d6; color:#c00000; }
+    .panel-warning  h3 { background:#fff4d6; color:#c07000; }
+    .panel-info     h3 { background:#d6eaff; color:#004490; }
+    .panel-hw       h3 { background:#ffd6d6; color:#8a2a2a; }
+    .alert-panel-section table { width:100%; }
+    .hw-panel-section { margin-top:20px; }
+    .hw-panel-section h3 { margin:0 0 6px; font-size:12pt; font-weight:bold;
+      padding:5px 10px; border-radius:3px; background:#ffd6d6; color:#8a2a2a; }
+    .hw-panel-section h4 { margin:8px 0 4px; font-size:11pt; }
+    .hw-panel-section table { width:100%; margin-bottom:10px; }
+    .hw-panel-section td.sev-critical,
+    .hw-panel-section td.sev-warning { text-align:center; }
+    /* HW modal (reuses overlay) */
+    #hw-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.5); z-index:1000; }
+    #hw-modal { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      background:#fff; border-radius:6px; padding:18px 22px; max-width:95vw; max-height:85vh;
+      overflow:auto; box-shadow:0 4px 24px rgba(0,0,0,0.4); min-width:500px; }
+    #hw-modal h2 { margin:0 0 12px; font-size:13pt; color:#8a2a2a; }
+    #hw-modal table { width:100%; margin-top:0; }
+    #hw-modal th { background:#dce6f1; }
+    #close-hw-modal { float:right; cursor:pointer; font-size:16pt; line-height:1;
+      border:none; background:none; color:#555; margin-top:-4px; }
+    /* Alert modal */
+    #alert-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.5); z-index:1000; }
+    #alert-modal { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      background:#fff; border-radius:6px; padding:18px 22px; max-width:90vw; max-height:85vh;
+      overflow:auto; box-shadow:0 4px 24px rgba(0,0,0,0.4); min-width:420px; }
+    #alert-modal h2 { margin:0 0 12px; font-size:13pt; }
+    #alert-modal table { width:100%; margin-top:0; }
+    #alert-modal th { background:#dce6f1; }
+    #close-modal { float:right; cursor:pointer; font-size:16pt; line-height:1;
+      border:none; background:none; color:#555; margin-top:-4px; }
+    /* Replication detail modal */
+    #repl-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.5); z-index:1000; }
+    #repl-modal { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      background:#fff; border-radius:6px; padding:18px 22px; max-width:92vw; max-height:85vh;
+      overflow:auto; box-shadow:0 4px 24px rgba(0,0,0,0.4); min-width:520px; }
+    #repl-modal h2 { margin:0 0 8px; font-size:13pt; }
+    #repl-modal p.repl-meta { margin:0 0 10px; font-size:10pt; color:#444; }
+    #repl-modal table { width:100%; margin-top:0; }
+    #repl-modal th { background:#dce6f1; }
+    #close-repl-modal { float:right; cursor:pointer; font-size:16pt; line-height:1;
+      border:none; background:none; color:#555; margin-top:-4px; }
+    .repl-ok       { background:#e8f5e9; }
+    .repl-exceeded { background:#ffd6d6; color:#c00000; font-weight:bold; }
+    /* Replication-relationships modal */
+    #rel-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.5); z-index:1000; }
+    #rel-modal { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      background:#fff; border-radius:6px; padding:18px 22px; max-width:92vw; max-height:85vh;
+      overflow:auto; box-shadow:0 4px 24px rgba(0,0,0,0.4); min-width:520px; }
+    #rel-modal h2 { margin:0 0 12px; font-size:13pt; color:#2a7a2a; }
+    #rel-modal h3 { margin:12px 0 6px; font-size:11pt; background:#dff0d8;
+      color:#2a7a2a; padding:4px 8px; border-radius:3px; }
+    #rel-modal table { width:100%; margin-top:0; }
+    #rel-modal th { background:#dce6f1; }
+    #close-rel-modal { float:right; cursor:pointer; font-size:16pt; line-height:1;
+      border:none; background:none; color:#555; margin-top:-4px; }
+  </style>
+</head>
+<body>
+  <h1>Everpure &#8211; Pure Storage Array Report</h1>
+  <p>Output from Report run on Wednesday, May 06, 2026 at 01:13:48 PM Eastern Daylight Time</p>
+  <p>Defined Replication SLA for SLA FB: 1h 30m 0s</p>
+  <p>Defined Replication SLA for SLA FA-File: 1h 0m 0s</p>
+  <p>Defined Replication SLA for SLA FA-Block: 1h 0m 0s</p>
+  <p>Alert Codes Ignored: 9999, 9998-10000</p>
+  <p>Ignore Source Side Replica Reporting: Checked</p>
+  <p class="arrays-heading">Arrays Checked:</p>
+  <ul>
+  </ul>
+  <div class="filter-bar rel-pairs-bar">
+    <button id="btn-rel-pairs" class="sev-btn rel-pairs-btn" onclick="toggleRelPairs()">Show Replication Relationships</button>
+  </div>
+  <!-- Replication-relationships pair panel (populated by JS when toggled) -->
+  <div id="rel-pairs-panel"></div>
+  <div class="filter-bar">
+    <span>Alert View:</span>
+    <button id="btn-critical" class="sev-btn critical-btn" onclick="toggleSev('critical')">Show Critical</button>
+    <button id="btn-warning"  class="sev-btn warning-btn"  onclick="toggleSev('warning')">Show Warning</button>
+    <button id="btn-info"     class="sev-btn info-btn"     onclick="toggleSev('info')">Show Info</button>
+    <span style="border-left:1px solid #ccc;height:20px;margin:0 6px;"></span>
+    <button id="btn-repl-FB"      class="sev-btn repl-all-btn" onclick="toggleReplGroup('FB')">FlashBlade Replication Detail</button>
+    <button id="btn-repl-FAFile"  class="sev-btn repl-all-btn" onclick="toggleReplGroup('FA-File')">FlashArray Pod Replication Detail - File</button>
+    <button id="btn-repl-FABlock" class="sev-btn repl-all-btn" onclick="toggleReplGroup('FA-Block')">FlashArray Snapshot Replication Detail</button>
+    <span style="border-left:1px solid #ccc;height:20px;margin:0 6px;"></span>
+    <button id="btn-hw-all" class="sev-btn hw-all-btn" onclick="toggleHwAll()">All Hardware Issues</button>
+  </div>
+<div class="sla-summary">Overall Replication SLA Success: <strong>0/0</strong>&nbsp;&nbsp;|&nbsp;&nbsp;Success Rate: <strong style="color:#333;">—</strong></div>  <table>
+    <colgroup>
+      <col class="c0"><col class="c1"><col class="c1a"><col class="c1b"><col class="c2">
+      <col class="c3"><col class="c4"><col class="c5"><col class="c6">
+      <col class="c7"><col class="c8"><col class="c9">
+    </colgroup>
+    <thead>
+      <tr>
+        <th>Array Status</th><th>Array Name</th><th>Location</th><th>Notes</th><th>Type</th>
+        <th style="color:#c00000;">Critical</th>
+        <th style="color:#c07000;">Warning</th>
+        <th style="color:#004490;">Info</th>
+        <th style="color:#8a2a2a;">Hardware Health</th>
+        <th>Replication Lag vs SLA</th>
+        <th>Repl SLA Success</th>
+        <th>Repl SLA Success Rate</th>
+      </tr>
+    </thead>
+    <tbody>
+    </tbody>
+  </table>
+
+  <!-- Hardware-issues panel (populated by JS when "All Hardware Issues" is active) -->
+  <div id="hw-panel"></div>
+
+  <!-- Severity alert panel (populated by JS when toggle buttons are active) -->
+  <div id="alert-panel"></div>
+
+  <!-- Per-type replication detail panels -->
+  <div id="repl-panel-FB"></div>
+  <div id="repl-panel-FA-File"></div>
+  <div id="repl-panel-FA-Block"></div>
+
+  <!-- Replication detail modal -->
+  <div id="repl-overlay" onclick="closeRepl()">
+    <div id="repl-modal" onclick="event.stopPropagation()">
+      <button id="close-repl-modal" onclick="closeRepl()" title="Close">&times;</button>
+      <h2 id="repl-modal-title">Replication Detail</h2>
+      <div id="repl-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Alert detail modal -->
+  <div id="alert-overlay" onclick="closeAlerts()">
+    <div id="alert-modal" onclick="event.stopPropagation()">
+      <button id="close-modal" onclick="closeAlerts()" title="Close">&times;</button>
+      <h2 id="modal-title">Alerts</h2>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Hardware-health detail modal -->
+  <div id="hw-overlay" onclick="closeHw()">
+    <div id="hw-modal" onclick="event.stopPropagation()">
+      <button id="close-hw-modal" onclick="closeHw()" title="Close">&times;</button>
+      <h2 id="hw-modal-title">Hardware Issues</h2>
+      <div id="hw-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Replication-relationships detail modal -->
+  <div id="rel-overlay" onclick="closeRelModal()">
+    <div id="rel-modal" onclick="event.stopPropagation()">
+      <button id="close-rel-modal" onclick="closeRelModal()" title="Close">&times;</button>
+      <h2 id="rel-modal-title">Replication Relationship</h2>
+      <div id="rel-modal-body"></div>
+    </div>
+  </div>
+
+  <script>
+    var ALERT_DATA = {};
+    var REPL_DATA  = {};
+    var HW_DATA    = {};
+    var REL_DATA   = {};
+    var REL_PAIRS  = [];
+    var IMG_B64    = {};
+
+    /* ── Per-type replication detail panels ────────────────────────────── */
+    var _replGroupActive = { 'FB': false, 'FA-File': false, 'FA-Block': false };
+    var _replGroupBtnIds   = { 'FB': 'btn-repl-FB', 'FA-File': 'btn-repl-FAFile', 'FA-Block': 'btn-repl-FABlock' };
+    var _replGroupPanelIds = { 'FB': 'repl-panel-FB', 'FA-File': 'repl-panel-FA-File', 'FA-Block': 'repl-panel-FA-Block' };
+    var _replGroupLabels   = {
+      'FB':       'FlashBlade Replication Detail',
+      'FA-File':  'FlashArray Pod Replication Detail – File',
+      'FA-Block': 'FlashArray Snapshot Replication Detail'
+    };
+
+    function toggleReplGroup(type) {
+      _replGroupActive[type] = !_replGroupActive[type];
+      var btn = document.getElementById(_replGroupBtnIds[type]);
+      if (_replGroupActive[type]) {
+        btn.classList.add('active');
+      } else {
+        btn.classList.remove('active');
+      }
+      buildReplGroupPanel(type);
+    }
+
+    function buildReplGroupPanel(type) {
+      var panel = document.getElementById(_replGroupPanelIds[type]);
+      if (!_replGroupActive[type]) { panel.innerHTML = ''; return; }
+
+      /* Gather rows for this type only; strip " (type)" suffix from key */
+      var rows = [];
+      Object.keys(REPL_DATA).forEach(function(arrKey) {
+        var d = REPL_DATA[arrKey];
+        if ((d.type || '') !== type) return;
+        var displayArr = arrKey.replace(/ \([^)]+\)$/, '');
+        (d.rows || []).forEach(function(r) {
+          rows.push({ _array: displayArr, _row: r });
+        });
+      });
+
+      var headStyle = 'margin:0 0 6px;font-size:12pt;font-weight:bold;'
+                    + 'padding:5px 10px;border-radius:3px;background:#dce6f1;color:#1a3d6e;';
+      var label = _replGroupLabels[type] || type;
+
+      if (rows.length === 0) {
+        panel.innerHTML = '<div style="margin-top:20px;"><h3 style="' + headStyle
+                        + '">' + label + ' — No data available.</h3></div>';
+        return;
+      }
+
+      /* Build column list from this group's rows only */
+      var cols = [];
+      rows.forEach(function(item) {
+        Object.keys(item._row).forEach(function(k) {
+          if (cols.indexOf(k) === -1) cols.push(k);
+        });
+      });
+
+      var tbl = '<table><thead><tr><th>Array Name</th>';
+      cols.forEach(function(c) { tbl += '<th>' + escHtml(c) + '</th>'; });
+      tbl += '</tr></thead><tbody>';
+      rows.forEach(function(item) {
+        var exceeded = (item._row['SLA Status'] || '').toLowerCase() === 'exceeded';
+        tbl += '<tr class="' + (exceeded ? 'repl-exceeded' : 'repl-ok') + '">';
+        tbl += '<td>' + escHtml(item._array) + '</td>';
+        cols.forEach(function(c) { tbl += '<td>' + escHtml(item._row[c] || '') + '</td>'; });
+        tbl += '</tr>';
+      });
+      tbl += '</tbody></table>';
+
+      var disclaimer = '';
+      if (type === 'FA-Block') {
+        disclaimer = '<p style="margin:2px 0 6px;font-size:9pt;color:#555;font-style:italic;">'
+                   + '<strong>Note:</strong> For FA-Block Replication, the Source Side array will not report '
+                   + 'Start Time, Progress, Data Transferred, or Bytes Written. '
+                   + 'That information is reported by the Destination array.</p>';
+      }
+
+      panel.innerHTML = '<div style="margin-top:20px;">'
+        + '<h3 style="' + headStyle + '">' + label
+        + ' <span style="font-weight:normal;font-size:9pt;color:#555;">(' + rows.length + ' jobs)</span></h3>'
+        + disclaimer + tbl + '</div>';
+    }
+
+    /* ── Replication detail modal ───────────────────────────────────────── */
+    function showRepl(arrayName) {
+      var d = REPL_DATA[arrayName];
+      if (!d) return;
+      /* Strip the " (type)" suffix for a cleaner title — type is shown in the meta line */
+      var displayName = arrayName.replace(/ \([^)]+\)$/, '');
+      document.getElementById('repl-modal-title').textContent =
+        displayName + ' – Replication Detail (24h)';
+      var meta = '<p class="repl-meta">'
+        + '<strong>Type:</strong> '        + escHtml(d.type    || '—') + '  |  '
+        + '<strong>SLA Target:</strong> '  + escHtml(d.sla     || '—') + '  |  '
+        + '<strong>Avg Lag:</strong> '     + escHtml(d.avg_lag || '—') + '  |  '
+        + '<strong>Max Lag:</strong> '     + escHtml(d.max_lag || '—')
+        + '</p>';
+      var body = meta;
+      if (!d.rows || d.rows.length === 0) {
+        body += '<p>No replication detail data available.</p>';
+      } else {
+        var cols = [];
+        d.rows.forEach(function(r) {
+          Object.keys(r).forEach(function(k) {
+            if (cols.indexOf(k) === -1) cols.push(k);
+          });
+        });
+        var tbl = '<table><thead><tr>';
+        cols.forEach(function(c) { tbl += '<th>' + escHtml(c) + '</th>'; });
+        tbl += '</tr></thead><tbody>';
+        d.rows.forEach(function(r) {
+          var exceeded = (r['SLA Status'] || '').toLowerCase() === 'exceeded';
+          tbl += '<tr class="' + (exceeded ? 'repl-exceeded' : 'repl-ok') + '">';
+          cols.forEach(function(c) { tbl += '<td>' + escHtml(r[c] || '') + '</td>'; });
+          tbl += '</tr>';
+        });
+        tbl += '</tbody></table>';
+        body += tbl;
+      }
+      document.getElementById('repl-modal-body').innerHTML = body;
+      document.getElementById('repl-overlay').style.display = 'block';
+    }
+
+    function closeRepl() {
+      document.getElementById('repl-overlay').style.display = 'none';
+    }
+
+    /* ── Toggle-panel logic ─────────────────────────────────────────────── */
+    var _activeSevs = {};
+
+    function toggleSev(sev) {
+      _activeSevs[sev] = !_activeSevs[sev];
+      var btn = document.getElementById('btn-' + sev);
+      if (_activeSevs[sev]) {
+        btn.classList.add('active');
+      } else {
+        btn.classList.remove('active');
+      }
+      buildAlertPanel();
+    }
+
+    function buildAlertPanel() {
+      var panel = document.getElementById('alert-panel');
+      var html  = '';
+      var order = ['critical', 'warning', 'info'];
+      order.forEach(function(sev) {
+        if (!_activeSevs[sev]) return;
+        /* Gather all alerts of this severity across every array */
+        var rows = [];
+        Object.keys(ALERT_DATA).forEach(function(arrName) {
+          (ALERT_DATA[arrName] || []).forEach(function(a) {
+            if (a._sev === sev) rows.push({ _array: arrName, _alert: a });
+          });
+        });
+        var label = sev.charAt(0).toUpperCase() + sev.slice(1);
+        var heading = label + ' Alerts' + (rows.length ? ' (' + rows.length + ')' : ' — None');
+        if (rows.length === 0) {
+          html += '<div class="alert-panel-section panel-' + sev + '"><h3>' + heading + '</h3></div>';
+          return;
+        }
+        /* Build unified column list (skip internal keys) */
+        var cols = [];
+        rows.forEach(function(r) {
+          Object.keys(r._alert).forEach(function(k) {
+            if (k !== '_sev' && k !== 'Component Type' && k !== 'Component Name' && cols.indexOf(k) === -1) cols.push(k);
+          });
+        });
+        var tbl = '<table><thead><tr><th>Array Name</th>';
+        cols.forEach(function(c) { tbl += '<th>' + escHtml(c) + '</th>'; });
+        tbl += '</tr></thead><tbody>';
+        rows.forEach(function(r) {
+          tbl += '<tr class="sev-' + sev + '"><td>' + escHtml(r._array) + '</td>';
+          cols.forEach(function(c) { tbl += '<td>' + escHtml(r._alert[c] || '') + '</td>'; });
+          tbl += '</tr>';
+        });
+        tbl += '</tbody></table>';
+        html += '<div class="alert-panel-section panel-' + sev + '"><h3>' + heading + '</h3>' + tbl + '</div>';
+      });
+      panel.innerHTML = html;
+    }
+
+    /* ── Per-array modal logic ──────────────────────────────────────────── */
+    function showAlerts(arrayName, sev) {
+      var all = ALERT_DATA[arrayName] || [];
+      var filtered = all.filter(function(a) { return a._sev === sev; });
+      var sevLabel = sev.charAt(0).toUpperCase() + sev.slice(1);
+      document.getElementById('modal-title').textContent =
+        arrayName + ' – ' + sevLabel + ' Alerts (' + filtered.length + ')';
+
+      if (filtered.length === 0) {
+        document.getElementById('modal-body').innerHTML = '<p>No alerts found.</p>';
+      } else {
+        // Collect column names (skip internal _sev key)
+        var cols = [];
+        filtered.forEach(function(a) {
+          Object.keys(a).forEach(function(k) {
+            if (k !== '_sev' && k !== 'Component Type' && k !== 'Component Name' && cols.indexOf(k) === -1) cols.push(k);
+          });
+        });
+        var html = '<table><thead><tr>';
+        cols.forEach(function(c) { html += '<th>' + escHtml(c) + '</th>'; });
+        html += '</tr></thead><tbody>';
+        filtered.forEach(function(a) {
+          html += '<tr class="sev-' + sev + '">';
+          cols.forEach(function(c) { html += '<td>' + escHtml(a[c] || '') + '</td>'; });
+          html += '</tr>';
+        });
+        html += '</tbody></table>';
+        document.getElementById('modal-body').innerHTML = html;
+      }
+      document.getElementById('alert-overlay').style.display = 'block';
+    }
+
+    function closeAlerts() {
+      document.getElementById('alert-overlay').style.display = 'none';
+    }
+
+    function escHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    /* ── Hardware-health modal and "All Hardware Issues" panel ─────────── */
+    function _buildHwTable(header, rows, highlightIdx, unhealthyKeys) {
+      var h = '<table><thead><tr>';
+      for (var i = 0; i < header.length; i++) h += '<th>' + escHtml(header[i]) + '</th>';
+      h += '</tr></thead><tbody>';
+      for (var r = 0; r < rows.length; r++) {
+        var isBad = unhealthyKeys && unhealthyKeys[JSON.stringify(rows[r])];
+        h += isBad ? '<tr style="background:#ffecec;">' : '<tr>';
+        for (var c = 0; c < rows[r].length; c++) {
+          var cell = escHtml(rows[r][c]);
+          if (c === highlightIdx && isBad) {
+            h += '<td class="sev-critical">' + cell + '</td>';
+          } else {
+            h += '<td>' + cell + '</td>';
+          }
+        }
+        h += '</tr>';
+      }
+      h += '</tbody></table>';
+      return h;
+    }
+
+    function showHw(array) {
+      var info = HW_DATA[array];
+      if (!info) return;
+      var bad = (info.unhealthy_rows && info.unhealthy_rows.length) || 0;
+      var title = (bad ? 'Hardware Issues — ' : 'Hardware Status — ')
+                + array + ' (' + info.platform + ')';
+      if (bad) title += '  —  ' + bad + ' issue' + (bad === 1 ? '' : 's');
+      document.getElementById('hw-modal-title').textContent = title;
+      var body = document.getElementById('hw-modal-body');
+      if (info.error) {
+        body.innerHTML = '<p><em>Error collecting hardware data: ' + escHtml(info.error) + '</em></p>';
+      } else if (!info.rows || info.rows.length === 0) {
+        body.innerHTML = '<p><em>No hardware components reported.</em></p>';
+      } else {
+        // Find the Status column index so unhealthy cells are flagged.
+        var si = -1;
+        for (var i = 0; i < info.header.length; i++) {
+          if (String(info.header[i]).trim().toLowerCase() === 'status') { si = i; break; }
+        }
+        // Build a lookup of unhealthy rows (JSON-keyed) so the full list can
+        // highlight them while still showing every component from purehw list.
+        var keys = {};
+        if (info.unhealthy_rows) {
+          for (var u = 0; u < info.unhealthy_rows.length; u++) {
+            keys[JSON.stringify(info.unhealthy_rows[u])] = true;
+          }
+        }
+        var intro = bad
+          ? '<p style="margin:0 0 8px;color:#8a2a2a;">'
+            + bad + ' component' + (bad === 1 ? '' : 's') + ' flagged as unhealthy (highlighted below). '
+            + 'Full <code>purehw list</code> output:</p>'
+          : '<p style="margin:0 0 8px;color:#155724;">All components healthy. '
+            + 'Full <code>purehw list</code> output:</p>';
+        body.innerHTML = intro + _buildHwTable(info.header, info.rows, si, keys);
+      }
+      document.getElementById('hw-overlay').style.display = 'block';
+    }
+
+    function closeHw() {
+      document.getElementById('hw-overlay').style.display = 'none';
+    }
+
+    /* ── Replication-relationships panel + modal ───────────────────────── */
+    var _relPairsActive = false;
+    function toggleRelPairs() {
+      _relPairsActive = !_relPairsActive;
+      var btn = document.getElementById('btn-rel-pairs');
+      if (_relPairsActive) btn.classList.add('active'); else btn.classList.remove('active');
+      buildRelPanel();
+    }
+
+    function _relImgTag(plat, status) {
+      var p = (plat === 'FB') ? 'FB' : 'FA';
+      var s = (String(status || '').trim().toLowerCase() === 'connected') ? 'Green' : 'Red';
+      var b64 = IMG_B64[p + '-' + s] || '';
+      if (!b64) return '';
+      return '<img src="data:image/png;base64,' + b64 + '" alt="' + p + ' ' + s + '">';
+    }
+
+    function _relLocDiv(loc) {
+      var t = String(loc || '').trim();
+      if (!t) return '<div class="rel-array-loc empty">(no location)</div>';
+      return '<div class="rel-array-loc">' + escHtml(t) + '</div>';
+    }
+
+    function _relPairCell(name, plat, status, loc) {
+      return '<td class="rel-array-cell">'
+        + _relLocDiv(loc)
+        + _relImgTag(plat, status)
+        + '<div class="rel-array-name">' + escHtml(name) + '</div>'
+        + '<div class="rel-array-stat">' + escHtml(status || '(unknown)') + '</div>'
+        + '</td>';
+    }
+
+    function buildRelPanel() {
+      var panel = document.getElementById('rel-pairs-panel');
+      if (!_relPairsActive) { panel.innerHTML = ''; return; }
+      if (!REL_PAIRS || REL_PAIRS.length === 0) {
+        panel.innerHTML = '<div class="rel-panel-section">'
+          + '<h3>Replication Relationships — None discovered.</h3></div>';
+        return;
+      }
+      // Group pairs by (a_loc, b_loc) preserving first-seen order so the
+      // alignment seeded server-side is reflected visually.
+      var groupOrder = [];
+      var groups = {};
+      for (var i = 0; i < REL_PAIRS.length; i++) {
+        var p = REL_PAIRS[i];
+        var la = String(p.a_loc || '').trim();
+        var lb = String(p.b_loc || '').trim();
+        var key = la + '␟' + lb;
+        if (!groups[key]) { groups[key] = {la: la, lb: lb, items: []}; groupOrder.push(key); }
+        groups[key].items.push(i);
+      }
+      var html = '<div class="rel-panel-section">'
+               + '<h3>Replication Relationships</h3>';
+      for (var g = 0; g < groupOrder.length; g++) {
+        var grp = groups[groupOrder[g]];
+        var lbl = (grp.la || '(no location)') + '  ↔  ' + (grp.lb || '(no location)');
+        html += '<table><tbody>'
+             +  '<tr class="rel-group-hdr"><td colspan="3">' + escHtml(lbl) + '</td></tr>';
+        for (var j = 0; j < grp.items.length; j++) {
+          var idx = grp.items[j];
+          var pp = REL_PAIRS[idx];
+          html += '<tr class="rel-pair-row" onclick="showRelRow(' + idx + ')" '
+               +  'title="Click to view connection-list row detail">'
+               +  _relPairCell(pp.a_name, pp.a_plat, pp.a_status, pp.a_loc)
+               +  '<td class="rel-arrow">↔</td>'
+               +  _relPairCell(pp.b_name, pp.b_plat, pp.b_status, pp.b_loc)
+               +  '</tr>';
+        }
+        html += '</tbody></table>';
+      }
+      html += '</div>';
+      panel.innerHTML = html;
+    }
+
+    function _relMatchingRows(arr, remote) {
+      var info = REL_DATA[arr];
+      if (!info) return {header: [], rows: []};
+      var header = info.header || [];
+      var ni = -1;
+      for (var i = 0; i < header.length; i++) {
+        if (String(header[i]).trim().toLowerCase() === 'name') { ni = i; break; }
+      }
+      var rows = info.rows || [];
+      if (ni < 0) return {header: header, rows: rows};
+      var out = [];
+      for (var r = 0; r < rows.length; r++) {
+        if (ni < rows[r].length && String(rows[r][ni]).trim() === remote) out.push(rows[r]);
+      }
+      return {header: header, rows: out};
+    }
+
+    function _relSideTable(title, data) {
+      var h = '<h3>' + escHtml(title) + '</h3>';
+      if (!data.header.length || !data.rows.length) {
+        h += '<p><em>No matching row in the connection-list output.</em></p>';
+        return h;
+      }
+      h += '<table><thead><tr>';
+      for (var i = 0; i < data.header.length; i++) h += '<th>' + escHtml(data.header[i]) + '</th>';
+      h += '</tr></thead><tbody>';
+      for (var r = 0; r < data.rows.length; r++) {
+        h += '<tr>';
+        for (var c = 0; c < data.rows[r].length; c++) h += '<td>' + escHtml(data.rows[r][c]) + '</td>';
+        h += '</tr>';
+      }
+      h += '</tbody></table>';
+      return h;
+    }
+
+    function _relTitleName(name, loc) {
+      var t = String(loc || '').trim();
+      return t ? (name + ' (' + t + ')') : name;
+    }
+
+    function showRelRow(idx) {
+      var p = REL_PAIRS[idx];
+      if (!p) return;
+      document.getElementById('rel-modal-title').textContent =
+        'Replication Relationship — '
+        + _relTitleName(p.a_name, p.a_loc) + ' ↔ '
+        + _relTitleName(p.b_name, p.b_loc);
+      var body = _relSideTable(
+        p.a_name + ' (' + p.a_plat + ') — connection to ' + p.b_name,
+        _relMatchingRows(p.a_name, p.b_name));
+      body += _relSideTable(
+        p.b_name + ' (' + p.b_plat + ') — connection to ' + p.a_name,
+        _relMatchingRows(p.b_name, p.a_name));
+      document.getElementById('rel-modal-body').innerHTML = body;
+      document.getElementById('rel-overlay').style.display = 'block';
+    }
+
+    function showArrRel(arr) {
+      var matches = [];
+      for (var i = 0; i < REL_PAIRS.length; i++) {
+        if (REL_PAIRS[i].a_name === arr || REL_PAIRS[i].b_name === arr) matches.push(i);
+      }
+      document.getElementById('rel-modal-title').textContent =
+        'Replication Partners — ' + arr;
+      var body = document.getElementById('rel-modal-body');
+      if (matches.length === 0) {
+        body.innerHTML = '<p><em>' + escHtml(arr)
+          + ' has no replication relationships configured.</em></p>';
+        document.getElementById('rel-overlay').style.display = 'block';
+        return;
+      }
+      var html = '<table><tbody>';
+      for (var m = 0; m < matches.length; m++) {
+        var p = REL_PAIRS[matches[m]];
+        var local = (p.a_name === arr) ? p
+          : {a_name: p.b_name, a_plat: p.b_plat, a_status: p.b_status, a_loc: p.b_loc,
+              b_name: p.a_name, b_plat: p.a_plat, b_status: p.a_status, b_loc: p.a_loc};
+        html += '<tr class="rel-pair-row" onclick="showRelRow(' + matches[m] + ')" '
+             +  'title="Click for connection-list row detail">'
+             +  _relPairCell(local.a_name, local.a_plat, local.a_status, local.a_loc)
+             +  '<td class="rel-arrow">↔</td>'
+             +  _relPairCell(local.b_name, local.b_plat, local.b_status, local.b_loc)
+             +  '</tr>';
+      }
+      html += '</tbody></table>';
+      body.innerHTML = html;
+      document.getElementById('rel-overlay').style.display = 'block';
+    }
+
+    function closeRelModal() {
+      document.getElementById('rel-overlay').style.display = 'none';
+    }
+
+    var _hwAllActive = false;
+    function toggleHwAll() {
+      _hwAllActive = !_hwAllActive;
+      var btn = document.getElementById('btn-hw-all');
+      if (_hwAllActive) btn.classList.add('active'); else btn.classList.remove('active');
+      buildHwPanel();
+    }
+
+    function buildHwPanel() {
+      var panel = document.getElementById('hw-panel');
+      if (!_hwAllActive) { panel.innerHTML = ''; return; }
+      // Group arrays by platform. FA-File and FA-Block share columns so they
+      // go in a single FA table (the HW data itself is de-duped per array).
+      var fb = [], fa = [];
+      var fbHeader = null, faHeader = null;
+      var names = Object.keys(HW_DATA).sort();
+      for (var i = 0; i < names.length; i++) {
+        var n = names[i];
+        var info = HW_DATA[n];
+        if (!info || !info.unhealthy_rows || info.unhealthy_rows.length === 0) continue;
+        var dest = (info.platform === 'FB') ? fb : fa;
+        if (info.platform === 'FB' && !fbHeader) fbHeader = info.header;
+        if (info.platform !== 'FB' && !faHeader) faHeader = info.header;
+        for (var r = 0; r < info.unhealthy_rows.length; r++) {
+          // Prepend array name so the combined table shows which array each row came from
+          dest.push([n].concat(info.unhealthy_rows[r]));
+        }
+      }
+      var html = '<div class="hw-panel-section"><h3>All Hardware Issues</h3>';
+      if (fbHeader && fb.length > 0) {
+        // Find Status column index after prepending 'Array' header
+        var si = -1;
+        for (var i = 0; i < fbHeader.length; i++) {
+          if (String(fbHeader[i]).trim().toLowerCase() === 'status') { si = i + 1; break; }
+        }
+        html += '<h4>FlashBlade</h4>' + _buildHwTable(['Array'].concat(fbHeader), fb, si);
+      }
+      if (faHeader && fa.length > 0) {
+        var si = -1;
+        for (var i = 0; i < faHeader.length; i++) {
+          if (String(faHeader[i]).trim().toLowerCase() === 'status') { si = i + 1; break; }
+        }
+        html += '<h4>FlashArray (File &amp; Block)</h4>' + _buildHwTable(['Array'].concat(faHeader), fa, si);
+      }
+      if ((!fbHeader || fb.length === 0) && (!faHeader || fa.length === 0)) {
+        html += '<p><em>No unhealthy hardware components reported across any array.</em></p>';
+      }
+      html += '</div>';
+      panel.innerHTML = html;
+    }
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { closeAlerts(); closeRepl(); closeHw(); }
+    });
+  </script>
+</body>
+</html>

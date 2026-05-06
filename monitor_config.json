@@ -1,0 +1,77 @@
+{
+    "alerts_excluded_rows": [
+        {
+            "code": "9999",
+            "description": "Bogus Alert Code",
+            "justification": "For Testing A"
+        },
+        {
+            "code": "9998-10000",
+            "description": "Bogus Alert Code",
+            "justification": "For Testing B"
+        }
+    ],
+    "alerts_excluded": "9999, 9998-10000",
+    "alerts_col_widths": [
+        108,
+        217,
+        276
+    ],
+    "arrays": [
+        {
+            "name": "flasharray1",
+            "location": "Boston",
+            "notes": "DR Array",
+            "auth_user": "pureuser"
+        },
+        {
+            "name": "flasharray2",
+            "location": "New York",
+            "notes": "Prod Array",
+            "auth_user": "pureuser"
+        },
+        {
+            "name": "flashblade1",
+            "location": "Boston",
+            "notes": "Prod Array",
+            "auth_user": "pureuser"
+        },
+        {
+            "name": "flashblade2",
+            "location": "Chicago",
+            "notes": "DR Array",
+            "auth_user": "pureuser"
+        }
+    ],
+    "arrays_col_widths": [
+        134,
+        121,
+        166,
+        180
+    ],
+    "main_sash_pos": 667,
+    "sla_fb": "1h 30m",
+    "sla_faf": "1h",
+    "sla_fab": "1h",
+    "sla_retention_snap": "7",
+    "sla_retention_repl": "14",
+    "ignore_source_lag": true,
+    "smtp_server": "smtp.freesmtpservers.com",
+    "smtp_port": "25",
+    "smtp_from": "johnsmith@domain.com",
+    "smtp_to": "janedoe@domain.com",
+    "replication_pairs": [
+        {
+            "name": "Example Pair 1",
+            "source": "source-array1",
+            "destination": "dest-array1",
+            "type": "FA-Block"
+        },
+        {
+            "name": "Example Pair 2",
+            "source": "source-array2",
+            "destination": "dest-array2",
+            "type": "FB"
+        }
+    ]
+}
