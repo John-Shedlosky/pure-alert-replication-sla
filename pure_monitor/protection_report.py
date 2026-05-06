@@ -158,25 +158,34 @@ def _fake_protection_data_for(array):
     directories = [
         {'name': 'home:users', 'fs': 'home', 'directory': 'users'},
         {'name': 'home:temp',  'fs': 'home', 'directory': 'temp'}]
+    # Snapshot policies: `daily` (no retention lock) drives the plain
+    # `home` directory rows so Safemode demos as Disabled. The pod-
+    # stretched `shared_fs:data` rows are driven by `daily-locked`,
+    # which is registered in `policy_locks` as retention-lock=enabled
+    # and therefore demos Safemode=Enabled (green).
     dir_snapshots = [
-        {'name': 'home:users.daily.1'},
-        {'name': 'home:users.daily.2'},
-        {'name': 'home:temp.daily.1'}]
+        {'name': 'home:users.daily.1', 'policy': 'daily'},
+        {'name': 'home:users.daily.2', 'policy': 'daily'},
+        {'name': 'home:temp.daily.1',  'policy': 'daily'}]
+    policy_locks = {'daily': 'disabled', 'daily-locked': 'enabled'}
     if array in pod_pairs:
         _lp = pod_pairs[array][1]
         filesystems.append({'name': f'{_lp}::shared_fs',
                             'pod': _lp, 'fs': 'shared_fs'})
         directories.append({'name': f'{_lp}::shared_fs:data',
                             'fs': f'{_lp}::shared_fs', 'directory': 'data'})
-        dir_snapshots.append({'name': f'{_lp}::shared_fs:data.daily.1'})
-        dir_snapshots.append({'name': f'{_lp}::shared_fs:data.daily.2'})
+        dir_snapshots.append({'name': f'{_lp}::shared_fs:data.daily.1',
+                              'policy': 'daily-locked'})
+        dir_snapshots.append({'name': f'{_lp}::shared_fs:data.daily.2',
+                              'policy': 'daily-locked'})
     return {'volumes': volumes, 'pod_links': pod_links, 'snapshots': snapshots,
             'pgroups': pgroups, 'pgroup_locks': pgroup_locks,
             'pgroup_schedules': pgroup_schedules,
             'pgroup_retentions': pgroup_retentions,
             'connections': connections,
             'filesystems': filesystems, 'directories': directories,
-            'dir_snapshots': dir_snapshots, 'error': None}
+            'dir_snapshots': dir_snapshots,
+            'policy_locks': policy_locks, 'error': None}
 
 
 def _parse_purevol_list_csv(text):
@@ -347,18 +356,36 @@ def _parse_purefs_list_csv(text):
 
 
 def _parse_puredir_snap_list_csv(text):
-    """Parse `puredir snapshot list --csv` -> [{'name'}, ...].
+    """Parse `puredir snapshot list --csv` -> [{'name','policy'}, ...].
     Snapshot Name format is `[pod::]filesystem:directory.<suffix>`.
     The suffix can contain dots so the row is preserved verbatim and
     matched against known directories via prefix comparison in
-    aggregate_fa_filesystem_rows.
+    aggregate_fa_filesystem_rows. Policy is the snapshot-policy name
+    that produced the snapshot; retention-lock state is looked up
+    against `purepolicy snapshot retention-lock list`.
     """
     out = []
     for d in _csv_to_dicts(text):
         name = (d.get('Name') or '').strip()
         if not name:
             continue
-        out.append({'name': name})
+        out.append({'name':   name,
+                    'policy': (d.get('Policy') or '').strip()})
+    return out
+
+
+def _parse_purepolicy_snap_retention_lock_csv(text):
+    """Parse `purepolicy snapshot retention-lock list --csv` rows.
+    Returns {policy_name: retention_lock_value_lowercase}. The 'Name'
+    column is preserved verbatim.
+    """
+    out = {}
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        rl = (d.get('Retention Lock') or '').strip().lower()
+        out[name] = rl
     return out
 
 
@@ -374,6 +401,7 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
            'pgroups': [], 'pgroup_locks': {}, 'pgroup_schedules': {},
            'pgroup_retentions': {}, 'connections': [],
            'filesystems': [], 'directories': [], 'dir_snapshots': [],
+           'policy_locks': {},
            'error': None}
     _errs = []
     try:
@@ -448,6 +476,14 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
             log_list=detailed_logs, nogui=nogui))
     except Exception as e:
         _errs.append(f"puredir snapshot list: {e}")
+    try:
+        out['policy_locks'] = _parse_purepolicy_snap_retention_lock_csv(
+            run_ssh_command(
+                array, user,
+                "purepolicy snapshot retention-lock list --csv",
+                log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purepolicy snapshot retention-lock list: {e}")
     if _errs:
         out['error'] = "; ".join(_errs)
     return out
@@ -511,7 +547,7 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
                             'pgroup_locks': {}, 'pgroup_schedules': {},
                             'pgroup_retentions': {}, 'connections': [],
                             'filesystems': [], 'directories': [],
-                            'dir_snapshots': []}
+                            'dir_snapshots': [], 'policy_locks': {}}
         if platform == 'FA':
             fa_targets.append((_name, info.get('user')
                                       or auth_user_for_array(_name, config)))
@@ -917,6 +953,12 @@ def aggregate_fa_filesystem_rows(per_array):
     'replicating'. Local snapshot count is derived from
     `puredir snapshot list` rows whose Name starts with the
     directory's `[pod::]fs:dir.` prefix.
+
+    Stretched-pod directories appear on both arrays. The dest-side
+    rows are dropped so each directory is rendered once, anchored at
+    the source side as determined by the replica-link Direction
+    column ('-->' source, '<--' dest). The source-side row's Array
+    Name displays the stretch as 'source -> dest' to mirror Table 1.
     """
     # Map (arr, fs_token) -> pod_or_None. The fs_token is the value
     # that appears in the `fs` portion of the directory's Name in
@@ -935,39 +977,57 @@ def aggregate_fa_filesystem_rows(per_array):
             if full and full != bare:
                 fs_pod_map.setdefault((arr, full), pod)
 
-    # Map (arr, pod) -> {remote_array, remote_pod} for pods that
-    # currently carry a 'replicating' replica link. Non-replicating
-    # pods produce no Replication Destination on the row.
-    pod_repl = {}
+    # Pod stretch map (replicating links only): mirrors the structure
+    # used by aggregate_fa_volume_rows so each pod-stretched directory
+    # can be folded into a single row on the source side.
+    # stretch[(arr, pod)] = (peer_arr, peer_pod, role) where role is
+    # 'source' if direction is '-->' (this side replicates outward) and
+    # 'dest' if direction is '<--' (this side receives the replica).
+    stretch = {}
     for arr, data in per_array.items():
         for link in data.get('pod_links', []):
             if (link.get('status') or '').lower() != 'replicating':
                 continue
-            local_pod = link.get('local_pod', '')
-            if not local_pod:
+            local_pod    = link.get('local_pod', '')
+            remote_pod   = link.get('remote_pod', '')
+            remote_array = link.get('remote_array', '')
+            direction    = link.get('direction', '')
+            if not (local_pod and remote_array):
                 continue
-            pod_repl[(arr, local_pod)] = {
-                'remote_array': link.get('remote_array', ''),
-                'remote_pod':   link.get('remote_pod', '')}
+            role = 'source' if direction == '-->' else (
+                   'dest' if direction == '<--' else '')
+            stretch[(arr, local_pod)] = (remote_array, remote_pod, role)
 
-    rows = []
+    def _resolve_pod(arr, fs_token):
+        if '::' in fs_token:
+            return fs_token.split('::', 1)[0]
+        return fs_pod_map.get((arr, fs_token))
+
+    # Drop set: dest-side directories of stretched pods. The matching
+    # source-side row carries the directory once, with the Array Name
+    # column rendered as "source -> dest".
+    drop = set()
     for arr, data in per_array.items():
-        fs_entries = data.get('filesystems', [])
-        # Build a quick lookup of the directory's pod prefix even when
-        # the directory's `fs` field omits it. Falls back to scanning
-        # purefs by bare fs name.
         for d in data.get('directories', []):
             fs_token  = d.get('fs', '')
             directory = d.get('directory', '')
-            # Detect pod from the fs token directly (pod::fs form), or
-            # else look it up in the per-array filesystem inventory.
-            pod = None
-            if '::' in fs_token:
-                pod = fs_token.split('::', 1)[0]
-                fs_bare = fs_token.split('::', 1)[1]
-            else:
-                fs_bare = fs_token
-                pod = fs_pod_map.get((arr, fs_token))
+            pod = _resolve_pod(arr, fs_token)
+            if not pod:
+                continue
+            info = stretch.get((arr, pod))
+            if info and info[2] == 'dest':
+                drop.add((arr, fs_token, directory))
+
+    rows = []
+    for arr, data in per_array.items():
+        for d in data.get('directories', []):
+            fs_token  = d.get('fs', '')
+            directory = d.get('directory', '')
+            if (arr, fs_token, directory) in drop:
+                continue
+            pod = _resolve_pod(arr, fs_token)
+            fs_bare = (fs_token.split('::', 1)[1]
+                       if '::' in fs_token else fs_token)
             # Display name is "filesystem:directory" verbatim from
             # puredir; preserve any pod prefix it may carry.
             row = {
@@ -980,12 +1040,31 @@ def aggregate_fa_filesystem_rows(per_array):
                 'in_pod':    bool(pod),
                 'remote_pod': '',
                 'replication_destinations': [],
-                'local_snaps': 0}
-            link = pod_repl.get((arr, pod)) if pod else None
-            if link:
-                if link['remote_array']:
-                    row['replication_destinations'] = [link['remote_array']]
-                row['remote_pod'] = link['remote_pod']
+                'local_snaps': 0,
+                'replicated_pod_snaps': 0,
+                'safemode': False}
+
+            stretch_info = stretch.get((arr, pod)) if pod else None
+            if stretch_info:
+                peer_arr, peer_pod, role = stretch_info
+                if peer_arr:
+                    row['replication_destinations'] = [peer_arr]
+                row['remote_pod'] = peer_pod
+                # Source-side rows display the stretch direction in
+                # the Array Name column; dest-side rows are already
+                # filtered out by the drop set above.
+                if role == 'source':
+                    row['array'] = f'{arr} \u2192 {peer_arr}'
+
+            # Safemode is Enabled if ANY snapshot associated with the
+            # directory is produced by a policy whose Retention Lock is
+            # enabled in `purepolicy snapshot retention-lock list`.
+            # Both the source-side and (for pod-stretched directories)
+            # destination-side snapshots are considered, each compared
+            # against their own array's policy_locks map.
+            src_locks = data.get('policy_locks', {}) or {}
+            safemode  = False
+
             # Count local snapshots by prefix match. Snapshot Name is
             # `[pod::]fs:dir.<suffix>`; the trailing dot anchors the
             # match so e.g. directory `db` doesn't pick up snapshots
@@ -998,7 +1077,34 @@ def aggregate_fa_filesystem_rows(per_array):
             for snap in data.get('dir_snapshots', []):
                 if (snap.get('name') or '').startswith(prefix):
                     cnt += 1
+                    pol = (snap.get('policy') or '').strip()
+                    if pol and src_locks.get(pol) == 'enabled':
+                        safemode = True
             row['local_snaps'] = cnt
+
+            # Replicated pod snapshots: by definition only pod-resident
+            # directories replicate (via the pod replica link). When the
+            # pod has a remote peer, the replica copies appear in the
+            # destination array's `puredir snapshot list` under the peer
+            # pod's namespace (`remote_pod::fs:dir.<suffix>`). Count
+            # those on the destination array, and fold their policies
+            # into the safemode check using the destination array's own
+            # policy_locks map.
+            if stretch_info:
+                peer_arr, peer_pod, _role = stretch_info
+                dest_data   = per_array.get(peer_arr) or {}
+                dest_locks  = dest_data.get('policy_locks', {}) or {}
+                dest_prefix = f'{peer_pod}::{fs_bare}:{directory}.'
+                rcnt = 0
+                for snap in dest_data.get('dir_snapshots', []):
+                    if (snap.get('name') or '').startswith(dest_prefix):
+                        rcnt += 1
+                        pol = (snap.get('policy') or '').strip()
+                        if pol and dest_locks.get(pol) == 'enabled':
+                            safemode = True
+                row['replicated_pod_snaps'] = rcnt
+
+            row['safemode'] = safemode
             rows.append(row)
 
     rows.sort(key=lambda r: (r['array'].lower(),
@@ -1238,14 +1344,15 @@ def build_protection_html(per_array, config):
                 '</tr>\n')
 
     # ── Build Table 2 rows (FlashArray Filesystems) ─────────────────────
-    # Currently only the first six columns carry real data (Directory
-    # Name, Array Name, Replication Destination, Pod, Remote Pod, Local
-    # Snapshots). The remaining columns are rendered as neutral em-
-    # dashes pending the next iteration of the spec.
+    # Currently the first eight columns carry real data (Directory Name,
+    # Array Name, Replication Destination, Pod, Remote Pod, Local
+    # Snapshots, Replicated Pod Snapshots, Safemode). The remaining
+    # columns are rendered as neutral em-dashes pending the next
+    # iteration of the spec.
     rows_t2 = aggregate_fa_filesystem_rows(per_array)
     tr_html_t2 = ""
     if not rows_t2:
-        tr_html_t2 = ('<tr><td colspan="16" style="text-align:center;color:#888;">'
+        tr_html_t2 = ('<tr><td colspan="15" style="text-align:center;color:#888;">'
                       'No FlashArray filesystem directories discovered.</td></tr>')
     else:
         for r in rows_t2:
@@ -1259,6 +1366,21 @@ def build_protection_html(per_array, config):
             dir_disp = (r.get('name')
                         or f'{r["fs_token"]}:{r["directory"]}')
             local_n = int(r['local_snaps'])
+            # Replicated pod snapshots: only meaningful for pod-resident
+            # directories whose pod has a remote peer. Non-pod and
+            # unlinked rows render the cell as a neutral em-dash.
+            rep_eligible = bool(r['in_pod'] and r['remote_pod']
+                                and r['replication_destinations'])
+            rep_n = int(r.get('replicated_pod_snaps', 0))
+            if rep_eligible:
+                rep_cell = (f'<td style="{_OK if rep_n > 0 else _BAD}'
+                            f'text-align:right;">{rep_n}</td>')
+            else:
+                rep_cell = f'<td style="text-align:right;">{_DASH}</td>'
+            sm_on = bool(r.get('safemode'))
+            sm_text = 'Enabled' if sm_on else 'Disabled'
+            sm_style = ((_OK if sm_on else _BAD)
+                        + 'text-align:center;font-weight:bold;')
             tr_html_t2 += (
                 '<tr>'
                 f'<td>{_html.escape(dir_disp)}</td>'
@@ -1267,9 +1389,8 @@ def build_protection_html(per_array, config):
                 f'<td style="{_OK if pod_ok else _BAD}text-align:center;">{pod_cell}</td>'
                 f'<td style="{_OK if remote_ok else _BAD}text-align:center;">{remote_pod}</td>'
                 f'<td style="{_OK if local_n > 0 else _BAD}text-align:right;">{local_n}</td>'
-                f'<td style="text-align:right;">{_DASH}</td>'
-                f'<td style="text-align:right;">{_DASH}</td>'
-                f'<td style="text-align:center;">{_DASH}</td>'
+                f'{rep_cell}'
+                f'<td style="{sm_style}">{sm_text}</td>'
                 f'<td>{_DASH}</td>'
                 f'<td style="text-align:right;">{_DASH}</td>'
                 f'<td style="text-align:right;">{_DASH}</td>'
@@ -1412,12 +1533,14 @@ def build_protection_html(per_array, config):
         'Local Snap Retention vs SLA', 'Repl Snap Retention vs SLA',
         'Connected Hosts', 'Non Protection Reasoning']
     # Table 2 mirrors Table 1's column structure with "Directory Name"
-    # in column 1 in place of "Volume Name". Header generation is
-    # factored into a small helper so both thead blocks stay in sync.
+    # in column 1 in place of "Volume Name". The "Pod Snapshots" column
+    # from Table 1 is omitted because FA directory replication is
+    # always pod-mediated (the pod is the snapshot domain), so the
+    # column collapses with "Replicated Pod Snapshots".
     _T2_COLS = [
         'Directory Name', 'Array Name', 'Replication Destination',
-        'Pod', 'Remote Pod', 'Local Snapshots', 'Pod Snapshots',
-        'Replicated Snapshots', 'Safemode', 'Protection Groups',
+        'Pod', 'Remote Pod', 'Local Snapshots',
+        'Replicated Pod Snapshots', 'Safemode', 'Protection Groups',
         'Max Local Snap Retention (Days)', 'Max Repl Snap Retention (Days)',
         'Local Snap Retention vs SLA', 'Repl Snap Retention vs SLA',
         'Connected Hosts', 'Non Protection Reasoning']
@@ -1822,4 +1945,4 @@ def build_protection_html(per_array, config):
 """
 
 
-__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
+__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
