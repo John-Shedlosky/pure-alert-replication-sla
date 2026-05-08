@@ -158,16 +158,23 @@ def _fake_protection_data_for(array):
     directories = [
         {'name': 'home:users', 'fs': 'home', 'directory': 'users'},
         {'name': 'home:temp',  'fs': 'home', 'directory': 'temp'}]
-    # Snapshot policies: `daily` (no retention lock) drives the plain
-    # `home` directory rows so Safemode demos as Disabled. The pod-
-    # stretched `shared_fs:data` rows are driven by `daily-locked`,
-    # which is registered in `policy_locks` as retention-lock=enabled
-    # and therefore demos Safemode=Enabled (green).
     dir_snapshots = [
         {'name': 'home:users.daily.1', 'policy': 'daily'},
         {'name': 'home:users.daily.2', 'policy': 'daily'},
         {'name': 'home:temp.daily.1',  'policy': 'daily'}]
-    policy_locks = {'daily': 'disabled', 'daily-locked': 'enabled'}
+    policy_locks = {'daily': 'disabled', 'daily-locked': 'ratcheted'}
+    # Array-wide safemode (purearray eradication-config). Half the
+    # fake arrays demo 'all-disabled' with a 2d delay so the aggregator
+    # forces Safemode=Enabled on rows with any snapshot regardless of
+    # pgroup / policy retention-lock state; the others demo the
+    # default 'all-enabled' (no array-wide safemode).
+    if array in ('nyc-pure-fa-01', 'chi-pure-fa-01',
+                 'dal-pure-fa-01', 'sea-pure-fa-01'):
+        eradication = {'Manual Eradication': 'all-disabled',
+                       'Enabled Delay': '2d'}
+    else:
+        eradication = {'Manual Eradication': 'all-enabled',
+                       'Enabled Delay': ''}
     if array in pod_pairs:
         _lp = pod_pairs[array][1]
         filesystems.append({'name': f'{_lp}::shared_fs',
@@ -185,7 +192,8 @@ def _fake_protection_data_for(array):
             'connections': connections,
             'filesystems': filesystems, 'directories': directories,
             'dir_snapshots': dir_snapshots,
-            'policy_locks': policy_locks, 'error': None}
+            'policy_locks': policy_locks,
+            'eradication': eradication, 'error': None}
 
 
 def _parse_purevol_list_csv(text):
@@ -389,6 +397,34 @@ def _parse_purepolicy_snap_retention_lock_csv(text):
     return out
 
 
+def _parse_purearray_eradication_config_csv(text):
+    """Parse `purearray eradication-config list --csv` rows.
+    Single-row output describing the array-level eradication settings;
+    returns the first row as {column: stripped_value}. Columns of
+    interest are 'Manual Eradication' (e.g., 'all-disabled') and
+    'Enabled Delay' (e.g., '2d'). Returns {} on empty input.
+    """
+    rows = _csv_to_dicts(text)
+    if not rows:
+        return {}
+    return {k: (v or '').strip() for k, v in rows[0].items() if k}
+
+
+def _fmt_eradication_delay(val):
+    """Render an eradication-config Enabled Delay as 'N Day Protection'.
+    Accepts the verbatim Purity value (e.g., '2d') and falls back to
+    the original string when no `<int>d` prefix is found. Empty input
+    returns the empty string.
+    """
+    s = (val or '').strip()
+    if not s:
+        return ''
+    m = re.match(r'^(\d+)\s*d', s, re.IGNORECASE)
+    if m:
+        return f'{m.group(1)} Day Protection'
+    return s
+
+
 def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
     """Issue the three FlashArray protection commands and parse their output.
     Returns {'volumes', 'pod_links', 'snapshots', 'error'}. Errors on a
@@ -401,7 +437,7 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
            'pgroups': [], 'pgroup_locks': {}, 'pgroup_schedules': {},
            'pgroup_retentions': {}, 'connections': [],
            'filesystems': [], 'directories': [], 'dir_snapshots': [],
-           'policy_locks': {},
+           'policy_locks': {}, 'eradication': {},
            'error': None}
     _errs = []
     try:
@@ -484,6 +520,14 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
                 log_list=detailed_logs, nogui=nogui))
     except Exception as e:
         _errs.append(f"purepolicy snapshot retention-lock list: {e}")
+    try:
+        out['eradication'] = _parse_purearray_eradication_config_csv(
+            run_ssh_command(
+                array, user,
+                "purearray eradication-config list --csv",
+                log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purearray eradication-config list: {e}")
     if _errs:
         out['error'] = "; ".join(_errs)
     return out
@@ -547,7 +591,8 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
                             'pgroup_locks': {}, 'pgroup_schedules': {},
                             'pgroup_retentions': {}, 'connections': [],
                             'filesystems': [], 'directories': [],
-                            'dir_snapshots': [], 'policy_locks': {}}
+                            'dir_snapshots': [], 'policy_locks': {},
+                            'eradication': {}}
         if platform == 'FA':
             fa_targets.append((_name, info.get('user')
                                       or auth_user_for_array(_name, config)))
@@ -724,6 +769,20 @@ def aggregate_fa_volume_rows(per_array):
             if (lock or '').lower() == 'ratcheted':
                 pg_ratcheted.add((arr, pg_name))
 
+    # ── Array-wide safemode (purearray eradication-config). When
+    # 'Manual Eradication' is 'all-disabled' on an array, any snapshot
+    # that lives on that array is safemode-protected regardless of
+    # pgroup or policy retention-lock state. The 'Enabled Delay' is
+    # rendered as a second line under the Safemode cell when the
+    # row's safemode is enabled.
+    arr_force_sm = {}
+    arr_sm_delay = {}
+    for arr, data in per_array.items():
+        erad = data.get('eradication') or {}
+        me = (erad.get('Manual Eradication') or '').strip().lower()
+        arr_force_sm[arr] = (me == 'all-disabled')
+        arr_sm_delay[arr] = _fmt_eradication_delay(erad.get('Enabled Delay'))
+
     # ── Per-(array, pgroup) maximum snap and replication retention in days,
     # derived from the array's purepgroup --schedule + --retention output.
     # See _compute_pg_max_retention for the snap/replicate -> source/target
@@ -790,6 +849,7 @@ def aggregate_fa_volume_rows(per_array):
                    'local_snaps': 0, 'pod_snaps': 0,
                    'replicated_snaps': 0, 'replication_destinations': [],
                    'protection_groups': [], 'safemode': False,
+                   'safemode_delay': '',
                    'max_snap_retention_days': 0,
                    'max_repl_retention_days': 0,
                    'local_status': 'no_pg', 'repl_status': 'no_pg',
@@ -802,7 +862,15 @@ def aggregate_fa_volume_rows(per_array):
                     repl_dests.get((arr, None, vol), set()))
                 pgs = pg_membership.get((arr, None, vol), set())
                 row['protection_groups'] = sorted(pgs)
-                row['safemode'] = any((arr, p) in pg_ratcheted for p in pgs)
+                _sm = any((arr, p) in pg_ratcheted for p in pgs)
+                # Array-wide safemode forces the row when the source
+                # array has Manual Eradication=all-disabled and the
+                # volume has at least one snapshot on that array.
+                if arr_force_sm.get(arr) and row['local_snaps'] > 0:
+                    _sm = True
+                row['safemode'] = _sm
+                if _sm and arr_force_sm.get(arr):
+                    row['safemode_delay'] = arr_sm_delay.get(arr, '')
                 _src_max = 0
                 _tgt_max = 0
                 for _p in pgs:
@@ -887,8 +955,26 @@ def aggregate_fa_volume_rows(per_array):
                 _arrs_to_check = {arr}
                 if stretch_info and stretch_info[0]:
                     _arrs_to_check.add(stretch_info[0])
-                row['safemode'] = any((a, p) in pg_ratcheted
-                                      for a in _arrs_to_check for p in pgs)
+                _sm = any((a, p) in pg_ratcheted
+                          for a in _arrs_to_check for p in pgs)
+                # Array-wide safemode: if either side's array forces
+                # safemode and that side has at least one pod snapshot,
+                # the row is protected. Prefer the source array's
+                # delay; fall back to the peer's only when source isn't
+                # forcing.
+                _force_arr = ''
+                if arr_force_sm.get(arr) and local_pod_snaps > 0:
+                    _sm = True
+                    _force_arr = arr
+                if (stretch_info and stretch_info[0]
+                        and arr_force_sm.get(stretch_info[0])
+                        and peer_pod_snaps > 0):
+                    _sm = True
+                    if not _force_arr:
+                        _force_arr = stretch_info[0]
+                row['safemode'] = _sm
+                if _sm and _force_arr:
+                    row['safemode_delay'] = arr_sm_delay.get(_force_arr, '')
                 # Maximum local-snap retention across all member pgroups,
                 # considering profiles on both sides of the stretched pod
                 # (pod-scoped pgroups can be defined on either side).
@@ -1003,6 +1089,18 @@ def aggregate_fa_filesystem_rows(per_array):
             return fs_token.split('::', 1)[0]
         return fs_pod_map.get((arr, fs_token))
 
+    # Array-wide safemode (purearray eradication-config). Directories
+    # on an array with Manual Eradication=all-disabled get Safemode
+    # forced when they have at least one snapshot on that side. The
+    # Enabled Delay value is rendered alongside the cell.
+    arr_force_sm = {}
+    arr_sm_delay = {}
+    for arr, data in per_array.items():
+        erad = data.get('eradication') or {}
+        me = (erad.get('Manual Eradication') or '').strip().lower()
+        arr_force_sm[arr] = (me == 'all-disabled')
+        arr_sm_delay[arr] = _fmt_eradication_delay(erad.get('Enabled Delay'))
+
     # Drop set: dest-side directories of stretched pods. The matching
     # source-side row carries the directory once, with the Array Name
     # column rendered as "source -> dest".
@@ -1042,7 +1140,8 @@ def aggregate_fa_filesystem_rows(per_array):
                 'replication_destinations': [],
                 'local_snaps': 0,
                 'replicated_pod_snaps': 0,
-                'safemode': False}
+                'safemode': False,
+                'safemode_delay': ''}
 
             stretch_info = stretch.get((arr, pod)) if pod else None
             if stretch_info:
@@ -1058,7 +1157,7 @@ def aggregate_fa_filesystem_rows(per_array):
 
             # Safemode is Enabled if ANY snapshot associated with the
             # directory is produced by a policy whose Retention Lock is
-            # enabled in `purepolicy snapshot retention-lock list`.
+            # 'ratcheted' in `purepolicy snapshot retention-lock list`.
             # Both the source-side and (for pod-stretched directories)
             # destination-side snapshots are considered, each compared
             # against their own array's policy_locks map.
@@ -1078,7 +1177,7 @@ def aggregate_fa_filesystem_rows(per_array):
                 if (snap.get('name') or '').startswith(prefix):
                     cnt += 1
                     pol = (snap.get('policy') or '').strip()
-                    if pol and src_locks.get(pol) == 'enabled':
+                    if pol and src_locks.get(pol) == 'ratcheted':
                         safemode = True
             row['local_snaps'] = cnt
 
@@ -1100,11 +1199,28 @@ def aggregate_fa_filesystem_rows(per_array):
                     if (snap.get('name') or '').startswith(dest_prefix):
                         rcnt += 1
                         pol = (snap.get('policy') or '').strip()
-                        if pol and dest_locks.get(pol) == 'enabled':
+                        if pol and dest_locks.get(pol) == 'ratcheted':
                             safemode = True
                 row['replicated_pod_snaps'] = rcnt
 
+            # Array-wide safemode forces the row when either side's
+            # array has Manual Eradication=all-disabled and has at
+            # least one snapshot. Source-array forcing wins for the
+            # delay display; the peer is consulted only as a fallback.
+            _force_arr = ''
+            if arr_force_sm.get(arr) and row['local_snaps'] > 0:
+                safemode = True
+                _force_arr = arr
+            if (stretch_info and stretch_info[0]
+                    and arr_force_sm.get(stretch_info[0])
+                    and row['replicated_pod_snaps'] > 0):
+                safemode = True
+                if not _force_arr:
+                    _force_arr = stretch_info[0]
+
             row['safemode'] = safemode
+            if safemode and _force_arr:
+                row['safemode_delay'] = arr_sm_delay.get(_force_arr, '')
             rows.append(row)
 
     rows.sort(key=lambda r: (r['array'].lower(),
@@ -1262,6 +1378,15 @@ def build_protection_html(per_array, config):
             sm_on = bool(r.get('safemode'))
             sm_text = 'Enabled' if sm_on else 'Disabled'
             sm_style = (_OK if sm_on else _BAD) + 'text-align:center;font-weight:bold;'
+            # When the row's safemode is array-wide (purearray
+            # eradication-config), append the Enabled Delay value as a
+            # second line (e.g., "2 Day Protection") below the status.
+            sm_delay = r.get('safemode_delay', '') if sm_on else ''
+            sm_inner = sm_text
+            if sm_delay:
+                sm_inner += (
+                    f'<br><span style="font-weight:normal;font-size:smaller;">'
+                    f'{_html.escape(sm_delay)}</span>')
             hosts_list = r.get('connected_hosts', [])
             hosts_ok = bool(hosts_list)
             hosts = (', '.join(_html.escape(h) for h in hosts_list)
@@ -1323,7 +1448,7 @@ def build_protection_html(per_array, config):
                 f'<td style="{_OK if local_n > 0 else _BAD}text-align:right;">{local_n}</td>'
                 f'<td style="{_OK if pod_n > 0 else _BAD}text-align:right;">{pod_n}</td>'
                 f'<td style="{_OK if rep_n > 0 else _BAD}text-align:right;">{rep_n}</td>'
-                f'<td style="{sm_style}">{sm_text}</td>'
+                f'<td style="{sm_style}">{sm_inner}</td>'
                 f'<td style="{_OK if pgs_ok else _BAD}">{pgs}</td>'
                 f'<td style="{_OK if snap_ret_n > 0 else _BAD}text-align:right;">{snap_ret_disp}</td>'
                 f'<td style="{_OK if repl_ret_n > 0 else _BAD}text-align:right;">{repl_ret_disp}</td>'
@@ -1381,6 +1506,15 @@ def build_protection_html(per_array, config):
             sm_text = 'Enabled' if sm_on else 'Disabled'
             sm_style = ((_OK if sm_on else _BAD)
                         + 'text-align:center;font-weight:bold;')
+            # Optional second line for array-wide safemode delay
+            # ("2 Day Protection" etc.); empty when safemode is off or
+            # the array's eradication-config does not force it.
+            sm_delay = r.get('safemode_delay', '') if sm_on else ''
+            sm_inner = sm_text
+            if sm_delay:
+                sm_inner += (
+                    f'<br><span style="font-weight:normal;font-size:smaller;">'
+                    f'{_html.escape(sm_delay)}</span>')
             tr_html_t2 += (
                 '<tr>'
                 f'<td>{_html.escape(dir_disp)}</td>'
@@ -1390,7 +1524,7 @@ def build_protection_html(per_array, config):
                 f'<td style="{_OK if remote_ok else _BAD}text-align:center;">{remote_pod}</td>'
                 f'<td style="{_OK if local_n > 0 else _BAD}text-align:right;">{local_n}</td>'
                 f'{rep_cell}'
-                f'<td style="{sm_style}">{sm_text}</td>'
+                f'<td style="{sm_style}">{sm_inner}</td>'
                 f'<td>{_DASH}</td>'
                 f'<td style="text-align:right;">{_DASH}</td>'
                 f'<td style="text-align:right;">{_DASH}</td>'
@@ -1422,9 +1556,9 @@ def build_protection_html(per_array, config):
     else:
         comments_toolbar = ''
 
-    # Modal markup + JS for the Protection Group detail popup. Rendered
-    # only when at least one array has profile data so empty datasets
-    # don't ship dead JS.
+    # Modal markup + JS for the Protection Group detail popup (Table 1).
+    # Rendered only when at least one array has pgroup profile data so
+    # empty datasets don't ship dead JS.
     if pg_profiles:
         modal_block = (
             '<div id="pg-modal" class="modal" '
@@ -1945,4 +2079,4 @@ def build_protection_html(per_array, config):
 """
 
 
-__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
+__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
