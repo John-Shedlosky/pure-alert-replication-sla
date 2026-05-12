@@ -540,26 +540,23 @@ def _parse_puredir_export_list_csv(text):
 
 def _parse_purepolicy_nfs_rule_list_csv(text):
     """Parse `purepolicy nfs rule list --csv` rows.
-    Returns {policy_name: [rule_dict, ...]} keyed by the policy name
-    column. Real Purity output titles that column `Name`; older /
-    alternate forms use `Policy`, so both are accepted. Each rule
-    dict preserves Client / Access / Permission(s) / Anonuid /
-    Anongid / Version / Security verbatim.
+    Returns {policy_name: [rule_dict, ...]} keyed by the Policy column
+    (the verbatim value that matches the Policy column of
+    `puredir export list --csv`). Each rule dict preserves Client /
+    Access / Permission / Anonuid / Anongid / Version / Security
+    verbatim.
     """
     out = {}
     for d in _csv_to_dicts(text):
-        policy = (d.get('Name') or d.get('Policy') or '').strip()
+        policy = (d.get('Policy') or '').strip()
         if not policy:
             continue
         out.setdefault(policy, []).append({
             'client':     (d.get('Client') or '').strip(),
             'access':     (d.get('Access') or '').strip(),
-            'permission': (d.get('Permission')
-                           or d.get('Permissions') or '').strip(),
-            'anonuid':    (d.get('Anonuid')
-                           or d.get('Anon UID') or '').strip(),
-            'anongid':    (d.get('Anongid')
-                           or d.get('Anon GID') or '').strip(),
+            'permission': (d.get('Permission') or '').strip(),
+            'anonuid':    (d.get('Anonuid') or '').strip(),
+            'anongid':    (d.get('Anongid') or '').strip(),
             'version':    (d.get('Version') or '').strip(),
             'security':   (d.get('Security') or '').strip()})
     return out
@@ -582,15 +579,14 @@ def _parse_purepolicy_nfs_list_csv(text):
 
 def _parse_purepolicy_smb_rule_list_csv(text):
     """Parse `purepolicy smb rule list --csv` rows.
-    Returns {policy_name: [rule_dict, ...]} keyed by the policy name
-    column. Real Purity output titles that column `Name`; older /
-    alternate forms use `Policy`, so both are accepted. Each rule
-    dict preserves Client / Anonymous Access Allowed / SMB
-    Encryption Required verbatim.
+    Returns {policy_name: [rule_dict, ...]} keyed by the Policy column
+    (the verbatim value that matches the Policy column of
+    `puredir export list --csv`). Each rule dict preserves Client /
+    Anonymous Access Allowed / SMB Encryption Required verbatim.
     """
     out = {}
     for d in _csv_to_dicts(text):
-        policy = (d.get('Name') or d.get('Policy') or '').strip()
+        policy = (d.get('Policy') or '').strip()
         if not policy:
             continue
         out.setdefault(policy, []).append({
@@ -1687,6 +1683,38 @@ def build_protection_html(per_array, config):
     now_str = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p")
     rows    = aggregate_fa_volume_rows(per_array)
     saved_comments = _load_recent_comments()
+
+    # Debug dump: surface the verbatim purepolicy capture so the GUI
+    # log shows whether the rule / list parsers found anything for
+    # each array. Printed once per build so the size stays bounded;
+    # values are pretty-printed JSON for readability.
+    print('=' * 72)
+    print('purepolicy debug dump (NFS / SMB) — per array')
+    print('=' * 72)
+    for _arr in sorted(per_array.keys()):
+        _info  = per_array.get(_arr) or {}
+        _nfs_r = _info.get('policy_nfs_rules') or {}
+        _nfs_l = _info.get('policy_nfs_list')  or {}
+        _smb_r = _info.get('policy_smb_rules') or {}
+        _smb_l = _info.get('policy_smb_list')  or {}
+        _exps  = _info.get('dir_exports')      or []
+        print(f'\n[{_arr}]')
+        print(f'  dir_exports ({len(_exps)} rows):')
+        for _e in _exps:
+            print(f'    directory={_e.get("directory","")!r} '
+                  f'export_name={_e.get("export_name","")!r} '
+                  f'policy={_e.get("policy","")!r} '
+                  f'type={_e.get("type","")!r} '
+                  f'enabled={_e.get("enabled","")!r}')
+        print(f'  policy_nfs_rules keys: {sorted(_nfs_r.keys())}')
+        print(f'  policy_nfs_rules: {_json.dumps(_nfs_r, indent=2)}')
+        print(f'  policy_nfs_list  keys: {sorted(_nfs_l.keys())}')
+        print(f'  policy_nfs_list : {_json.dumps(_nfs_l, indent=2)}')
+        print(f'  policy_smb_rules keys: {sorted(_smb_r.keys())}')
+        print(f'  policy_smb_rules: {_json.dumps(_smb_r, indent=2)}')
+        print(f'  policy_smb_list  keys: {sorted(_smb_l.keys())}')
+        print(f'  policy_smb_list : {_json.dumps(_smb_l, indent=2)}')
+    print('=' * 72)
 
     # Per-array error banner contents.
     err_lines = []
