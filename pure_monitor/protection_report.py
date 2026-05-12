@@ -540,21 +540,26 @@ def _parse_puredir_export_list_csv(text):
 
 def _parse_purepolicy_nfs_rule_list_csv(text):
     """Parse `purepolicy nfs rule list --csv` rows.
-    Returns {policy_name: [rule_dict, ...]} keyed by the Policy column.
-    Each rule dict preserves Client / Access / Permission / Anonuid /
+    Returns {policy_name: [rule_dict, ...]} keyed by the policy name
+    column. Real Purity output titles that column `Name`; older /
+    alternate forms use `Policy`, so both are accepted. Each rule
+    dict preserves Client / Access / Permission(s) / Anonuid /
     Anongid / Version / Security verbatim.
     """
     out = {}
     for d in _csv_to_dicts(text):
-        policy = (d.get('Policy') or '').strip()
+        policy = (d.get('Name') or d.get('Policy') or '').strip()
         if not policy:
             continue
         out.setdefault(policy, []).append({
             'client':     (d.get('Client') or '').strip(),
             'access':     (d.get('Access') or '').strip(),
-            'permission': (d.get('Permission') or '').strip(),
-            'anonuid':    (d.get('Anonuid') or '').strip(),
-            'anongid':    (d.get('Anongid') or '').strip(),
+            'permission': (d.get('Permission')
+                           or d.get('Permissions') or '').strip(),
+            'anonuid':    (d.get('Anonuid')
+                           or d.get('Anon UID') or '').strip(),
+            'anongid':    (d.get('Anongid')
+                           or d.get('Anon GID') or '').strip(),
             'version':    (d.get('Version') or '').strip(),
             'security':   (d.get('Security') or '').strip()})
     return out
@@ -577,13 +582,15 @@ def _parse_purepolicy_nfs_list_csv(text):
 
 def _parse_purepolicy_smb_rule_list_csv(text):
     """Parse `purepolicy smb rule list --csv` rows.
-    Returns {policy_name: [rule_dict, ...]} keyed by the Policy column.
-    Each rule dict preserves Client / Anonymous Access Allowed / SMB
+    Returns {policy_name: [rule_dict, ...]} keyed by the policy name
+    column. Real Purity output titles that column `Name`; older /
+    alternate forms use `Policy`, so both are accepted. Each rule
+    dict preserves Client / Anonymous Access Allowed / SMB
     Encryption Required verbatim.
     """
     out = {}
     for d in _csv_to_dicts(text):
-        policy = (d.get('Policy') or '').strip()
+        policy = (d.get('Name') or d.get('Policy') or '').strip()
         if not policy:
             continue
         out.setdefault(policy, []).append({
