@@ -1736,13 +1736,17 @@ def build_protection_html(per_array, config):
                 'rules':          rules.get(nm, [])}
     policy_profiles_json = _json.dumps(policy_profiles)
 
-    # Per-(array, export_name) profile for the Connected Hosts modal
-    # in Table 2. Each entry preserves the verbatim columns from
-    # `puredir export list` (Server, Path, Policy, Type, Enabled),
-    # plus per-type rule/policy detail pulled from the matching
-    # `purepolicy <nfs|smb> rule list` and `purepolicy <nfs|smb> list`
-    # outputs. The 'kind' field tells the JS which column set to
-    # render in the secondary tables.
+    # Per-(array, export_name) profile for the Exports modal in Table
+    # 2. Each entry has the shared directory/server/path columns from
+    # `puredir export list` plus a 'bindings' list. One binding is
+    # produced per CSV row (one per export-to-policy attachment), so
+    # an export that exposes both NFS and SMB \u2014 or multiple rule
+    # policies of the same kind \u2014 renders one section per
+    # binding in the modal. Each binding carries the policy name,
+    # raw type / enabled fields, the resolved 'kind' (nfs / smb)
+    # used to pick the right rule + policy-attr column sets, and
+    # the matched rules + policy-level attributes from
+    # `purepolicy <kind> rule list` / `purepolicy <kind> list`.
     export_profiles = {}
     for arr, info in per_array.items():
         nfs_rules = info.get('policy_nfs_rules') or {}
@@ -1765,16 +1769,21 @@ def build_protection_html(per_array, config):
                 policy_block = nfs_list.get(polnm, {})
             else:
                 rules_block, policy_block = [], {}
-            export_profiles.setdefault(arr, {})[en] = {
-                'directory':    exp.get('directory', ''),
-                'server':       exp.get('server', ''),
-                'path':         exp.get('path', ''),
+            prof = export_profiles.setdefault(arr, {}).get(en)
+            if prof is None:
+                prof = {
+                    'directory': exp.get('directory', ''),
+                    'server':    exp.get('server', ''),
+                    'path':      exp.get('path', ''),
+                    'bindings':  []}
+                export_profiles[arr][en] = prof
+            prof['bindings'].append({
                 'policy':       polnm,
                 'type':         exp.get('type', ''),
                 'enabled':      exp.get('enabled', ''),
                 'kind':         kind,
                 'rules':        rules_block,
-                'policy_attrs': policy_block}
+                'policy_attrs': policy_block})
     export_profiles_json = _json.dumps(export_profiles)
 
     # Per-(array, directory) export listing for the Directory-name
@@ -2152,10 +2161,7 @@ def build_protection_html(per_array, config):
             '<h3 id="export-title"></h3>'
             '<p class="meta" id="export-meta"></p>'
             '<div id="export-detail"></div>'
-            '<h4 id="export-rules-h" style="display:none;">Export Rules</h4>'
-            '<div id="export-rules"></div>'
-            '<h4 id="export-policy-h" style="display:none;">Policy Attributes</h4>'
-            '<div id="export-policy"></div>'
+            '<div id="export-bindings"></div>'
             '</div></div>')
     if _has_dir:
         modal_block_parts.append(
@@ -2311,17 +2317,21 @@ def build_protection_html(per_array, config):
                 'document.getElementById("policy-rules").innerHTML=h;'
                 'document.getElementById("policy-modal").style.display="flex";}\n')
         if _has_export:
-            # Export modal: three stacked tables.
-            #   1) verbatim columns from `puredir export list`
-            #      (directory / server / path / policy / type /
-            #      enabled). The CSV's Enabled column is empty when
-            #      the export is enabled and reads "Policy Disabled"
-            #      when it is not, so the renderer maps an empty
-            #      string to the literal "Enabled".
-            #   2) per-rule detail from `purepolicy <kind> rule
-            #      list`, selected by the export's type (smb vs
-            #      nfs). Suppressed when no rules are attached.
-            #   3) policy-level attributes from `purepolicy <kind>
+            # Export modal: a single "Export Info" header table with
+            # the shared directory/server/path columns from
+            # `puredir export list`, followed by one section per
+            # binding. Each binding is one CSV row attaching the
+            # export to a policy, so an export carrying both NFS and
+            # SMB \u2014 or multiple rule policies of the same kind
+            # \u2014 renders one section per attachment. A section
+            # contains:
+            #   1) Policy / Type / Enabled header (CSV Enabled is
+            #      empty for enabled exports and "Policy Disabled"
+            #      when not, so the renderer maps those to "Enabled"
+            #      / "Disabled").
+            #   2) Per-rule detail from `purepolicy <kind> rule
+            #      list`. Suppressed when no rules are attached.
+            #   3) Policy-level attributes from `purepolicy <kind>
             #      list`. Suppressed when no attributes are present.
             # NFS_RULE_COLS / SMB_RULE_COLS hold paired [key, label]
             # tuples so the table headers stay readable while the
@@ -2344,6 +2354,10 @@ def build_protection_html(per_array, config):
                 'const SMB_POLICY_COLS=['
                 '["access_based_enumeration_enabled","Access Based Enumeration Enabled"],'
                 '["continuous_availability_enabled","Continuous Availability Enabled"]];\n'
+                'function fmtExpEnabled(v){'
+                'if(!v||!v.length)return "Enabled";'
+                'if(String(v).toLowerCase()==="policy disabled")return "Disabled";'
+                'return v;}\n'
                 'function renderExportRules(rules,cols){'
                 'if(!rules||!rules.length)return "";'
                 'let h=\'<table class="pg-detail"><thead><tr>\';'
@@ -2361,37 +2375,46 @@ def build_protection_html(per_array, config):
                 'cols.forEach(c=>{h+=\'<tr><th>\'+escHtml(c[1])+\'</th><td>\''
                 '+escHtml(attrs[c[0]]||"")+\'</td></tr>\';});'
                 'return h+\'</tbody></table>\';}\n'
+                'function renderBinding(b){'
+                'const kind=b.kind||"";'
+                'const ruleCols=(kind==="smb")?SMB_RULE_COLS:'
+                '((kind==="nfs")?NFS_RULE_COLS:[]);'
+                'const polCols=(kind==="smb")?SMB_POLICY_COLS:'
+                '((kind==="nfs")?NFS_POLICY_COLS:[]);'
+                'const polNm=b.policy||"";'
+                'const title=polNm?("Policy - "+polNm):"Policy";'
+                'let h=\'<h4 style="margin-top:1em;">\'+escHtml(title)+\'</h4>\';'
+                'h+=\'<table class="pg-detail"><tbody>\''
+                '+\'<tr><th>Policy</th><td>\'+escHtml(polNm)+\'</td></tr>\''
+                '+\'<tr><th>Type</th><td>\'+escHtml(b.type||"")+\'</td></tr>\''
+                '+\'<tr><th>Enabled</th><td>\'+escHtml(fmtExpEnabled(b.enabled))+\'</td></tr>\''
+                '+\'</tbody></table>\';'
+                'const rulesHtml=renderExportRules(b.rules,ruleCols);'
+                'if(rulesHtml){h+=\'<h5 style="margin-top:0.5em;">Export Rules</h5>\'+rulesHtml;}'
+                'const polHtml=renderExportPolicy(b.policy_attrs,polCols);'
+                'if(polHtml){h+=\'<h5 style="margin-top:0.5em;">Policy Attributes</h5>\'+polHtml;}'
+                'return h;}\n'
                 'function showExport(el){'
                 'const arr=el.getAttribute("data-arr"),en=el.getAttribute("data-exp");'
                 'const data=(EXPORT_PROFILES[arr]||{})[en]||null;'
                 'document.getElementById("export-title").textContent='
                 '"Export Details - "+en;'
                 'document.getElementById("export-meta").textContent="Source array: "+arr;'
-                'let h;'
-                'if(!data){h=\'<p style="color:#888;">No data.</p>\';}'
-                'else{const enDisp=(data.enabled&&data.enabled.length)?data.enabled:"Enabled";'
-                'h=\'<table class="pg-detail"><tbody>\''
+                'let detailHtml,bindHtml="";'
+                'if(!data){detailHtml=\'<p style="color:#888;">No data.</p>\';}'
+                'else{'
+                'detailHtml=\'<table class="pg-detail"><tbody>\''
                 '+\'<tr><th>Directory</th><td>\'+escHtml(data.directory||"")+\'</td></tr>\''
                 '+\'<tr><th>Server</th><td>\'+escHtml(data.server||"")+\'</td></tr>\''
                 '+\'<tr><th>Path</th><td>\'+escHtml(data.path||"")+\'</td></tr>\''
-                '+\'<tr><th>Policy</th><td>\'+escHtml(data.policy||"")+\'</td></tr>\''
-                '+\'<tr><th>Type</th><td>\'+escHtml(data.type||"")+\'</td></tr>\''
-                '+\'<tr><th>Enabled</th><td>\'+escHtml(enDisp)+\'</td></tr>\''
-                '+\'</tbody></table>\';}'
-                'document.getElementById("export-detail").innerHTML=h;'
-                'const kind=data?(data.kind||""):"";'
-                'const ruleCols=(kind==="smb")?SMB_RULE_COLS:'
-                '((kind==="nfs")?NFS_RULE_COLS:[]);'
-                'const polCols=(kind==="smb")?SMB_POLICY_COLS:'
-                '((kind==="nfs")?NFS_POLICY_COLS:[]);'
-                'const rulesHtml=data?renderExportRules(data.rules,ruleCols):"";'
-                'const polHtml=data?renderExportPolicy(data.policy_attrs,polCols):"";'
-                'document.getElementById("export-rules").innerHTML=rulesHtml;'
-                'document.getElementById("export-rules-h").style.display='
-                'rulesHtml?"block":"none";'
-                'document.getElementById("export-policy").innerHTML=polHtml;'
-                'document.getElementById("export-policy-h").style.display='
-                'polHtml?"block":"none";'
+                '+\'<tr><th>Export Name</th><td>\'+escHtml(en||"")+\'</td></tr>\''
+                '+\'</tbody></table>\';'
+                'const binds=data.bindings||[];'
+                'if(!binds.length){bindHtml=\'<p style="color:#888;">No policy bindings.</p>\';}'
+                'else{binds.forEach(b=>{bindHtml+=renderBinding(b);});}'
+                '}'
+                'document.getElementById("export-detail").innerHTML=detailHtml;'
+                'document.getElementById("export-bindings").innerHTML=bindHtml;'
                 'document.getElementById("export-modal").style.display="flex";}\n')
         if _has_dir:
             # Directory popup: list every `puredir export list` row
@@ -2454,7 +2477,7 @@ def build_protection_html(per_array, config):
         'Replicated Pod Snapshots', 'Safemode', 'Snapshot Policies',
         'Max Local Snap Retention (Days)', 'Max Repl Snap Retention (Days)',
         'Local Snap Retention vs SLA', 'Repl Snap Retention vs SLA',
-        'Connected Hosts', 'Non Protection Reasoning']
+        'Exports', 'Non Protection Reasoning']
     def _build_thead(cols):
         return ('<thead><tr>' + ''.join(
             f'<th class="sortable" onclick="sfHeaderClick(event,{i})">'
