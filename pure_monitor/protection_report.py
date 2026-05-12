@@ -175,6 +175,25 @@ def _fake_protection_data_for(array):
     else:
         eradication = {'Manual Eradication': 'all-enabled',
                        'Enabled Delay': ''}
+    # Snapshot policies: the bare 'daily' policy is enabled with a
+    # 7-day local rule; 'daily-locked' is enabled and ratcheted in
+    # policy_locks so pod-stretched directories demo Safemode=Enabled.
+    policy_snapshots = [
+        {'name': 'daily',        'pod': None, 'policy': 'daily',        'enabled': 'true'},
+        {'name': 'daily-locked', 'pod': None, 'policy': 'daily-locked', 'enabled': 'true'}]
+    policy_rules = {
+        'daily':        [{'every': '1d', 'at': '02:00',
+                          'keep_for': '7d', 'client_name': '',
+                          'suffix': 'daily'}],
+        'daily-locked': [{'every': '1d', 'at': '03:00',
+                          'keep_for': '14d', 'client_name': '',
+                          'suffix': 'daily'}]}
+    # Synthetic export listing: every home:users dir exposes one NFS
+    # export; pod-stretched data dirs additionally expose an SMB share.
+    dir_exports = [
+        {'directory': 'home:users', 'export_name': f'{array}_users_nfs',
+         'server': f'{array}-server01', 'path': '/users', 'policy': 'nfs-default',
+         'type': 'nfs', 'enabled': 'True'}]
     if array in pod_pairs:
         _lp = pod_pairs[array][1]
         filesystems.append({'name': f'{_lp}::shared_fs',
@@ -185,6 +204,11 @@ def _fake_protection_data_for(array):
                               'policy': 'daily-locked'})
         dir_snapshots.append({'name': f'{_lp}::shared_fs:data.daily.2',
                               'policy': 'daily-locked'})
+        dir_exports.append({
+            'directory': f'{_lp}::shared_fs:data',
+            'export_name': f'{_lp}_data_smb',
+            'server': f'{_lp}-smb01', 'path': '/data',
+            'policy': 'smb-default', 'type': 'smb', 'enabled': 'True'})
     return {'volumes': volumes, 'pod_links': pod_links, 'snapshots': snapshots,
             'pgroups': pgroups, 'pgroup_locks': pgroup_locks,
             'pgroup_schedules': pgroup_schedules,
@@ -193,6 +217,9 @@ def _fake_protection_data_for(array):
             'filesystems': filesystems, 'directories': directories,
             'dir_snapshots': dir_snapshots,
             'policy_locks': policy_locks,
+            'policy_snapshots': policy_snapshots,
+            'policy_rules': policy_rules,
+            'dir_exports': dir_exports,
             'eradication': eradication, 'error': None}
 
 
@@ -425,11 +452,95 @@ def _fmt_eradication_delay(val):
     return s
 
 
+def _parse_purepolicy_snapshot_list_csv(text):
+    """Parse `purepolicy snapshot list --csv` rows.
+    Returns [{'name','pod','policy','enabled'}, ...] where 'name' is the
+    verbatim Name column (including any `pod::` prefix), 'pod' is the
+    extracted pod prefix or None, and 'policy' is the bare policy name.
+    'enabled' is the Enabled column lowercased ('true'/'false').
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        if '::' in name:
+            pod, pol = name.split('::', 1)
+        else:
+            pod, pol = None, name
+        out.append({'name': name, 'pod': pod, 'policy': pol,
+                    'enabled': (d.get('Enabled') or '').strip().lower()})
+    return out
+
+
+def _parse_purepolicy_snapshot_rule_list_csv(text):
+    """Parse `purepolicy snapshot rule list --csv` rows.
+    Returns {policy_full_name: [rule_dict, ...]} keyed by the verbatim
+    Policy column (which includes any `pod::` prefix). Each rule dict
+    preserves Every / At / Keep For / Client Name / Suffix verbatim.
+    """
+    out = {}
+    for d in _csv_to_dicts(text):
+        policy = (d.get('Policy') or d.get('Name') or '').strip()
+        if not policy:
+            continue
+        out.setdefault(policy, []).append({
+            'every':       (d.get('Every') or '').strip(),
+            'at':          (d.get('At') or '').strip(),
+            'keep_for':    (d.get('Keep For') or '').strip(),
+            'client_name': (d.get('Client Name') or '').strip(),
+            'suffix':      (d.get('Suffix') or '').strip()})
+    return out
+
+
+def _parse_puredir_export_list_csv(text):
+    """Parse `puredir export list --csv` rows.
+    Returns [{'directory','export_name','server','path','policy',
+    'type','enabled'}, ...]. 'directory' carries the Directory column
+    verbatim (`[pod::]fs:dir`); the lookup against the Table 2 row uses
+    that same form so pod-scoped directories match.
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        directory = (d.get('Directory') or '').strip()
+        if not directory:
+            continue
+        out.append({
+            'directory':   directory,
+            'export_name': (d.get('Export Name') or d.get('Name') or '').strip(),
+            'server':      (d.get('Server') or '').strip(),
+            'path':        (d.get('Path') or '').strip(),
+            'policy':      (d.get('Policy') or '').strip(),
+            'type':        (d.get('Type') or '').strip(),
+            'enabled':     (d.get('Enabled') or '').strip()})
+    return out
+
+
+def _parse_retention_to_days(val):
+    """Convert a Purity 'Keep For' value (e.g., '7d', '12h', '604800')
+    into whole days. Strings like '7d' / '1w' are parsed via
+    parse_time_to_seconds; raw integer strings are interpreted as
+    seconds. Returns 0 when the input is empty or unparseable.
+    """
+    s = (val or '').strip()
+    if not s:
+        return 0
+    try:
+        secs = parse_time_to_seconds(s)
+    except Exception:
+        secs = 0
+    if not secs:
+        try:
+            secs = int(s)
+        except Exception:
+            return 0
+    return int(secs) // 86400
+
+
 def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
-    """Issue the three FlashArray protection commands and parse their output.
-    Returns {'volumes', 'pod_links', 'snapshots', 'error'}. Errors on a
-    single command are non-fatal: that section returns [] and the error
-    text is recorded in 'error'.
+    """Issue the FlashArray protection commands and parse their output.
+    Returns {'volumes', 'pod_links', 'snapshots', 'error', 'policy_snapshots',
+    'policy_rules', 'dir_exports'}.
     """
     if ALERT_DEBUG:
         return _fake_protection_data_for(array)
@@ -438,6 +549,7 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
            'pgroup_retentions': {}, 'connections': [],
            'filesystems': [], 'directories': [], 'dir_snapshots': [],
            'policy_locks': {}, 'eradication': {},
+           'policy_snapshots': [], 'policy_rules': {}, 'dir_exports': [],
            'error': None}
     _errs = []
     try:
@@ -528,6 +640,24 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
                 log_list=detailed_logs, nogui=nogui))
     except Exception as e:
         _errs.append(f"purearray eradication-config list: {e}")
+    try:
+        out['policy_snapshots'] = _parse_purepolicy_snapshot_list_csv(run_ssh_command(
+            array, user, "purepolicy snapshot list --csv",
+            log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purepolicy snapshot list: {e}")
+    try:
+        out['policy_rules'] = _parse_purepolicy_snapshot_rule_list_csv(run_ssh_command(
+            array, user, "purepolicy snapshot rule list --csv",
+            log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purepolicy snapshot rule list: {e}")
+    try:
+        out['dir_exports'] = _parse_puredir_export_list_csv(run_ssh_command(
+            array, user, "puredir export list --csv",
+            log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"puredir export list: {e}")
     if _errs:
         out['error'] = "; ".join(_errs)
     return out
@@ -592,7 +722,8 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
                             'pgroup_retentions': {}, 'connections': [],
                             'filesystems': [], 'directories': [],
                             'dir_snapshots': [], 'policy_locks': {},
-                            'eradication': {}}
+                            'policy_snapshots': [], 'policy_rules': {},
+                            'dir_exports': [], 'eradication': {}}
         if platform == 'FA':
             fa_targets.append((_name, info.get('user')
                                       or auth_user_for_array(_name, config)))
@@ -1031,20 +1162,9 @@ def aggregate_fa_volume_rows(per_array):
 
 def aggregate_fa_filesystem_rows(per_array):
     """Build Table 2 rows from per-array filesystem inventory.
-
-    Each row corresponds to one directory on one array. Pod membership
-    is sourced from `purefs list` (a filesystem Name of `pod::fs` is
-    pod-scoped); replication destination and remote pod are read from
-    the pod's entry in `purepod replica-link list` when its Status is
-    'replicating'. Local snapshot count is derived from
-    `puredir snapshot list` rows whose Name starts with the
-    directory's `[pod::]fs:dir.` prefix.
-
-    Stretched-pod directories appear on both arrays. The dest-side
-    rows are dropped so each directory is rendered once, anchored at
-    the source side as determined by the replica-link Direction
-    column ('-->' source, '<--' dest). The source-side row's Array
-    Name displays the stretch as 'source -> dest' to mirror Table 1.
+    
+    Returns rows with snapshot policy details, retention calculations,
+    and export information.
     """
     # Map (arr, fs_token) -> pod_or_None. The fs_token is the value
     # that appears in the `fs` portion of the directory's Name in
@@ -1101,6 +1221,78 @@ def aggregate_fa_filesystem_rows(per_array):
         arr_force_sm[arr] = (me == 'all-disabled')
         arr_sm_delay[arr] = _fmt_eradication_delay(erad.get('Enabled Delay'))
 
+    # Build policy objects per array
+    policy_objects = {}  # (arr, policy_name) -> {enabled, retention_lock, deletion, rules}
+    for arr, data in per_array.items():
+        for pol in data.get('policy_snapshots', []):
+            key = (arr, pol['name'])
+            policy_objects[key] = {
+                'name': pol['name'],
+                'pod': pol.get('pod'),
+                'policy': pol.get('policy'),
+                'enabled': pol['enabled'],
+                'retention_lock': '',
+                'deletion': '',
+                'rules': []
+            }
+        
+        # Merge retention lock info
+        policy_locks = data.get('policy_locks', {}) or {}
+        for pol_name, lock_state in policy_locks.items():
+            key = (arr, pol_name)
+            if key in policy_objects:
+                policy_objects[key]['retention_lock'] = lock_state
+        
+        # Merge rules
+        policy_rules = data.get('policy_rules', {}) or {}
+        for pol_name, rules in policy_rules.items():
+            key = (arr, pol_name)
+            if key in policy_objects:
+                policy_objects[key]['rules'] = rules
+    
+    # Map directories to their snapshot policies via dir_snapshots. A
+    # snapshot's Name is `[pod::]fs:directory.<suffix>` where the suffix
+    # itself can contain dots, so the only reliable extraction is by
+    # prefix-matching against the array's known directories. The
+    # source-side dir_snapshots feed the local policy set; pod-stretched
+    # directories additionally collect policies from the destination
+    # array's dir_snapshots (the replicated copies under `peer_pod::`).
+    dir_policies = {}  # (arr, fs_token, directory) -> [policy_names]
+    for arr, data in per_array.items():
+        snaps = data.get('dir_snapshots', []) or []
+        for d in data.get('directories', []) or []:
+            fs_token  = d.get('fs', '')
+            directory = d.get('directory', '')
+            if not fs_token or not directory:
+                continue
+            fs_bare = (fs_token.split('::', 1)[1]
+                       if '::' in fs_token else fs_token)
+            pod = _resolve_pod(arr, fs_token)
+            prefix = (f'{pod}::{fs_bare}:{directory}.' if pod
+                      else f'{fs_bare}:{directory}.')
+            ordered = []
+            seen = set()
+            for snap in snaps:
+                if (snap.get('name') or '').startswith(prefix):
+                    pol = (snap.get('policy') or '').strip()
+                    if pol and pol not in seen:
+                        seen.add(pol)
+                        ordered.append(pol)
+            if ordered:
+                dir_policies[(arr, fs_token, directory)] = ordered
+
+    # Map directories to exports
+    dir_exports = {}  # (arr, directory_name) -> [export_objects]
+    for arr, data in per_array.items():
+        for exp in data.get('dir_exports', []):
+            directory = exp.get('directory', '')
+            if not directory:
+                continue
+            key = (arr, directory)
+            if key not in dir_exports:
+                dir_exports[key] = []
+            dir_exports[key].append(exp)
+    
     # Drop set: dest-side directories of stretched pods. The matching
     # source-side row carries the directory once, with the Array Name
     # column rendered as "source -> dest".
@@ -1130,6 +1322,8 @@ def aggregate_fa_filesystem_rows(per_array):
             # puredir; preserve any pod prefix it may carry.
             row = {
                 'array': arr,
+                'source_array': arr,
+                'peer_array': '',
                 'fs':        fs_bare,
                 'fs_token':  fs_token,
                 'directory': directory,
@@ -1148,6 +1342,7 @@ def aggregate_fa_filesystem_rows(per_array):
                 peer_arr, peer_pod, role = stretch_info
                 if peer_arr:
                     row['replication_destinations'] = [peer_arr]
+                    row['peer_array'] = peer_arr
                 row['remote_pod'] = peer_pod
                 # Source-side rows display the stretch direction in
                 # the Array Name column; dest-side rows are already
@@ -1155,6 +1350,68 @@ def aggregate_fa_filesystem_rows(per_array):
                 if role == 'source':
                     row['array'] = f'{arr} \u2192 {peer_arr}'
 
+            # Snapshot policies for this directory. The source-array's
+            # policies come from its own dir_snapshots; pod-stretched
+            # directories also pull policies from the peer array's
+            # replicated copies so the cell reflects every enabled
+            # policy retaining a snapshot for the directory.
+            dir_key = (arr, fs_token, directory)
+            policies = list(dir_policies.get(dir_key, []))
+            if stretch_info:
+                _peer_arr, _peer_pod, _ = stretch_info
+                _peer_key = (_peer_arr, f'{_peer_pod}::{fs_bare}', directory)
+                for _pol in dir_policies.get(_peer_key, []):
+                    if _pol not in policies:
+                        policies.append(_pol)
+
+            # policy_objects is keyed by (array, policy_name) where
+            # policy_name is the verbatim Name column from
+            # `purepolicy snapshot list`. The snapshot's `policy` field
+            # in `puredir snapshot list` may carry just the bare policy
+            # for non-pod policies; pod-scoped policies show up under
+            # the peer array's policy_objects map, so try both arrays.
+            def _resolve_policy_obj(pol_name):
+                obj = policy_objects.get((arr, pol_name))
+                if obj is None and stretch_info:
+                    obj = policy_objects.get((stretch_info[0], pol_name))
+                return obj
+
+            # Max local retention: longest Keep For across the enabled
+            # policies' rules. Max repl retention mirrors local, but is
+            # only meaningful when the directory's pod has a replica
+            # link (replication is pod-mediated).
+            max_local_days = 0
+            for pol_name in policies:
+                pol_obj = _resolve_policy_obj(pol_name)
+                if pol_obj and (pol_obj.get('enabled') or '').lower() == 'true':
+                    for rule in pol_obj.get('rules', []):
+                        days = _parse_retention_to_days(rule.get('keep_for', ''))
+                        if days > max_local_days:
+                            max_local_days = days
+            max_repl_days = max_local_days if stretch_info else 0
+
+            # Connected hosts: a directory may have multiple exports
+            # (one NFS + one SMB, etc.). Preserve order of appearance.
+            export_key = (arr, d.get('name', ''))
+            exports = dir_exports.get(export_key, [])
+            export_names = []
+            export_objects = {}
+            for e in exports:
+                en = e.get('export_name') or e.get('policy') or ''
+                if not en or en in export_objects:
+                    continue
+                export_names.append(en)
+                export_objects[en] = e
+
+            row.update({
+                'snapshot_policies': policies,
+                'policy_objects': {p: _resolve_policy_obj(p) for p in policies},
+                'max_local_retention_days': max_local_days,
+                'max_repl_retention_days': max_repl_days,
+                'connected_hosts':  export_names,
+                'export_objects':   export_objects,
+            })
+            
             # Safemode is Enabled if ANY snapshot associated with the
             # directory is produced by a policy whose Retention Lock is
             # 'ratcheted' in `purepolicy snapshot retention-lock list`.
@@ -1325,6 +1582,47 @@ def build_protection_html(per_array, config):
             k: {'schedule': sched.get(k, {}), 'retention': rete.get(k, {})}
             for k in keys}
     profiles_json = _json.dumps(pg_profiles)
+
+    # Per-(array, snapshot_policy) profile for the Table 2 modal. Each
+    # entry carries the policy's Enabled state, Retention Lock (from
+    # `purepolicy snapshot retention-lock list`), and the list of rules
+    # (every / at / keep_for) from `purepolicy snapshot rule list`. The
+    # modal looks the entry up by the link's data-arr / data-pol attrs.
+    policy_profiles = {}
+    for arr, info in per_array.items():
+        snaps = info.get('policy_snapshots') or []
+        if not snaps:
+            continue
+        locks = info.get('policy_locks') or {}
+        rules = info.get('policy_rules') or {}
+        policy_profiles[arr] = {}
+        for pol in snaps:
+            nm = pol.get('name', '')
+            if not nm:
+                continue
+            policy_profiles[arr][nm] = {
+                'enabled':        pol.get('enabled', ''),
+                'retention_lock': locks.get(nm, ''),
+                'rules':          rules.get(nm, [])}
+    policy_profiles_json = _json.dumps(policy_profiles)
+
+    # Per-(array, export_name) profile for the Connected Hosts modal in
+    # Table 2. Each entry preserves the verbatim columns from
+    # `puredir export list` (Server, Path, Policy, Type, Enabled).
+    export_profiles = {}
+    for arr, info in per_array.items():
+        for exp in (info.get('dir_exports') or []):
+            en = exp.get('export_name') or exp.get('policy') or ''
+            if not en:
+                continue
+            export_profiles.setdefault(arr, {})[en] = {
+                'directory': exp.get('directory', ''),
+                'server':    exp.get('server', ''),
+                'path':      exp.get('path', ''),
+                'policy':    exp.get('policy', ''),
+                'type':      exp.get('type', ''),
+                'enabled':   exp.get('enabled', '')}
+    export_profiles_json = _json.dumps(export_profiles)
 
     # Cells for the protection-related columns are shaded based on
     # whether they carry meaningful content. Numeric snapshot cells use
@@ -1515,6 +1813,68 @@ def build_protection_html(per_array, config):
                 sm_inner += (
                     f'<br><span style="font-weight:normal;font-size:smaller;">'
                     f'{_html.escape(sm_delay)}</span>')
+            # Snapshot policies cell: each name clickable; resolves to
+            # source array first, peer array as fallback (pod-scoped
+            # policies may exist only on the peer side).
+            _src_arr  = r.get('source_array') or r['array']
+            _peer_arr = r.get('peer_array') or ''
+            def _pol_owner(pname, _s=_src_arr, _p=_peer_arr):
+                if pname in (policy_profiles.get(_s) or {}):
+                    return _s
+                if _p and pname in (policy_profiles.get(_p) or {}):
+                    return _p
+                return _s
+            pols_list = r.get('snapshot_policies') or []
+            pols_ok = bool(pols_list)
+            pols_cell = (', '.join(
+                f'<a href="#" class="pg-link" '
+                f'data-arr="{_html.escape(_pol_owner(p), quote=True)}" '
+                f'data-pol="{_html.escape(p, quote=True)}" '
+                f'onclick="showPolicy(this);return false;">{_html.escape(p)}</a>'
+                for p in pols_list) if pols_ok else _DASH)
+            # Connected hosts cell: each export name clickable, bound
+            # to the source array's export_profiles entry.
+            exp_list = r.get('connected_hosts') or []
+            exp_ok = bool(exp_list)
+            exp_cell = (', '.join(
+                f'<a href="#" class="pg-link" '
+                f'data-arr="{_html.escape(_src_arr, quote=True)}" '
+                f'data-exp="{_html.escape(e, quote=True)}" '
+                f'onclick="showExport(this);return false;">{_html.escape(e)}</a>'
+                for e in exp_list) if exp_ok else _DASH)
+            # Max Local / Repl Snap Retention (Days).
+            loc_ret_n  = int(r.get('max_local_retention_days', 0))
+            repl_ret_n = int(r.get('max_repl_retention_days', 0))
+            loc_ret_disp  = (str(loc_ret_n)  if loc_ret_n  > 0 else _DASH)
+            repl_ret_disp = (str(repl_ret_n) if repl_ret_n > 0 else _DASH)
+            # SLA comparison cells. A threshold of 0 disables the
+            # check (neutral dash); otherwise green check when the
+            # row's retention meets the threshold and the row is
+            # eligible (policies present; pod replica link for the
+            # repl side). Red with a short reason on failure.
+            _CHECK_T2 = '\u2713'
+            _GREEN_T2 = (_OK + 'text-align:center;font-weight:bold;'
+                         'font-size:13pt;')
+            _RED_T2   = (_BAD + 'text-align:center;font-weight:bold;'
+                         'font-size:9pt;')
+            def _t2_local_sla():
+                if sla_snap_days <= 0:
+                    return f'<td style="text-align:center;">{_DASH}</td>'
+                if not pols_list:
+                    return f'<td style="{_RED_T2}">No Snapshot Policy</td>'
+                if loc_ret_n >= sla_snap_days:
+                    return f'<td style="{_GREEN_T2}">{_CHECK_T2}</td>'
+                return f'<td style="{_RED_T2}">Short Retention</td>'
+            def _t2_repl_sla():
+                if sla_repl_days <= 0:
+                    return f'<td style="text-align:center;">{_DASH}</td>'
+                if not rep_eligible:
+                    return f'<td style="{_RED_T2}">No Replica Link</td>'
+                if not pols_list:
+                    return f'<td style="{_RED_T2}">No Snapshot Policy</td>'
+                if repl_ret_n >= sla_repl_days:
+                    return f'<td style="{_GREEN_T2}">{_CHECK_T2}</td>'
+                return f'<td style="{_RED_T2}">Short Retention</td>'
             tr_html_t2 += (
                 '<tr>'
                 f'<td>{_html.escape(dir_disp)}</td>'
@@ -1525,12 +1885,12 @@ def build_protection_html(per_array, config):
                 f'<td style="{_OK if local_n > 0 else _BAD}text-align:right;">{local_n}</td>'
                 f'{rep_cell}'
                 f'<td style="{sm_style}">{sm_inner}</td>'
-                f'<td>{_DASH}</td>'
-                f'<td style="text-align:right;">{_DASH}</td>'
-                f'<td style="text-align:right;">{_DASH}</td>'
-                f'<td style="text-align:center;">{_DASH}</td>'
-                f'<td style="text-align:center;">{_DASH}</td>'
-                f'<td>{_DASH}</td>'
+                f'<td style="{_OK if pols_ok else _BAD}">{pols_cell}</td>'
+                f'<td style="{_OK if loc_ret_n > 0 else _BAD}text-align:right;">{loc_ret_disp}</td>'
+                f'<td style="{_OK if repl_ret_n > 0 else _BAD}text-align:right;">{repl_ret_disp}</td>'
+                f'{_t2_local_sla()}'
+                f'{_t2_repl_sla()}'
+                f'<td style="{_OK if exp_ok else _BAD}">{exp_cell}</td>'
                 f'<td>{_DASH}</td>'
                 '</tr>\n')
 
@@ -1556,102 +1916,194 @@ def build_protection_html(per_array, config):
     else:
         comments_toolbar = ''
 
-    # Modal markup + JS for the Protection Group detail popup (Table 1).
-    # Rendered only when at least one array has pgroup profile data so
-    # empty datasets don't ship dead JS.
-    if pg_profiles:
-        modal_block = (
+    # Modal markup + JS for the detail popups. Three modals coexist on
+    # the page: pg-modal (Table 1 protection groups), policy-modal
+    # (Table 2 snapshot policies), and export-modal (Table 2 connected
+    # hosts). Each is rendered only when at least one array has data
+    # for that modal so empty datasets don't ship dead JS. Shared
+    # helpers (escHtml, modal close, Escape handler) are emitted once
+    # whenever any of the three modals is present.
+    _has_pg     = bool(pg_profiles)
+    _has_policy = bool(policy_profiles)
+    _has_export = bool(export_profiles)
+    modal_block_parts = []
+    if _has_pg:
+        modal_block_parts.append(
             '<div id="pg-modal" class="modal" '
-            'onclick="closeModalIfBg(event)">'
+            'onclick="closeModalIfBg(event,\'pg-modal\')">'
             '<div class="modal-content">'
-            '<span class="modal-close" onclick="closeModal()">&times;</span>'
+            '<span class="modal-close" onclick="closeModalById(\'pg-modal\')">&times;</span>'
             '<h3 id="pg-title"></h3>'
             '<p class="meta" id="pg-array"></p>'
             '<h4>Schedule</h4><div id="pg-schedule"></div>'
             '<h4>Retention</h4><div id="pg-retention"></div>'
             '</div></div>')
-        script_block = (
-            '<script>\n'
-            'const PG_PROFILES = ' + profiles_json + ';\n'
+    if _has_policy:
+        modal_block_parts.append(
+            '<div id="policy-modal" class="modal" '
+            'onclick="closeModalIfBg(event,\'policy-modal\')">'
+            '<div class="modal-content">'
+            '<span class="modal-close" onclick="closeModalById(\'policy-modal\')">&times;</span>'
+            '<h3 id="policy-title"></h3>'
+            '<p class="meta" id="policy-meta"></p>'
+            '<h4>Rules</h4><div id="policy-rules"></div>'
+            '</div></div>')
+    if _has_export:
+        modal_block_parts.append(
+            '<div id="export-modal" class="modal" '
+            'onclick="closeModalIfBg(event,\'export-modal\')">'
+            '<div class="modal-content">'
+            '<span class="modal-close" onclick="closeModalById(\'export-modal\')">&times;</span>'
+            '<h3 id="export-title"></h3>'
+            '<p class="meta" id="export-meta"></p>'
+            '<div id="export-detail"></div>'
+            '</div></div>')
+    modal_block = '\n'.join(modal_block_parts)
+
+    if _has_pg or _has_policy or _has_export:
+        script_parts = ['<script>\n']
+        # Shared payload variables — emitted unconditionally for the
+        # modals that exist so the JS can reference them as constants.
+        if _has_pg:
+            script_parts.append('const PG_PROFILES = '
+                                + profiles_json + ';\n')
+        if _has_policy:
+            script_parts.append('const POLICY_PROFILES = '
+                                + policy_profiles_json + ';\n')
+        if _has_export:
+            script_parts.append('const EXPORT_PROFILES = '
+                                + export_profiles_json + ';\n')
+        # Shared helpers: HTML escape, modal open/close, Escape key.
+        script_parts.append(
             'function escHtml(s){'
             'return String(s).replace(/[&<>\"\\\']/g,'
             'ch=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","\\\'":"&#39;"})[ch]);'
             '}\n'
-            'function fmtSeconds(s){'
-            'if(!/^[0-9]+$/.test(String(s)))return s;'
-            'let n=parseInt(s,10);if(n===0)return "0 Seconds";'
-            'const d=Math.floor(n/86400);n-=d*86400;'
-            'const h=Math.floor(n/3600);n-=h*3600;'
-            'const m=Math.floor(n/60);n-=m*60;'
-            'const p=[];if(d)p.push(d+" Days");if(h)p.push(h+" Hours");'
-            'if(m)p.push(m+" Minutes");if(n)p.push(n+" Seconds");'
-            'return p.join(" ");}\n'
-            # Period Length comes from Purity in milliseconds; divide by
-            # 1000 before handing off to fmtSeconds. Non-numeric strings
-            # (e.g., already-formatted "1d" from older fixtures) pass
-            # through unchanged.
-            'function fmtMsAsSeconds(s){'
-            'if(!/^[0-9]+$/.test(String(s)))return fmtSeconds(s);'
-            'return fmtSeconds(String(Math.floor(parseInt(s,10)/1000)));}\n'
-            # Blackout cells arrive as "<start>-<end>" with each side
-            # being seconds past midnight. Render as "h:mm AM/PM-h:mm AM/PM".
-            'function fmtClock(s){'
-            'if(!/^[0-9]+$/.test(String(s)))return s;'
-            'const t=parseInt(s,10);'
-            'const h24=Math.floor(t/3600)%24,mm=Math.floor((t%3600)/60);'
-            'const ap=h24<12?"AM":"PM";let h=h24%12;if(h===0)h=12;'
-            'return h+":"+(mm<10?"0"+mm:mm)+" "+ap;}\n'
-            'function fmtBlackout(s){'
-            'if(s===""||s==null)return s;'
-            'const m=String(s).match(/^([0-9]+)-([0-9]+)$/);'
-            'if(!m)return s;'
-            'return fmtClock(m[1])+"-"+fmtClock(m[2]);}\n'
-            # Per-column formatters: keys are the Purity-native column
-            # names from the CSV. Anything not listed falls back to
-            # fmtSeconds. Header labels for the popup display only are
-            # remapped via PG_DISPLAY; the underlying profile keys stay
-            # the Purity-native names.
-            'const PG_FMT={'
-            '"Per Period":v=>String(v),'
-            '"Days":v=>String(v),'
-            '"Period Length":v=>fmtMsAsSeconds(v),'
-            '"Blackout":v=>fmtBlackout(v)};\n'
-            'const PG_DISPLAY={"All For":"Retained for",'
-            '"Per Period":"Additional Snaps Retained Per",'
-            '"Days":"For an Additional # of Days",'
-            '"Frequency":"Snapshot/Replication Frequency"};\n'
-            'function renderTable(o){'
-            'if(!o)return \'<p style="color:#888;">No data.</p>\';'
-            'const cols=Object.keys(o);'
-            'if(cols.length===0)return \'<p style="color:#888;">No data.</p>\';'
-            'const n=Math.max(0,...cols.map(c=>(o[c]||[]).length));'
-            'if(n===0)return \'<p style="color:#888;">No data.</p>\';'
-            'let h=\'<table class="pg-detail"><thead><tr>\';'
-            'cols.forEach(c=>{h+=\'<th>\'+escHtml(PG_DISPLAY[c]||c)+\'</th>\';});'
-            'h+=\'</tr></thead><tbody>\';'
-            'for(let i=0;i<n;i++){'
-            'h+=\'<tr>\';'
-            'cols.forEach(c=>{const v=(o[c]||[])[i];'
-            'const f=PG_FMT[c]||fmtSeconds;'
-            'const dv=(v===""||v==null)?null:f(v);'
-            'h+=\'<td>\'+(dv!==null&&dv!==""?escHtml(dv):\'<span style="color:#888;">&mdash;</span>\')+\'</td>\';});'
-            'h+=\'</tr>\';}'
-            'return h+\'</tbody></table>\';}\n'
-            'function showPg(el){'
-            'const arr=el.getAttribute("data-arr"),pg=el.getAttribute("data-pg");'
-            'const data=(PG_PROFILES[arr]||{})[pg]||null;'
-            'document.getElementById("pg-title").textContent='
-            '"Protection Group Details - "+pg;'
-            'document.getElementById("pg-array").textContent="Source array: "+arr;'
-            'document.getElementById("pg-schedule").innerHTML=renderTable(data&&data.schedule);'
-            'document.getElementById("pg-retention").innerHTML=renderTable(data&&data.retention);'
-            'document.getElementById("pg-modal").style.display="flex";}\n'
-            'function closeModal(){document.getElementById("pg-modal").style.display="none";}\n'
-            'function closeModalIfBg(e){if(e.target.id==="pg-modal")closeModal();}\n'
-            'document.addEventListener("keydown",e=>{if(e.key==="Escape")closeModal();});\n'
-            '</script>')
+            'function closeModalById(id){const m=document.getElementById(id);'
+            'if(m)m.style.display="none";}\n'
+            'function closeAllModals(){'
+            '["pg-modal","policy-modal","export-modal"].forEach(closeModalById);}\n'
+            'function closeModalIfBg(e,id){if(e.target.id===id)closeModalById(id);}\n'
+            'document.addEventListener("keydown",function(e){'
+            'if(e.key==="Escape")closeAllModals();});\n')
+        if _has_pg:
+            # PG-modal-specific formatters and renderer (verbatim from
+            # the previous single-modal build, unchanged).
+            script_parts.append(
+                'function fmtSeconds(s){'
+                'if(!/^[0-9]+$/.test(String(s)))return s;'
+                'let n=parseInt(s,10);if(n===0)return "0 Seconds";'
+                'const d=Math.floor(n/86400);n-=d*86400;'
+                'const h=Math.floor(n/3600);n-=h*3600;'
+                'const m=Math.floor(n/60);n-=m*60;'
+                'const p=[];if(d)p.push(d+" Days");if(h)p.push(h+" Hours");'
+                'if(m)p.push(m+" Minutes");if(n)p.push(n+" Seconds");'
+                'return p.join(" ");}\n'
+                'function fmtMsAsSeconds(s){'
+                'if(!/^[0-9]+$/.test(String(s)))return fmtSeconds(s);'
+                'return fmtSeconds(String(Math.floor(parseInt(s,10)/1000)));}\n'
+                'function fmtClock(s){'
+                'if(!/^[0-9]+$/.test(String(s)))return s;'
+                'const t=parseInt(s,10);'
+                'const h24=Math.floor(t/3600)%24,mm=Math.floor((t%3600)/60);'
+                'const ap=h24<12?"AM":"PM";let h=h24%12;if(h===0)h=12;'
+                'return h+":"+(mm<10?"0"+mm:mm)+" "+ap;}\n'
+                'function fmtBlackout(s){'
+                'if(s===""||s==null)return s;'
+                'const m=String(s).match(/^([0-9]+)-([0-9]+)$/);'
+                'if(!m)return s;'
+                'return fmtClock(m[1])+"-"+fmtClock(m[2]);}\n'
+                'const PG_FMT={'
+                '"Per Period":v=>String(v),'
+                '"Days":v=>String(v),'
+                '"Period Length":v=>fmtMsAsSeconds(v),'
+                '"Blackout":v=>fmtBlackout(v)};\n'
+                'const PG_DISPLAY={"All For":"Retained for",'
+                '"Per Period":"Additional Snaps Retained Per",'
+                '"Days":"For an Additional # of Days",'
+                '"Frequency":"Snapshot/Replication Frequency"};\n'
+                'function renderTable(o){'
+                'if(!o)return \'<p style="color:#888;">No data.</p>\';'
+                'const cols=Object.keys(o);'
+                'if(cols.length===0)return \'<p style="color:#888;">No data.</p>\';'
+                'const n=Math.max(0,...cols.map(c=>(o[c]||[]).length));'
+                'if(n===0)return \'<p style="color:#888;">No data.</p>\';'
+                'let h=\'<table class="pg-detail"><thead><tr>\';'
+                'cols.forEach(c=>{h+=\'<th>\'+escHtml(PG_DISPLAY[c]||c)+\'</th>\';});'
+                'h+=\'</tr></thead><tbody>\';'
+                'for(let i=0;i<n;i++){'
+                'h+=\'<tr>\';'
+                'cols.forEach(c=>{const v=(o[c]||[])[i];'
+                'const f=PG_FMT[c]||fmtSeconds;'
+                'const dv=(v===""||v==null)?null:f(v);'
+                'h+=\'<td>\'+(dv!==null&&dv!==""?escHtml(dv):\'<span style="color:#888;">&mdash;</span>\')+\'</td>\';});'
+                'h+=\'</tr>\';}'
+                'return h+\'</tbody></table>\';}\n'
+                'function showPg(el){'
+                'const arr=el.getAttribute("data-arr"),pg=el.getAttribute("data-pg");'
+                'const data=(PG_PROFILES[arr]||{})[pg]||null;'
+                'document.getElementById("pg-title").textContent='
+                '"Protection Group Details - "+pg;'
+                'document.getElementById("pg-array").textContent="Source array: "+arr;'
+                'document.getElementById("pg-schedule").innerHTML=renderTable(data&&data.schedule);'
+                'document.getElementById("pg-retention").innerHTML=renderTable(data&&data.retention);'
+                'document.getElementById("pg-modal").style.display="flex";}\n')
+        if _has_policy:
+            # Snapshot Policy modal: lists rules (Every / At / Keep For
+            # / Suffix) and surfaces Enabled + Retention Lock as a
+            # one-line meta. An empty rules array renders a "No rules"
+            # placeholder so the modal opens cleanly for sparse data.
+            script_parts.append(
+                'function showPolicy(el){'
+                'const arr=el.getAttribute("data-arr"),pol=el.getAttribute("data-pol");'
+                'const data=(POLICY_PROFILES[arr]||{})[pol]||null;'
+                'document.getElementById("policy-title").textContent='
+                '"Snapshot Policy Details - "+pol;'
+                'const enabled=data?data.enabled:"";'
+                'const lock=data?data.retention_lock:"";'
+                'const meta="Array: "+arr+"  -  Enabled: "+(enabled||"unknown")'
+                '+"  -  Retention Lock: "+(lock||"none");'
+                'document.getElementById("policy-meta").textContent=meta;'
+                'const rules=(data&&data.rules)||[];'
+                'let h;'
+                'if(!rules.length){h=\'<p style="color:#888;">No rules.</p>\';}'
+                'else{h=\'<table class="pg-detail"><thead><tr>'
+                '<th>Every</th><th>At</th><th>Keep For</th><th>Suffix</th>'
+                '</tr></thead><tbody>\';'
+                'rules.forEach(r=>{h+=\'<tr>\''
+                '+\'<td>\'+escHtml(r.every||"")+\'</td>\''
+                '+\'<td>\'+escHtml(r.at||"")+\'</td>\''
+                '+\'<td>\'+escHtml(r.keep_for||"")+\'</td>\''
+                '+\'<td>\'+escHtml(r.suffix||"")+\'</td></tr>\';});'
+                'h+=\'</tbody></table>\';}'
+                'document.getElementById("policy-rules").innerHTML=h;'
+                'document.getElementById("policy-modal").style.display="flex";}\n')
+        if _has_export:
+            # Export modal: surfaces the verbatim columns from
+            # `puredir export list` (server, path, policy, type,
+            # enabled) for one export entry.
+            script_parts.append(
+                'function showExport(el){'
+                'const arr=el.getAttribute("data-arr"),en=el.getAttribute("data-exp");'
+                'const data=(EXPORT_PROFILES[arr]||{})[en]||null;'
+                'document.getElementById("export-title").textContent='
+                '"Export Details - "+en;'
+                'document.getElementById("export-meta").textContent="Source array: "+arr;'
+                'let h;'
+                'if(!data){h=\'<p style="color:#888;">No data.</p>\';}'
+                'else{h=\'<table class="pg-detail"><tbody>\''
+                '+\'<tr><th>Directory</th><td>\'+escHtml(data.directory||"")+\'</td></tr>\''
+                '+\'<tr><th>Server</th><td>\'+escHtml(data.server||"")+\'</td></tr>\''
+                '+\'<tr><th>Path</th><td>\'+escHtml(data.path||"")+\'</td></tr>\''
+                '+\'<tr><th>Policy</th><td>\'+escHtml(data.policy||"")+\'</td></tr>\''
+                '+\'<tr><th>Type</th><td>\'+escHtml(data.type||"")+\'</td></tr>\''
+                '+\'<tr><th>Enabled</th><td>\'+escHtml(data.enabled||"")+\'</td></tr>\''
+                '+\'</tbody></table>\';}'
+                'document.getElementById("export-detail").innerHTML=h;'
+                'document.getElementById("export-modal").style.display="flex";}\n')
+        script_parts.append('</script>')
+        script_block = ''.join(script_parts)
     else:
-        modal_block = ''
         script_block = ''
 
     # Sort/filter wiring. The thead is built programmatically so the
@@ -1674,7 +2126,7 @@ def build_protection_html(per_array, config):
     _T2_COLS = [
         'Directory Name', 'Array Name', 'Replication Destination',
         'Pod', 'Remote Pod', 'Local Snapshots',
-        'Replicated Pod Snapshots', 'Safemode', 'Protection Groups',
+        'Replicated Pod Snapshots', 'Safemode', 'Snapshot Policies',
         'Max Local Snap Retention (Days)', 'Max Repl Snap Retention (Days)',
         'Local Snap Retention vs SLA', 'Repl Snap Retention vs SLA',
         'Connected Hosts', 'Non Protection Reasoning']
@@ -2079,4 +2531,4 @@ def build_protection_html(per_array, config):
 """
 
 
-__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
+__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purepolicy_snapshot_list_csv', '_parse_purepolicy_snapshot_rule_list_csv', '_parse_puredir_export_list_csv', '_parse_retention_to_days', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
