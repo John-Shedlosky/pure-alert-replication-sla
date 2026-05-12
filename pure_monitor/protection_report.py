@@ -181,19 +181,37 @@ def _fake_protection_data_for(array):
     policy_snapshots = [
         {'name': 'daily',        'pod': None, 'policy': 'daily',        'enabled': 'true'},
         {'name': 'daily-locked', 'pod': None, 'policy': 'daily-locked', 'enabled': 'true'}]
+    # Rule fields mirror the on-array CSV: Every / At / Keep For are
+    # raw millisecond integers. 86_400_000 ms == 1 day; the popup
+    # formats Every / At as d/h/m/s and Keep For as decimal days.
     policy_rules = {
-        'daily':        [{'every': '1d', 'at': '02:00',
-                          'keep_for': '7d', 'client_name': '',
+        'daily':        [{'every': '86400000', 'at': '7200000',
+                          'keep_for': '604800000', 'client_name': '',
                           'suffix': 'daily'}],
-        'daily-locked': [{'every': '1d', 'at': '03:00',
-                          'keep_for': '14d', 'client_name': '',
+        'daily-locked': [{'every': '86400000', 'at': '10800000',
+                          'keep_for': '1209600000', 'client_name': '',
                           'suffix': 'daily'}]}
+    # Synthetic NFS/SMB policy + rule data driving the Export modal.
+    policy_nfs_list  = {'nfs-default': {'user_mapping_enabled': 'True'}}
+    policy_nfs_rules = {'nfs-default': [
+        {'client': '*', 'access': 'root-squash', 'permission': 'rw',
+         'anonuid': '65534', 'anongid': '65534',
+         'version': 'nfsv3,nfsv4.1', 'security': 'sys'}]}
+    policy_smb_list  = {'smb-default': {
+        'access_based_enumeration_enabled': 'True',
+        'continuous_availability_enabled':  'False'}}
+    policy_smb_rules = {'smb-default': [
+        {'client': '*', 'anonymous_access_allowed': 'False',
+         'smb_encryption_required': 'True'}]}
     # Synthetic export listing: every home:users dir exposes one NFS
     # export; pod-stretched data dirs additionally expose an SMB share.
+    # Enabled is left blank to mirror the real CSV behavior (the
+    # column is empty when the export is enabled and reads
+    # "Policy Disabled" when it is not).
     dir_exports = [
         {'directory': 'home:users', 'export_name': f'{array}_users_nfs',
          'server': f'{array}-server01', 'path': '/users', 'policy': 'nfs-default',
-         'type': 'nfs', 'enabled': 'True'}]
+         'type': 'nfs', 'enabled': ''}]
     if array in pod_pairs:
         _lp = pod_pairs[array][1]
         filesystems.append({'name': f'{_lp}::shared_fs',
@@ -208,7 +226,7 @@ def _fake_protection_data_for(array):
             'directory': f'{_lp}::shared_fs:data',
             'export_name': f'{_lp}_data_smb',
             'server': f'{_lp}-smb01', 'path': '/data',
-            'policy': 'smb-default', 'type': 'smb', 'enabled': 'True'})
+            'policy': 'smb-default', 'type': 'smb', 'enabled': ''})
     return {'volumes': volumes, 'pod_links': pod_links, 'snapshots': snapshots,
             'pgroups': pgroups, 'pgroup_locks': pgroup_locks,
             'pgroup_schedules': pgroup_schedules,
@@ -220,6 +238,10 @@ def _fake_protection_data_for(array):
             'policy_snapshots': policy_snapshots,
             'policy_rules': policy_rules,
             'dir_exports': dir_exports,
+            'policy_nfs_rules': policy_nfs_rules,
+            'policy_nfs_list':  policy_nfs_list,
+            'policy_smb_rules': policy_smb_rules,
+            'policy_smb_list':  policy_smb_list,
             'eradication': eradication, 'error': None}
 
 
@@ -516,31 +538,107 @@ def _parse_puredir_export_list_csv(text):
     return out
 
 
+def _parse_purepolicy_nfs_rule_list_csv(text):
+    """Parse `purepolicy nfs rule list --csv` rows.
+    Returns {policy_name: [rule_dict, ...]} keyed by the Policy column.
+    Each rule dict preserves Client / Access / Permission / Anonuid /
+    Anongid / Version / Security verbatim.
+    """
+    out = {}
+    for d in _csv_to_dicts(text):
+        policy = (d.get('Policy') or '').strip()
+        if not policy:
+            continue
+        out.setdefault(policy, []).append({
+            'client':     (d.get('Client') or '').strip(),
+            'access':     (d.get('Access') or '').strip(),
+            'permission': (d.get('Permission') or '').strip(),
+            'anonuid':    (d.get('Anonuid') or '').strip(),
+            'anongid':    (d.get('Anongid') or '').strip(),
+            'version':    (d.get('Version') or '').strip(),
+            'security':   (d.get('Security') or '').strip()})
+    return out
+
+
+def _parse_purepolicy_nfs_list_csv(text):
+    """Parse `purepolicy nfs list --csv` rows.
+    Returns {policy_name: {'user_mapping_enabled': str}} keyed by the
+    Name column.
+    """
+    out = {}
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out[name] = {
+            'user_mapping_enabled': (d.get('User Mapping Enabled') or '').strip()}
+    return out
+
+
+def _parse_purepolicy_smb_rule_list_csv(text):
+    """Parse `purepolicy smb rule list --csv` rows.
+    Returns {policy_name: [rule_dict, ...]} keyed by the Policy column.
+    Each rule dict preserves Client / Anonymous Access Allowed / SMB
+    Encryption Required verbatim.
+    """
+    out = {}
+    for d in _csv_to_dicts(text):
+        policy = (d.get('Policy') or '').strip()
+        if not policy:
+            continue
+        out.setdefault(policy, []).append({
+            'client':                   (d.get('Client') or '').strip(),
+            'anonymous_access_allowed': (d.get('Anonymous Access Allowed') or '').strip(),
+            'smb_encryption_required':  (d.get('SMB Encryption Required') or '').strip()})
+    return out
+
+
+def _parse_purepolicy_smb_list_csv(text):
+    """Parse `purepolicy smb list --csv` rows.
+    Returns {policy_name: {'access_based_enumeration_enabled': str,
+    'continuous_availability_enabled': str}} keyed by the Name column.
+    """
+    out = {}
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out[name] = {
+            'access_based_enumeration_enabled':
+                (d.get('Access Based Enumeration Enabled') or '').strip(),
+            'continuous_availability_enabled':
+                (d.get('Continuous Availability Enabled') or '').strip()}
+    return out
+
+
 def _parse_retention_to_days(val):
-    """Convert a Purity 'Keep For' value (e.g., '7d', '12h', '604800')
-    into whole days. Strings like '7d' / '1w' are parsed via
-    parse_time_to_seconds; raw integer strings are interpreted as
-    seconds. Returns 0 when the input is empty or unparseable.
+    """Convert a Purity 'Keep For' value to a number of days as float.
+    `purepolicy snapshot rule list --csv` emits 'Keep For' as a raw
+    integer in milliseconds; suffixed duration strings ('7d', '12h',
+    '1w') are accepted for backward compatibility. Returns 0.0 when
+    the input is empty or unparseable. The result may be decimal
+    (e.g., 2.5 for a 60-hour keep value).
     """
     s = (val or '').strip()
     if not s:
-        return 0
+        return 0.0
+    try:
+        ms = int(s)
+        return ms / 86400000.0
+    except (ValueError, TypeError):
+        pass
     try:
         secs = parse_time_to_seconds(s)
+        return float(secs) / 86400.0 if secs else 0.0
     except Exception:
-        secs = 0
-    if not secs:
-        try:
-            secs = int(s)
-        except Exception:
-            return 0
-    return int(secs) // 86400
+        return 0.0
 
 
 def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
     """Issue the FlashArray protection commands and parse their output.
     Returns {'volumes', 'pod_links', 'snapshots', 'error', 'policy_snapshots',
-    'policy_rules', 'dir_exports'}.
+    'policy_rules', 'dir_exports', 'policy_nfs_rules', 'policy_nfs_list',
+    'policy_smb_rules', 'policy_smb_list'}.
     """
     if ALERT_DEBUG:
         return _fake_protection_data_for(array)
@@ -550,6 +648,8 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
            'filesystems': [], 'directories': [], 'dir_snapshots': [],
            'policy_locks': {}, 'eradication': {},
            'policy_snapshots': [], 'policy_rules': {}, 'dir_exports': [],
+           'policy_nfs_rules': {}, 'policy_nfs_list': {},
+           'policy_smb_rules': {}, 'policy_smb_list': {},
            'error': None}
     _errs = []
     try:
@@ -658,6 +758,34 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
             log_list=detailed_logs, nogui=nogui))
     except Exception as e:
         _errs.append(f"puredir export list: {e}")
+    try:
+        out['policy_nfs_rules'] = _parse_purepolicy_nfs_rule_list_csv(
+            run_ssh_command(array, user,
+                "purepolicy nfs rule list --csv",
+                log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purepolicy nfs rule list: {e}")
+    try:
+        out['policy_nfs_list'] = _parse_purepolicy_nfs_list_csv(
+            run_ssh_command(array, user,
+                "purepolicy nfs list --csv",
+                log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purepolicy nfs list: {e}")
+    try:
+        out['policy_smb_rules'] = _parse_purepolicy_smb_rule_list_csv(
+            run_ssh_command(array, user,
+                "purepolicy smb rule list --csv",
+                log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purepolicy smb rule list: {e}")
+    try:
+        out['policy_smb_list'] = _parse_purepolicy_smb_list_csv(
+            run_ssh_command(array, user,
+                "purepolicy smb list --csv",
+                log_list=detailed_logs, nogui=nogui))
+    except Exception as e:
+        _errs.append(f"purepolicy smb list: {e}")
     if _errs:
         out['error'] = "; ".join(_errs)
     return out
@@ -723,7 +851,9 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
                             'filesystems': [], 'directories': [],
                             'dir_snapshots': [], 'policy_locks': {},
                             'policy_snapshots': [], 'policy_rules': {},
-                            'dir_exports': [], 'eradication': {}}
+                            'dir_exports': [], 'eradication': {},
+                            'policy_nfs_rules': {}, 'policy_nfs_list': {},
+                            'policy_smb_rules': {}, 'policy_smb_list': {}}
         if platform == 'FA':
             fa_targets.append((_name, info.get('user')
                                       or auth_user_for_array(_name, config)))
@@ -1606,23 +1736,66 @@ def build_protection_html(per_array, config):
                 'rules':          rules.get(nm, [])}
     policy_profiles_json = _json.dumps(policy_profiles)
 
-    # Per-(array, export_name) profile for the Connected Hosts modal in
-    # Table 2. Each entry preserves the verbatim columns from
-    # `puredir export list` (Server, Path, Policy, Type, Enabled).
+    # Per-(array, export_name) profile for the Connected Hosts modal
+    # in Table 2. Each entry preserves the verbatim columns from
+    # `puredir export list` (Server, Path, Policy, Type, Enabled),
+    # plus per-type rule/policy detail pulled from the matching
+    # `purepolicy <nfs|smb> rule list` and `purepolicy <nfs|smb> list`
+    # outputs. The 'kind' field tells the JS which column set to
+    # render in the secondary tables.
     export_profiles = {}
     for arr, info in per_array.items():
+        nfs_rules = info.get('policy_nfs_rules') or {}
+        nfs_list  = info.get('policy_nfs_list')  or {}
+        smb_rules = info.get('policy_smb_rules') or {}
+        smb_list  = info.get('policy_smb_list')  or {}
         for exp in (info.get('dir_exports') or []):
             en = exp.get('export_name') or exp.get('policy') or ''
             if not en:
                 continue
+            etype  = (exp.get('type')   or '').lower()
+            polnm  = exp.get('policy', '')
+            kind   = ('smb' if 'smb' in etype
+                      else ('nfs' if 'nfs' in etype else ''))
+            if kind == 'smb':
+                rules_block  = smb_rules.get(polnm, [])
+                policy_block = smb_list.get(polnm, {})
+            elif kind == 'nfs':
+                rules_block  = nfs_rules.get(polnm, [])
+                policy_block = nfs_list.get(polnm, {})
+            else:
+                rules_block, policy_block = [], {}
             export_profiles.setdefault(arr, {})[en] = {
-                'directory': exp.get('directory', ''),
-                'server':    exp.get('server', ''),
-                'path':      exp.get('path', ''),
-                'policy':    exp.get('policy', ''),
-                'type':      exp.get('type', ''),
-                'enabled':   exp.get('enabled', '')}
+                'directory':    exp.get('directory', ''),
+                'server':       exp.get('server', ''),
+                'path':         exp.get('path', ''),
+                'policy':       polnm,
+                'type':         exp.get('type', ''),
+                'enabled':      exp.get('enabled', ''),
+                'kind':         kind,
+                'rules':        rules_block,
+                'policy_attrs': policy_block}
     export_profiles_json = _json.dumps(export_profiles)
+
+    # Per-(array, directory) export listing for the Directory-name
+    # popup. Each entry is the list of `puredir export list` rows that
+    # match the directory's verbatim name (Filesystem:Directory or
+    # Pod::Filesystem:Directory). Multiple exports per directory are
+    # preserved in CSV order so the popup can list them all.
+    dir_export_profiles = {}
+    for arr, info in per_array.items():
+        for exp in (info.get('dir_exports') or []):
+            d_nm = exp.get('directory', '')
+            if not d_nm:
+                continue
+            dir_export_profiles.setdefault(arr, {}).setdefault(
+                d_nm, []).append({
+                    'server':      exp.get('server', ''),
+                    'export_name': exp.get('export_name', ''),
+                    'path':        exp.get('path', ''),
+                    'type':        exp.get('type', ''),
+                    'enabled':     exp.get('enabled', '')})
+    dir_export_profiles_json = _json.dumps(dir_export_profiles)
 
     # Cells for the protection-related columns are shaded based on
     # whether they carry meaningful content. Numeric snapshot cells use
@@ -1788,18 +1961,33 @@ def build_protection_html(per_array, config):
             remote_pod = _html.escape(r['remote_pod']) if remote_ok else _DASH
             dir_disp = (r.get('name')
                         or f'{r["fs_token"]}:{r["directory"]}')
+            # Directory cell is a link that opens the puredir-export
+            # popup for that directory. The lookup is bound to the
+            # source array (peer-array exports for stretched pods
+            # are not surfaced here \u2014 they're collapsed into the
+            # source row).
+            _src_arr_dir = r.get('source_array') or r['array']
+            dir_cell_inner = (
+                f'<a href="#" class="pg-link" '
+                f'data-arr="{_html.escape(_src_arr_dir, quote=True)}" '
+                f'data-dir="{_html.escape(dir_disp, quote=True)}" '
+                f'onclick="showDir(this);return false;">'
+                f'{_html.escape(dir_disp)}</a>')
             local_n = int(r['local_snaps'])
-            # Replicated pod snapshots: only meaningful for pod-resident
-            # directories whose pod has a remote peer. Non-pod and
-            # unlinked rows render the cell as a neutral em-dash.
+            # Replicated pod snapshots: only pod-resident directories
+            # whose pod has a remote peer are eligible. The cell is
+            # painted red whenever the count is missing/zero (the
+            # non-eligible case still renders an em-dash, but in red
+            # so the row visibly flags as unprotected).
             rep_eligible = bool(r['in_pod'] and r['remote_pod']
                                 and r['replication_destinations'])
-            rep_n = int(r.get('replicated_pod_snaps', 0))
-            if rep_eligible:
-                rep_cell = (f'<td style="{_OK if rep_n > 0 else _BAD}'
-                            f'text-align:right;">{rep_n}</td>')
+            rep_n = int(r.get('replicated_pod_snaps', 0) or 0)
+            if rep_n > 0:
+                rep_cell = f'<td style="{_OK}text-align:right;">{rep_n}</td>'
+            elif rep_eligible:
+                rep_cell = f'<td style="{_BAD}text-align:right;">{rep_n}</td>'
             else:
-                rep_cell = f'<td style="text-align:right;">{_DASH}</td>'
+                rep_cell = f'<td style="{_BAD}text-align:right;">{_DASH}</td>'
             sm_on = bool(r.get('safemode'))
             sm_text = 'Enabled' if sm_on else 'Disabled'
             sm_style = ((_OK if sm_on else _BAD)
@@ -1842,11 +2030,17 @@ def build_protection_html(per_array, config):
                 f'data-exp="{_html.escape(e, quote=True)}" '
                 f'onclick="showExport(this);return false;">{_html.escape(e)}</a>'
                 for e in exp_list) if exp_ok else _DASH)
-            # Max Local / Repl Snap Retention (Days).
-            loc_ret_n  = int(r.get('max_local_retention_days', 0))
-            repl_ret_n = int(r.get('max_repl_retention_days', 0))
-            loc_ret_disp  = (str(loc_ret_n)  if loc_ret_n  > 0 else _DASH)
-            repl_ret_disp = (str(repl_ret_n) if repl_ret_n > 0 else _DASH)
+            # Max Local / Repl Snap Retention (Days). Values are
+            # decimal days derived from the policy rule's millisecond
+            # Keep For; render with `{:g}` after rounding so whole
+            # values print as integers ('7') and fractional values
+            # keep their precision ('2.5').
+            loc_ret_n  = float(r.get('max_local_retention_days', 0) or 0)
+            repl_ret_n = float(r.get('max_repl_retention_days', 0) or 0)
+            loc_ret_disp  = (f'{round(loc_ret_n,  2):g}'
+                             if loc_ret_n  > 0 else _DASH)
+            repl_ret_disp = (f'{round(repl_ret_n, 2):g}'
+                             if repl_ret_n > 0 else _DASH)
             # SLA comparison cells. A threshold of 0 disables the
             # check (neutral dash); otherwise green check when the
             # row's retention meets the threshold and the row is
@@ -1877,7 +2071,7 @@ def build_protection_html(per_array, config):
                 return f'<td style="{_RED_T2}">Short Retention</td>'
             tr_html_t2 += (
                 '<tr>'
-                f'<td>{_html.escape(dir_disp)}</td>'
+                f'<td>{dir_cell_inner}</td>'
                 f'<td>{_html.escape(r["array"])}</td>'
                 f'<td style="{_OK if dests_ok else _BAD}">{dests}</td>'
                 f'<td style="{_OK if pod_ok else _BAD}text-align:center;">{pod_cell}</td>'
@@ -1926,6 +2120,7 @@ def build_protection_html(per_array, config):
     _has_pg     = bool(pg_profiles)
     _has_policy = bool(policy_profiles)
     _has_export = bool(export_profiles)
+    _has_dir    = bool(dir_export_profiles)
     modal_block_parts = []
     if _has_pg:
         modal_block_parts.append(
@@ -1957,10 +2152,24 @@ def build_protection_html(per_array, config):
             '<h3 id="export-title"></h3>'
             '<p class="meta" id="export-meta"></p>'
             '<div id="export-detail"></div>'
+            '<h4 id="export-rules-h" style="display:none;">Export Rules</h4>'
+            '<div id="export-rules"></div>'
+            '<h4 id="export-policy-h" style="display:none;">Policy Attributes</h4>'
+            '<div id="export-policy"></div>'
+            '</div></div>')
+    if _has_dir:
+        modal_block_parts.append(
+            '<div id="dir-modal" class="modal" '
+            'onclick="closeModalIfBg(event,\'dir-modal\')">'
+            '<div class="modal-content">'
+            '<span class="modal-close" onclick="closeModalById(\'dir-modal\')">&times;</span>'
+            '<h3 id="dir-title"></h3>'
+            '<p class="meta" id="dir-meta"></p>'
+            '<div id="dir-detail"></div>'
             '</div></div>')
     modal_block = '\n'.join(modal_block_parts)
 
-    if _has_pg or _has_policy or _has_export:
+    if _has_pg or _has_policy or _has_export or _has_dir:
         script_parts = ['<script>\n']
         # Shared payload variables — emitted unconditionally for the
         # modals that exist so the JS can reference them as constants.
@@ -1973,6 +2182,9 @@ def build_protection_html(per_array, config):
         if _has_export:
             script_parts.append('const EXPORT_PROFILES = '
                                 + export_profiles_json + ';\n')
+        if _has_dir:
+            script_parts.append('const DIR_EXPORT_PROFILES = '
+                                + dir_export_profiles_json + ';\n')
         # Shared helpers: HTML escape, modal open/close, Escape key.
         script_parts.append(
             'function escHtml(s){'
@@ -1982,7 +2194,8 @@ def build_protection_html(per_array, config):
             'function closeModalById(id){const m=document.getElementById(id);'
             'if(m)m.style.display="none";}\n'
             'function closeAllModals(){'
-            '["pg-modal","policy-modal","export-modal"].forEach(closeModalById);}\n'
+            '["pg-modal","policy-modal","export-modal","dir-modal"]'
+            '.forEach(closeModalById);}\n'
             'function closeModalIfBg(e,id){if(e.target.id===id)closeModalById(id);}\n'
             'document.addEventListener("keydown",function(e){'
             'if(e.key==="Escape")closeAllModals();});\n')
@@ -2049,11 +2262,30 @@ def build_protection_html(per_array, config):
                 'document.getElementById("pg-retention").innerHTML=renderTable(data&&data.retention);'
                 'document.getElementById("pg-modal").style.display="flex";}\n')
         if _has_policy:
-            # Snapshot Policy modal: lists rules (Every / At / Keep For
-            # / Suffix) and surfaces Enabled + Retention Lock as a
-            # one-line meta. An empty rules array renders a "No rules"
-            # placeholder so the modal opens cleanly for sparse data.
+            # Snapshot Policy modal: lists rules (Every / At / Keep
+            # For / Suffix) and surfaces Enabled + Retention Lock in
+            # a one-line meta. Every / At arrive from Purity as
+            # milliseconds (At is ms since the last event) and
+            # render as d/h/m/s; Keep For renders as decimal days.
+            # An empty rules array renders a "No rules" placeholder
+            # so the modal opens cleanly for sparse data.
             script_parts.append(
+                'function fmtMsAsDhms(s){'
+                'if(!/^[0-9]+$/.test(String(s)))return s;'
+                'let n=Math.floor(parseInt(s,10)/1000);'
+                'if(n===0)return "0 Seconds";'
+                'const d=Math.floor(n/86400);n-=d*86400;'
+                'const h=Math.floor(n/3600);n-=h*3600;'
+                'const m=Math.floor(n/60);n-=m*60;'
+                'const p=[];if(d)p.push(d+" Days");if(h)p.push(h+" Hours");'
+                'if(m)p.push(m+" Minutes");if(n)p.push(n+" Seconds");'
+                'return p.join(" ");}\n'
+                'function fmtMsAsDays(s){'
+                'if(!/^[0-9]+$/.test(String(s)))return s;'
+                'const v=parseInt(s,10)/86400000;'
+                'if(v===0)return "0 Days";'
+                'const r=Math.round(v*100)/100;'
+                'return r+" Days";}\n'
                 'function showPolicy(el){'
                 'const arr=el.getAttribute("data-arr"),pol=el.getAttribute("data-pol");'
                 'const data=(POLICY_PROFILES[arr]||{})[pol]||null;'
@@ -2071,18 +2303,64 @@ def build_protection_html(per_array, config):
                 '<th>Every</th><th>At</th><th>Keep For</th><th>Suffix</th>'
                 '</tr></thead><tbody>\';'
                 'rules.forEach(r=>{h+=\'<tr>\''
-                '+\'<td>\'+escHtml(r.every||"")+\'</td>\''
-                '+\'<td>\'+escHtml(r.at||"")+\'</td>\''
-                '+\'<td>\'+escHtml(r.keep_for||"")+\'</td>\''
+                '+\'<td>\'+escHtml(fmtMsAsDhms(r.every||""))+\'</td>\''
+                '+\'<td>\'+escHtml(fmtMsAsDhms(r.at||""))+\'</td>\''
+                '+\'<td>\'+escHtml(fmtMsAsDays(r.keep_for||""))+\'</td>\''
                 '+\'<td>\'+escHtml(r.suffix||"")+\'</td></tr>\';});'
                 'h+=\'</tbody></table>\';}'
                 'document.getElementById("policy-rules").innerHTML=h;'
                 'document.getElementById("policy-modal").style.display="flex";}\n')
         if _has_export:
-            # Export modal: surfaces the verbatim columns from
-            # `puredir export list` (server, path, policy, type,
-            # enabled) for one export entry.
+            # Export modal: three stacked tables.
+            #   1) verbatim columns from `puredir export list`
+            #      (directory / server / path / policy / type /
+            #      enabled). The CSV's Enabled column is empty when
+            #      the export is enabled and reads "Policy Disabled"
+            #      when it is not, so the renderer maps an empty
+            #      string to the literal "Enabled".
+            #   2) per-rule detail from `purepolicy <kind> rule
+            #      list`, selected by the export's type (smb vs
+            #      nfs). Suppressed when no rules are attached.
+            #   3) policy-level attributes from `purepolicy <kind>
+            #      list`. Suppressed when no attributes are present.
+            # NFS_RULE_COLS / SMB_RULE_COLS hold paired [key, label]
+            # tuples so the table headers stay readable while the
+            # underlying export_profile keys remain snake_cased.
             script_parts.append(
+                'const NFS_RULE_COLS=['
+                '["client","Client"],'
+                '["access","Access"],'
+                '["permission","Permission"],'
+                '["anonuid","Anonuid"],'
+                '["anongid","Anongid"],'
+                '["version","Version"],'
+                '["security","Security"]];\n'
+                'const SMB_RULE_COLS=['
+                '["client","Client"],'
+                '["anonymous_access_allowed","Anonymous Access Allowed"],'
+                '["smb_encryption_required","SMB Encryption Required"]];\n'
+                'const NFS_POLICY_COLS=['
+                '["user_mapping_enabled","User Mapping Enabled"]];\n'
+                'const SMB_POLICY_COLS=['
+                '["access_based_enumeration_enabled","Access Based Enumeration Enabled"],'
+                '["continuous_availability_enabled","Continuous Availability Enabled"]];\n'
+                'function renderExportRules(rules,cols){'
+                'if(!rules||!rules.length)return "";'
+                'let h=\'<table class="pg-detail"><thead><tr>\';'
+                'cols.forEach(c=>{h+=\'<th>\'+escHtml(c[1])+\'</th>\';});'
+                'h+=\'</tr></thead><tbody>\';'
+                'rules.forEach(r=>{h+=\'<tr>\';'
+                'cols.forEach(c=>{h+=\'<td>\'+escHtml(r[c[0]]||"")+\'</td>\';});'
+                'h+=\'</tr>\';});'
+                'return h+\'</tbody></table>\';}\n'
+                'function renderExportPolicy(attrs,cols){'
+                'if(!attrs||!cols.length)return "";'
+                'let any=false;cols.forEach(c=>{if(attrs[c[0]])any=true;});'
+                'if(!any)return "";'
+                'let h=\'<table class="pg-detail"><tbody>\';'
+                'cols.forEach(c=>{h+=\'<tr><th>\'+escHtml(c[1])+\'</th><td>\''
+                '+escHtml(attrs[c[0]]||"")+\'</td></tr>\';});'
+                'return h+\'</tbody></table>\';}\n'
                 'function showExport(el){'
                 'const arr=el.getAttribute("data-arr"),en=el.getAttribute("data-exp");'
                 'const data=(EXPORT_PROFILES[arr]||{})[en]||null;'
@@ -2091,16 +2369,63 @@ def build_protection_html(per_array, config):
                 'document.getElementById("export-meta").textContent="Source array: "+arr;'
                 'let h;'
                 'if(!data){h=\'<p style="color:#888;">No data.</p>\';}'
-                'else{h=\'<table class="pg-detail"><tbody>\''
+                'else{const enDisp=(data.enabled&&data.enabled.length)?data.enabled:"Enabled";'
+                'h=\'<table class="pg-detail"><tbody>\''
                 '+\'<tr><th>Directory</th><td>\'+escHtml(data.directory||"")+\'</td></tr>\''
                 '+\'<tr><th>Server</th><td>\'+escHtml(data.server||"")+\'</td></tr>\''
                 '+\'<tr><th>Path</th><td>\'+escHtml(data.path||"")+\'</td></tr>\''
                 '+\'<tr><th>Policy</th><td>\'+escHtml(data.policy||"")+\'</td></tr>\''
                 '+\'<tr><th>Type</th><td>\'+escHtml(data.type||"")+\'</td></tr>\''
-                '+\'<tr><th>Enabled</th><td>\'+escHtml(data.enabled||"")+\'</td></tr>\''
+                '+\'<tr><th>Enabled</th><td>\'+escHtml(enDisp)+\'</td></tr>\''
                 '+\'</tbody></table>\';}'
                 'document.getElementById("export-detail").innerHTML=h;'
+                'const kind=data?(data.kind||""):"";'
+                'const ruleCols=(kind==="smb")?SMB_RULE_COLS:'
+                '((kind==="nfs")?NFS_RULE_COLS:[]);'
+                'const polCols=(kind==="smb")?SMB_POLICY_COLS:'
+                '((kind==="nfs")?NFS_POLICY_COLS:[]);'
+                'const rulesHtml=data?renderExportRules(data.rules,ruleCols):"";'
+                'const polHtml=data?renderExportPolicy(data.policy_attrs,polCols):"";'
+                'document.getElementById("export-rules").innerHTML=rulesHtml;'
+                'document.getElementById("export-rules-h").style.display='
+                'rulesHtml?"block":"none";'
+                'document.getElementById("export-policy").innerHTML=polHtml;'
+                'document.getElementById("export-policy-h").style.display='
+                'polHtml?"block":"none";'
                 'document.getElementById("export-modal").style.display="flex";}\n')
+        if _has_dir:
+            # Directory popup: list every `puredir export list` row
+            # whose Directory column matches the row's verbatim
+            # directory name. The CSV Enabled column is empty when
+            # the export is enabled and reads "Policy Disabled" when
+            # it is not, so the renderer maps empty -> "Enabled"
+            # and "Policy Disabled" -> "Disabled".
+            script_parts.append(
+                'function fmtDirEnabled(v){'
+                'if(!v||!v.length)return "Enabled";'
+                'if(String(v).toLowerCase()==="policy disabled")return "Disabled";'
+                'return v;}\n'
+                'function showDir(el){'
+                'const arr=el.getAttribute("data-arr"),dn=el.getAttribute("data-dir");'
+                'const list=(DIR_EXPORT_PROFILES[arr]||{})[dn]||[];'
+                'document.getElementById("dir-title").textContent='
+                '"Directory Exports - "+dn;'
+                'document.getElementById("dir-meta").textContent="Source array: "+arr;'
+                'let h;'
+                'if(!list.length){h=\'<p style="color:#888;">No exports.</p>\';}'
+                'else{h=\'<table class="pg-detail"><thead><tr>'
+                '<th>Server</th><th>Export Name</th><th>Path</th>'
+                '<th>Type</th><th>Enabled</th>'
+                '</tr></thead><tbody>\';'
+                'list.forEach(e=>{h+=\'<tr>\''
+                '+\'<td>\'+escHtml(e.server||"")+\'</td>\''
+                '+\'<td>\'+escHtml(e.export_name||"")+\'</td>\''
+                '+\'<td>\'+escHtml(e.path||"")+\'</td>\''
+                '+\'<td>\'+escHtml(e.type||"")+\'</td>\''
+                '+\'<td>\'+escHtml(fmtDirEnabled(e.enabled))+\'</td></tr>\';});'
+                'h+=\'</tbody></table>\';}'
+                'document.getElementById("dir-detail").innerHTML=h;'
+                'document.getElementById("dir-modal").style.display="flex";}\n')
         script_parts.append('</script>')
         script_block = ''.join(script_parts)
     else:
@@ -2531,4 +2856,4 @@ def build_protection_html(per_array, config):
 """
 
 
-__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purepolicy_snapshot_list_csv', '_parse_purepolicy_snapshot_rule_list_csv', '_parse_puredir_export_list_csv', '_parse_retention_to_days', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
+__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purepolicy_snapshot_list_csv', '_parse_purepolicy_snapshot_rule_list_csv', '_parse_puredir_export_list_csv', '_parse_purepolicy_nfs_rule_list_csv', '_parse_purepolicy_nfs_list_csv', '_parse_purepolicy_smb_rule_list_csv', '_parse_purepolicy_smb_list_csv', '_parse_retention_to_days', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
