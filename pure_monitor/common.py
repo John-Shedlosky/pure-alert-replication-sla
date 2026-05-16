@@ -512,7 +512,16 @@ def detect_array_type(array, users, detailed_logs=None, nogui=False):
     result = {'is_fb': False, 'is_faf': False, 'is_fab': False, 'is_nrp': False,
               'user': None, 'error': None}
     if ALERT_DEBUG:
-        result['is_fab'] = True
+        # Pattern-match the array name in fake-arrays mode so the FB
+        # protection collector exercises the rendered Section 3 rows.
+        # Any name carrying '-fb-' or '-fb' (case-insensitive) is
+        # treated as a FlashBlade; everything else falls back to the
+        # original FA-Block default so the FA flows remain unchanged.
+        _lname = (array or '').lower()
+        if '-fb-' in _lname or _lname.endswith('-fb'):
+            result['is_fb'] = True
+        else:
+            result['is_fab'] = True
         result['user']   = (users[0][1] if users else None)
         return result
 

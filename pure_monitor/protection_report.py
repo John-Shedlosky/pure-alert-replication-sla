@@ -614,6 +614,301 @@ def _parse_purepolicy_smb_list_csv(text):
     return out
 
 
+# ── FlashBlade CSV parsers ────────────────────────────────────────────
+# The fourteen helpers below parse the FB protection commands. They
+# mirror the FA parser style (one dict per row, verbatim column values
+# preserved as stripped strings) so the aggregator can pull the fields
+# it needs without re-parsing.
+def _parse_fb_purefs_list_csv(text):
+    """Parse `purefs list --csv` (FlashBlade) rows.
+    Returns [{'name','size','virtual','hard_limit','source','created',
+    'protocols','writable','promotion_status','group_ownership'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':             name,
+            'size':             (d.get('Size') or '').strip(),
+            'virtual':          (d.get('Virtual') or '').strip(),
+            'hard_limit':       (d.get('Hard Limit') or '').strip(),
+            'source':           (d.get('Source') or '').strip(),
+            'created':          (d.get('Created') or '').strip(),
+            'protocols':        (d.get('Protocols') or '').strip(),
+            'writable':         (d.get('Writable') or '').strip(),
+            'promotion_status': (d.get('Promotion Status') or '').strip(),
+            'group_ownership':  (d.get('Group Ownership') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purefs_snap_csv(text):
+    """Parse `purefs list --snap --csv` (FlashBlade) rows.
+    Returns [{'name','source','created','policies'}, ...] where 'policies'
+    is the list of policy names from the Policies column split on '/'.
+    The verbatim Source column is preserved; a Source containing ':' is
+    a replicated snapshot (form `source_array:filesystem`), while a
+    Source without ':' is a local snapshot whose value equals the
+    filesystem name.
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        pols_raw = (d.get('Policies') or '').strip()
+        pols = [p.strip() for p in pols_raw.split('/') if p.strip()]
+        out.append({
+            'name':     name,
+            'source':   (d.get('Source') or '').strip(),
+            'created':  (d.get('Created') or '').strip(),
+            'policies': pols,
+        })
+    return out
+
+
+def _parse_fb_purearray_list_connect_csv(text):
+    """Parse `purearray list --connect --csv` (FlashBlade) rows.
+    Returns [{'name','id','version','management_address',
+    'replication_address','encrypted','ca_certificate_group','status',
+    'throttled'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':                 name,
+            'id':                   (d.get('ID') or '').strip(),
+            'version':              (d.get('Version') or '').strip(),
+            'management_address':   (d.get('Management Address') or '').strip(),
+            'replication_address':  (d.get('Replication Address') or '').strip(),
+            'encrypted':            (d.get('Encrypted') or '').strip(),
+            'ca_certificate_group': (d.get('CA Certificate Group') or '').strip(),
+            'status':               (d.get('Status') or '').strip(),
+            'throttled':            (d.get('Throttled') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purefs_export_list_csv(text):
+    """Parse `purefs export list --csv` (FlashBlade) rows.
+    Returns [{'name','export_name','server','file_system','policy',
+    'type','share_policy','enabled','status'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':         name,
+            'export_name':  (d.get('Export Name') or '').strip(),
+            'server':       (d.get('Server') or '').strip(),
+            'file_system':  (d.get('File System') or '').strip(),
+            'policy':       (d.get('Policy') or '').strip(),
+            'type':         (d.get('Type') or '').strip(),
+            'share_policy': (d.get('Share Policy') or '').strip(),
+            'enabled':      (d.get('Enabled') or '').strip(),
+            'status':       (d.get('Status') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purefs_multi_protocol_csv(text):
+    """Parse `purefs list --multi-protocol --csv` (FlashBlade) rows.
+    Returns [{'name','protocols','access_control_style',
+    'safeguard_acls'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':                 name,
+            'protocols':            (d.get('Protocols') or '').strip(),
+            'access_control_style': (d.get('Access Control Style') or '').strip(),
+            'safeguard_acls':       (d.get('Safeguard ACLs') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purefs_replica_link_csv(text):
+    """Parse `purefs replica-link list --csv` (FlashBlade) rows.
+    Returns [{'name','direction','remote','remote_file_system','policy',
+    'policies','status','recovery_point','lag','link_type'}, ...] where
+    'policy' is the verbatim Policy column and 'policies' is the same
+    value split on '/' (one entry per attached replication policy).
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        pol_raw = (d.get('Policy') or '').strip()
+        pols = [p.strip() for p in pol_raw.split('/') if p.strip()]
+        out.append({
+            'name':                name,
+            'direction':           (d.get('Direction') or '').strip(),
+            'remote':              (d.get('Remote') or '').strip(),
+            'remote_file_system':  (d.get('Remote File System') or '').strip(),
+            'policy':              pol_raw,
+            'policies':            pols,
+            'status':              (d.get('Status') or '').strip(),
+            'recovery_point':      (d.get('Recovery Point') or '').strip(),
+            'lag':                 (d.get('Lag') or '').strip(),
+            'link_type':           (d.get('Link Type') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purepolicy_snapshot_replica_link_csv(text):
+    """Parse `purepolicy snapshot list --replica-link --csv` rows.
+    Returns [{'name','file_system','remote','remote_file_system'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':               name,
+            'file_system':        (d.get('File System') or '').strip(),
+            'remote':             (d.get('Remote') or '').strip(),
+            'remote_file_system': (d.get('Remote File System') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purepolicy_snapshot_list_csv(text):
+    """Parse `purepolicy snapshot list --csv` (FlashBlade) rows.
+    Returns [{'name','type','enabled','retention_lock'}, ...]. The
+    'enabled' and 'retention_lock' values are lowercased so the
+    aggregator can compare them against literal strings ('true',
+    'ratcheted', 'locked') without re-normalising.
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':           name,
+            'type':           (d.get('Type') or '').strip(),
+            'enabled':        (d.get('Enabled') or '').strip().lower(),
+            'retention_lock': (d.get('Retention Lock') or '').strip().lower(),
+        })
+    return out
+
+
+def _parse_fb_purepolicy_snapshot_rule_list_csv(text):
+    """Parse `purepolicy snapshot rule list --csv` (FlashBlade) rows.
+    Returns {policy_name: [rule_dict, ...]} keyed by the verbatim Name
+    column. Some Purity versions emit the policy under a 'Policy'
+    column instead; the parser accepts either. Each rule dict preserves
+    Every / At / Time Zone / Keep For verbatim — Every and Keep For are
+    raw millisecond integers, At is milliseconds since midnight, and
+    the modal renderer handles the unit conversions.
+    """
+    out = {}
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or d.get('Policy') or '').strip()
+        if not name:
+            continue
+        out.setdefault(name, []).append({
+            'every':     (d.get('Every') or '').strip(),
+            'at':        (d.get('At') or '').strip(),
+            'time_zone': (d.get('Time Zone') or '').strip(),
+            'keep_for':  (d.get('Keep For') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purepolicy_smb_share_list_csv(text):
+    """Parse `purepolicy smb share list --csv` rows.
+    Returns [{'name','type','enabled'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':    name,
+            'type':    (d.get('Type') or '').strip(),
+            'enabled': (d.get('Enabled') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purepolicy_smb_share_rule_list_csv(text):
+    """Parse `purepolicy smb share rule list --csv` rows.
+    Returns [{'policy','principal','full_control','change','read'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        policy = (d.get('Policy') or '').strip()
+        if not policy:
+            continue
+        out.append({
+            'policy':       policy,
+            'principal':    (d.get('Principal') or '').strip(),
+            'full_control': (d.get('Full Control') or '').strip(),
+            'change':       (d.get('Change') or '').strip(),
+            'read':         (d.get('Read') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purepolicy_nfs_list_csv(text):
+    """Parse `purepolicy nfs list --csv` (FlashBlade) rows.
+    Returns [{'name','type','enabled'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':    name,
+            'type':    (d.get('Type') or '').strip(),
+            'enabled': (d.get('Enabled') or '').strip(),
+        })
+    return out
+
+
+def _parse_fb_purepolicy_nfs_rule_list_csv(text):
+    """Parse `purepolicy nfs rule list --csv` (FlashBlade) rows.
+    Returns [{'name','client','permission','security','access','anonuid',
+    'anongid','secure','fileid_32bit','atime','index',
+    'required_transport_security'}, ...].
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':                        name,
+            'client':                      (d.get('Client') or '').strip(),
+            'permission':                  (d.get('Permission') or '').strip(),
+            'security':                    (d.get('Security') or '').strip(),
+            'access':                      (d.get('Access') or '').strip(),
+            'anonuid':                     (d.get('Anonuid') or '').strip(),
+            'anongid':                     (d.get('Anongid') or '').strip(),
+            'secure':                      (d.get('Secure') or '').strip(),
+            'fileid_32bit':                (d.get('Fileid 32Bit') or '').strip(),
+            'atime':                       (d.get('Atime') or '').strip(),
+            'index':                       (d.get('Index') or '').strip(),
+            'required_transport_security': (d.get('Required Transport Security') or '').strip(),
+        })
+    return out
+
+
 def _parse_retention_to_days(val):
     """Convert a Purity 'Keep For' value to a number of days as float.
     `purepolicy snapshot rule list --csv` emits 'Keep For' as a raw
@@ -794,6 +1089,176 @@ def _collect_one_fa_protection(array, user, detailed_logs, nogui=False):
     return out
 
 
+def _fake_fb_protection_data_for(array):
+    """Synthetic per-array FB protection data used when ALERT_DEBUG is set.
+    Generates two filesystems per array with mixed local/replicated
+    snapshots, a single snapshot policy ('daily' or 'daily-locked'), and
+    one replica-link to the next FB in a small ring so the aggregator
+    has something to render for replication / SLA columns. The fixture
+    is structured so the fake FB arrays in --fake-arrays mode show a
+    representative mix of Safemode states and retention values.
+    """
+    _fbs = ['nyc-pure-fb-01', 'chi-pure-fb-01',
+            'dal-pure-fb-01', 'lon-pure-fb-01']
+    _idx  = _fbs.index(array) if array in _fbs else 0
+    _peer = _fbs[(_idx + 1) % len(_fbs)] if array in _fbs else ''
+    fs1 = f'{array}_fs_data'
+    fs2 = f'{array}_fs_home'
+    filesystems = [
+        {'name': fs1, 'size': '1T', 'virtual': '512G',
+         'hard_limit': 'false', 'source': '', 'created': '',
+         'protocols': 'nfsv4.1', 'writable': 'true',
+         'promotion_status': 'promoted', 'group_ownership': 'creator'},
+        {'name': fs2, 'size': '500G', 'virtual': '120G',
+         'hard_limit': 'false', 'source': '', 'created': '',
+         'protocols': 'smb,nfsv4.1', 'writable': 'true',
+         'promotion_status': 'promoted', 'group_ownership': 'creator'}]
+    # Local snapshots: two on fs1 (policy 'daily'), one on fs2 (policy
+    # 'daily-locked' on alternating arrays so half the rows demo a
+    # ratcheted-policy Safemode).
+    _pol_fs1 = 'daily'
+    _pol_fs2 = 'daily-locked' if (_idx % 2 == 0) else 'daily'
+    snapshots = [
+        {'name': f'{fs1}.snap1', 'source': fs1, 'created': '',
+         'policies': [_pol_fs1]},
+        {'name': f'{fs1}.snap2', 'source': fs1, 'created': '',
+         'policies': [_pol_fs1]},
+        {'name': f'{fs2}.snap1', 'source': fs2, 'created': '',
+         'policies': [_pol_fs2]}]
+    # Inbound replicated snapshot copy from the prior FB in the ring,
+    # rendered as 'source_array:filesystem' in the Source column.
+    if array in _fbs:
+        _prev = _fbs[(_idx - 1) % len(_fbs)]
+        snapshots.append({
+            'name':     f'{_prev}:{_prev}_fs_data.snap1',
+            'source':   f'{_prev}:{_prev}_fs_data',
+            'created':  '',
+            'policies': ['daily']})
+    # fs1 replicates outward to the peer FB via a single replica-link
+    # bound to the same policy that produced its snapshots, so the
+    # 'Max Repl Snap Retention' column resolves to a non-zero value.
+    replica_links = []
+    if _peer:
+        replica_links.append({
+            'name':               fs1,
+            'direction':          'outbound',
+            'remote':             _peer,
+            'remote_file_system': fs1,
+            'policy':             _pol_fs1,
+            'policies':           [_pol_fs1],
+            'status':             'replicating',
+            'recovery_point':     '',
+            'lag':                '0m',
+            'link_type':          'continuous'})
+    # Two policies: 'daily' is unlocked / 7d, 'daily-locked' is
+    # ratcheted / 14d so half the rows pass the safemode-by-policy
+    # check.
+    policy_snapshots = [
+        {'name': 'daily',        'type': 'snapshot',
+         'enabled': 'true', 'retention_lock': 'unlocked'},
+        {'name': 'daily-locked', 'type': 'snapshot',
+         'enabled': 'true', 'retention_lock': 'ratcheted'}]
+    policy_rules = {
+        'daily':        [{'every':     '86400000',
+                          'at':        '7200000',
+                          'time_zone': 'UTC',
+                          'keep_for':  '604800000'}],
+        'daily-locked': [{'every':     '86400000',
+                          'at':        '10800000',
+                          'time_zone': 'UTC',
+                          'keep_for':  '1209600000'}]}
+    # Half the fake FB arrays demo array-wide safemode (all-disabled)
+    # with a 2-day file eradication delay so the Safemode cell renders
+    # the delay sub-line for that subset.
+    if _idx % 2 == 0:
+        eradication = {'Manual Eradication':      'all-disabled',
+                       'File Eradication Delay':  '2d'}
+    else:
+        eradication = {'Manual Eradication':      'all-enabled',
+                       'File Eradication Delay':  ''}
+    return {
+        'fb_filesystems':              filesystems,
+        'fb_fs_snapshots':             snapshots,
+        'fb_array_connect':            [],
+        'fb_fs_exports':               [],
+        'fb_fs_multi_protocol':        [],
+        'fb_fs_replica_links':         replica_links,
+        'fb_policy_snap_replica':      [],
+        'fb_policy_snapshots':         policy_snapshots,
+        'fb_policy_snap_rules':        policy_rules,
+        'fb_policy_smb_share':         [],
+        'fb_policy_smb_share_rules':   [],
+        'fb_policy_nfs':               [],
+        'fb_policy_nfs_rules':         [],
+        'eradication':                 eradication,
+        'error':                       None}
+
+
+def _collect_one_fb_protection(array, user, detailed_logs, nogui=False):
+    """Issue the FlashBlade protection commands and parse their output.
+    Returns a per-array dict carrying the fourteen 'fb_*' collections
+    plus 'eradication' and 'error'. All commands run sequentially so
+    transient SSH failures on one CSV don't poison the rest of the
+    capture; per-command errors are joined into out['error'].
+    """
+    if ALERT_DEBUG:
+        return _fake_fb_protection_data_for(array)
+    out = {'fb_filesystems':            [], 'fb_fs_snapshots':           [],
+           'fb_array_connect':          [], 'fb_fs_exports':             [],
+           'fb_fs_multi_protocol':      [], 'fb_fs_replica_links':       [],
+           'fb_policy_snap_replica':    [], 'fb_policy_snapshots':       [],
+           'fb_policy_snap_rules':      {}, 'fb_policy_smb_share':       [],
+           'fb_policy_smb_share_rules': [], 'fb_policy_nfs':             [],
+           'fb_policy_nfs_rules':       [], 'eradication':               {},
+           'error':                     None}
+    _errs = []
+    # The fourteen FB collection calls, paired with the parser that
+    # consumes their CSV. Ordering matches the spec given for Section 3.
+    _calls = [
+        ('purefs list --csv',
+         'fb_filesystems',            _parse_fb_purefs_list_csv),
+        ('purefs list --snap --csv',
+         'fb_fs_snapshots',           _parse_fb_purefs_snap_csv),
+        ('purearray eradication-config list --csv',
+         'eradication',               _parse_purearray_eradication_config_csv),
+        ('purearray list --connect --csv',
+         'fb_array_connect',          _parse_fb_purearray_list_connect_csv),
+        ('purefs export list --csv',
+         'fb_fs_exports',             _parse_fb_purefs_export_list_csv),
+        ('purefs list --multi-protocol --csv',
+         'fb_fs_multi_protocol',      _parse_fb_purefs_multi_protocol_csv),
+        ('purefs replica-link list --csv',
+         'fb_fs_replica_links',       _parse_fb_purefs_replica_link_csv),
+        ('purepolicy snapshot list --replica-link --csv',
+         'fb_policy_snap_replica',
+         _parse_fb_purepolicy_snapshot_replica_link_csv),
+        ('purepolicy snapshot list --csv',
+         'fb_policy_snapshots',       _parse_fb_purepolicy_snapshot_list_csv),
+        ('purepolicy snapshot rule list --csv',
+         'fb_policy_snap_rules',
+         _parse_fb_purepolicy_snapshot_rule_list_csv),
+        ('purepolicy smb share list --csv',
+         'fb_policy_smb_share',       _parse_fb_purepolicy_smb_share_list_csv),
+        ('purepolicy smb share rule list --csv',
+         'fb_policy_smb_share_rules',
+         _parse_fb_purepolicy_smb_share_rule_list_csv),
+        ('purepolicy nfs list --csv',
+         'fb_policy_nfs',             _parse_fb_purepolicy_nfs_list_csv),
+        ('purepolicy nfs rule list --csv',
+         'fb_policy_nfs_rules',       _parse_fb_purepolicy_nfs_rule_list_csv),
+    ]
+    for _cmd, _key, _parser in _calls:
+        try:
+            out[_key] = _parser(run_ssh_command(
+                array, user, _cmd,
+                log_list=detailed_logs, nogui=nogui))
+        except Exception as e:
+            _errs.append(f"{_cmd.replace(' --csv','')}: {e}")
+    if _errs:
+        out['error'] = "; ".join(_errs)
+    return out
+
+
 def run_protection_collection_core(config, nogui=False, progress_cb=None):
     """Detect array types, then collect protection data for each FA.
     Returns (per_array, detailed_logs):
@@ -840,6 +1305,7 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
     # ── Step 2: Collect FlashArray protection (4 workers) ────────────────
     per_array = {}
     fa_targets = []
+    fb_targets = []
     for _entry in detect_results:
         if not _entry: continue
         _name, info = _entry
@@ -856,9 +1322,23 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
                             'policy_snapshots': [], 'policy_rules': {},
                             'dir_exports': [], 'eradication': {},
                             'policy_nfs_rules': {}, 'policy_nfs_list': {},
-                            'policy_smb_rules': {}, 'policy_smb_list': {}}
+                            'policy_smb_rules': {}, 'policy_smb_list': {},
+                            'fb_filesystems': [], 'fb_fs_snapshots': [],
+                            'fb_array_connect': [], 'fb_fs_exports': [],
+                            'fb_fs_multi_protocol': [],
+                            'fb_fs_replica_links': [],
+                            'fb_policy_snap_replica': [],
+                            'fb_policy_snapshots': [],
+                            'fb_policy_snap_rules': {},
+                            'fb_policy_smb_share': [],
+                            'fb_policy_smb_share_rules': [],
+                            'fb_policy_nfs': [],
+                            'fb_policy_nfs_rules': []}
         if platform == 'FA':
             fa_targets.append((_name, info.get('user')
+                                      or auth_user_for_array(_name, config)))
+        elif platform == 'FB':
+            fb_targets.append((_name, info.get('user')
                                       or auth_user_for_array(_name, config)))
 
     def _collect_one(_arg):
@@ -867,11 +1347,24 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
         return _name, _collect_one_fa_protection(
             _name, _u, detailed_logs, nogui=nogui)
 
+    def _collect_one_fb(_arg):
+        _idx, (_name, _u) = _arg
+        _p(f"Collecting array {_name} filesystems & snapshots...")
+        return _name, _collect_one_fb_protection(
+            _name, _u, detailed_logs, nogui=nogui)
+
     if fa_targets:
         _workers = min(4, len(fa_targets))
         with ThreadPoolExecutor(max_workers=_workers) as _ex:
             for _name, data in _ex.map(_collect_one,
                                        list(enumerate(fa_targets))):
+                per_array[_name].update(data)
+
+    if fb_targets:
+        _workers = min(4, len(fb_targets))
+        with ThreadPoolExecutor(max_workers=_workers) as _ex:
+            for _name, data in _ex.map(_collect_one_fb,
+                                       list(enumerate(fb_targets))):
                 per_array[_name].update(data)
 
     return per_array, detailed_logs
@@ -1620,6 +2113,179 @@ def aggregate_fa_filesystem_rows(per_array):
     return rows
 
 
+def aggregate_fb_filesystem_rows(per_array):
+    """Build Section 3 rows from per-array FlashBlade inventory.
+
+    One row per filesystem on each FB array. Snapshot counts, snapshot
+    policies, replication destinations, replication policies, and the
+    array-wide / policy-driven Safemode flag are all derived from the
+    fourteen 'fb_*' collections gathered by _collect_one_fb_protection.
+    """
+    # ── Tally snapshot counts ───────────────────────────────────────────
+    # fs_local_snap[(arr, fs)] -> count of local snapshots whose Source
+    #                             matches the filesystem name verbatim
+    #                             (no ':' separator).
+    # fs_repl_snap [(src_arr, fs)] -> count of replicated snapshots
+    #                             whose Source matches 'src_arr:fs' on
+    #                             any other array's purefs list --snap.
+    # fs_policies [(arr, fs)] -> ordered unique list of policy names
+    #                             contributing local snapshots, taken
+    #                             from each snap row's Policies column.
+    fs_local_snap = {}
+    fs_repl_snap  = {}
+    fs_policies   = {}
+    for arr, data in per_array.items():
+        if data.get('platform') != 'FB':
+            continue
+        for snap in data.get('fb_fs_snapshots', []):
+            src = snap.get('source', '')
+            if not src:
+                continue
+            if ':' in src:
+                _src_arr, _src_fs = src.split(':', 1)
+                _key = (_src_arr, _src_fs)
+                fs_repl_snap[_key] = fs_repl_snap.get(_key, 0) + 1
+            else:
+                _key = (arr, src)
+                fs_local_snap[_key] = fs_local_snap.get(_key, 0) + 1
+                _lst  = fs_policies.setdefault(_key, [])
+                _seen = set(_lst)
+                for _p in snap.get('policies', []):
+                    if _p and _p not in _seen:
+                        _lst.append(_p)
+                        _seen.add(_p)
+
+    # ── Per-filesystem replication destinations and policy lists from
+    # purefs replica-link list. A filesystem may carry more than one
+    # link row, each with its own Remote and one or more replication
+    # policies (Policy column is '/'-delimited).
+    repl_dests    = {}
+    repl_policies = {}
+    for arr, data in per_array.items():
+        if data.get('platform') != 'FB':
+            continue
+        for link in data.get('fb_fs_replica_links', []):
+            fs_name = link.get('name', '')
+            if not fs_name:
+                continue
+            _key = (arr, fs_name)
+            remote = link.get('remote', '')
+            if remote:
+                _lst = repl_dests.setdefault(_key, [])
+                if remote not in _lst:
+                    _lst.append(remote)
+            _plst = repl_policies.setdefault(_key, [])
+            for _p in link.get('policies', []):
+                if _p and _p not in _plst:
+                    _plst.append(_p)
+
+    # ── Per-(array, snapshot_policy) retention-lock state and the
+    # longest Keep For (in days) across the policy's rules. Used by
+    # the Safemode and Max Local / Repl Snap Retention columns.
+    pol_lock     = {}
+    pol_max_days = {}
+    for arr, data in per_array.items():
+        if data.get('platform') != 'FB':
+            continue
+        for pol in data.get('fb_policy_snapshots', []):
+            pol_lock[(arr, pol['name'])] = (
+                pol.get('retention_lock') or '').lower()
+        for pol_name, rules in (data.get('fb_policy_snap_rules') or {}).items():
+            best = 0.0
+            for _r in rules:
+                _d = _parse_retention_to_days(_r.get('keep_for', ''))
+                if _d > best:
+                    best = _d
+            pol_max_days[(arr, pol_name)] = best
+
+    # ── Array-wide safemode (purearray eradication-config). When
+    # Manual Eradication is 'all-disabled' every filesystem on the
+    # array is treated as safemode-enabled regardless of policy lock
+    # state, and the File Eradication Delay value is rendered as a
+    # second line under the cell.
+    arr_force_sm = {}
+    arr_sm_delay = {}
+    for arr, data in per_array.items():
+        if data.get('platform') != 'FB':
+            continue
+        erad = data.get('eradication') or {}
+        me = (erad.get('Manual Eradication') or '').strip().lower()
+        arr_force_sm[arr] = (me == 'all-disabled')
+        # FB exposes the delay as "File Eradication Delay"; older FA
+        # output uses "Enabled Delay". Accept either so the renderer
+        # never silently drops the sub-line.
+        arr_sm_delay[arr] = _fmt_eradication_delay(
+            erad.get('File Eradication Delay')
+            or erad.get('Enabled Delay'))
+
+    # ── Assemble rows. One per filesystem; if the FB array has no
+    # filesystems the array contributes no rows.
+    rows = []
+    for arr, data in per_array.items():
+        if data.get('platform') != 'FB':
+            continue
+        for fs in data.get('fb_filesystems', []):
+            fs_name = fs.get('name', '')
+            if not fs_name:
+                continue
+            local_n = fs_local_snap.get((arr, fs_name), 0)
+            rep_n   = fs_repl_snap.get((arr, fs_name), 0)
+            dests   = list(repl_dests.get((arr, fs_name), []))
+            pols    = list(fs_policies.get((arr, fs_name), []))
+            r_pols  = list(repl_policies.get((arr, fs_name), []))
+
+            # Safemode is enabled when either (a) the array's
+            # eradication-config forces it and the row has at least
+            # one local snapshot or (b) any policy contributing a
+            # local snapshot is ratcheted / locked.
+            sm_on    = False
+            sm_delay = ''
+            if arr_force_sm.get(arr) and local_n > 0:
+                sm_on    = True
+                sm_delay = arr_sm_delay.get(arr, '')
+            if not sm_on and local_n > 0:
+                for _p in pols:
+                    _lock = pol_lock.get((arr, _p), '')
+                    if _lock in ('ratcheted', 'locked'):
+                        sm_on = True
+                        break
+
+            # Max local retention: longest Keep For across the
+            # policies that have a snapshot of this filesystem.
+            max_local_days = 0.0
+            for _p in pols:
+                _v = pol_max_days.get((arr, _p), 0.0)
+                if _v > max_local_days:
+                    max_local_days = _v
+            # Max replicated retention: longest Keep For across the
+            # replication policies attached to the filesystem via
+            # purefs replica-link list — only meaningful when the
+            # filesystem actually has at least one replicated
+            # snapshot on a peer array.
+            max_repl_days = 0.0
+            if rep_n > 0:
+                for _p in r_pols:
+                    _v = pol_max_days.get((arr, _p), 0.0)
+                    if _v > max_repl_days:
+                        max_repl_days = _v
+
+            rows.append({
+                'array':                    arr,
+                'fs_name':                  fs_name,
+                'replication_destinations': dests,
+                'local_snaps':              local_n,
+                'replicated_snaps':         rep_n,
+                'safemode':                 sm_on,
+                'safemode_delay':           sm_delay,
+                'snapshot_policies':        pols,
+                'replication_policies':     r_pols,
+                'max_local_retention_days': max_local_days,
+                'max_repl_retention_days':  max_repl_days})
+
+    rows.sort(key=lambda r: (r['array'].lower(), r['fs_name'].lower()))
+    return rows
+
+
 def _load_recent_comments():
     """Return saved per-row comments from the most recent comments JSON
     file under reports/protection/. The file is hand-edited by the user
@@ -1669,11 +2335,9 @@ def build_protection_html(per_array, config):
     """Generate the Volume and Filesystem Protection HTML report.
 
     Three sections:
-      1. FlashArray Volumes  (fully populated)
-      2. FlashArray Filesystems  (Directory Name, Array Name,
-         Replication Destination, Pod, Remote Pod, Local Snapshots
-         populated; remaining columns pending the next iteration)
-      3. FlashBlade Filesystems  (placeholder, spec pending)
+      1. FlashArray Volumes
+      2. FlashArray Filesystems
+      3. FlashBlade Filesystems
     """
     import html as _html
     import time as _time
@@ -1769,6 +2433,26 @@ def build_protection_html(per_array, config):
                 'enabled':        pol.get('enabled', ''),
                 'retention_lock': locks.get(nm, ''),
                 'rules':          rules.get(nm, [])}
+    # FB snapshot policies are folded into the same dict so the existing
+    # showPolicy modal handles them with no separate JS path. Retention
+    # lock comes from each policy row directly (FB doesn't have a
+    # separate `retention-lock list` call); rule entries carry every /
+    # at / keep_for as raw milliseconds, matching the FA shape so the
+    # modal's fmtMsAsDhms / fmtMsAsDays helpers render them verbatim.
+    for arr, info in per_array.items():
+        fb_snaps = info.get('fb_policy_snapshots') or []
+        if not fb_snaps:
+            continue
+        fb_rules = info.get('fb_policy_snap_rules') or {}
+        policy_profiles.setdefault(arr, {})
+        for pol in fb_snaps:
+            nm = pol.get('name', '')
+            if not nm:
+                continue
+            policy_profiles[arr][nm] = {
+                'enabled':        pol.get('enabled', ''),
+                'retention_lock': pol.get('retention_lock', ''),
+                'rules':          fb_rules.get(nm, [])}
     policy_profiles_json = _json.dumps(policy_profiles)
 
     # Per-(array, export_name) profile for the Exports modal in Table
@@ -2132,13 +2816,137 @@ def build_protection_html(per_array, config):
                 f'<td>{_DASH}</td>'
                 '</tr>\n')
 
+    # ── Build Table 3 rows (FlashBlade Filesystems) ─────────────────────
+    # Per-(array, filesystem) export-name map sourced from
+    # `purefs export list`. Stored at render time rather than in the
+    # aggregator so that any later changes to the Exports column can
+    # tweak presentation without re-running the collection.
+    fb_fs_exports = {}
+    for _arr, _data in per_array.items():
+        if _data.get('platform') != 'FB':
+            continue
+        for _exp in _data.get('fb_fs_exports', []):
+            _fs = _exp.get('file_system', '')
+            _en = _exp.get('export_name') or _exp.get('name', '')
+            if not _fs or not _en:
+                continue
+            _lst = fb_fs_exports.setdefault((_arr, _fs), [])
+            if _en not in _lst:
+                _lst.append(_en)
+
+    rows_t3 = aggregate_fb_filesystem_rows(per_array)
+    tr_html_t3 = ""
+    if not rows_t3:
+        tr_html_t3 = ('<tr><td colspan="13" style="text-align:center;color:#888;">'
+                      'No FlashBlade filesystems discovered.</td></tr>')
+    else:
+        # Shared SLA-cell styling: matches Table 2 so the visual treatment
+        # of the L/M columns is identical across both filesystem tables.
+        _CHECK_T3 = '\u2713'
+        _GREEN_T3 = (_OK + 'text-align:center;font-weight:bold;'
+                     'font-size:13pt;')
+        _RED_T3   = (_BAD + 'text-align:center;font-weight:bold;'
+                     'font-size:9pt;')
+        for r in rows_t3:
+            arr     = r['array']
+            fs_name = r['fs_name']
+            dests_ok = bool(r['replication_destinations'])
+            dests = (', '.join(_html.escape(d)
+                               for d in r['replication_destinations'])
+                     if dests_ok else _DASH)
+            local_n = int(r['local_snaps'])
+            rep_n   = int(r['replicated_snaps'])
+            # Replicated-snapshots cell: green when present, red when 0.
+            # Unlike FA Table 2 there is no "eligible" distinction — any
+            # FB filesystem can carry replicated snapshots if it has an
+            # inbound replica-link, but the column still flags red on 0
+            # so unprotected rows are visually obvious.
+            if rep_n > 0:
+                rep_cell = (f'<td style="{_OK}text-align:right;">{rep_n}</td>')
+            else:
+                rep_cell = (f'<td style="{_BAD}text-align:right;">{rep_n}</td>')
+            sm_on = bool(r.get('safemode'))
+            sm_text = 'Enabled' if sm_on else 'Disabled'
+            sm_style = ((_OK if sm_on else _BAD)
+                        + 'text-align:center;font-weight:bold;')
+            sm_delay = r.get('safemode_delay', '') if sm_on else ''
+            sm_inner = sm_text
+            if sm_delay:
+                sm_inner += (
+                    f'<br><span style="font-weight:normal;font-size:smaller;">'
+                    f'{_html.escape(sm_delay)}</span>')
+            # Snapshot- and Replication-Policy cells share the policy
+            # modal already wired up for Table 2; each name renders as
+            # a clickable link bound to the row's source array. FB
+            # policies are non-pod-scoped so there's no peer-array
+            # fallback needed.
+            pols_list  = r.get('snapshot_policies')     or []
+            rpols_list = r.get('replication_policies')  or []
+            pols_ok    = bool(pols_list)
+            rpols_ok   = bool(rpols_list)
+            def _pol_link(p, _a=arr):
+                return (f'<a href="#" class="pg-link" '
+                        f'data-arr="{_html.escape(_a, quote=True)}" '
+                        f'data-pol="{_html.escape(p, quote=True)}" '
+                        f'onclick="showPolicy(this);return false;">'
+                        f'{_html.escape(p)}</a>')
+            pols_cell  = (', '.join(_pol_link(p) for p in pols_list)
+                          if pols_ok  else _DASH)
+            rpols_cell = (', '.join(_pol_link(p) for p in rpols_list)
+                          if rpols_ok else _DASH)
+            exp_list = fb_fs_exports.get((arr, fs_name), [])
+            exp_ok   = bool(exp_list)
+            exp_cell = (', '.join(_html.escape(e) for e in exp_list)
+                        if exp_ok else _DASH)
+            loc_ret_n  = float(r.get('max_local_retention_days', 0) or 0)
+            repl_ret_n = float(r.get('max_repl_retention_days', 0)  or 0)
+            loc_ret_disp  = (f'{round(loc_ret_n,  2):g}'
+                             if loc_ret_n  > 0 else _DASH)
+            repl_ret_disp = (f'{round(repl_ret_n, 2):g}'
+                             if repl_ret_n > 0 else _DASH)
+            # SLA L: green check when local retention meets SLA; else a
+            # short red reason. A 0 threshold disables the check.
+            def _t3_local_sla():
+                if sla_snap_days <= 0:
+                    return f'<td style="text-align:center;">{_DASH}</td>'
+                if not pols_list or local_n == 0:
+                    return f'<td style="{_RED_T3}">Snapshots Not Enabled</td>'
+                if loc_ret_n >= sla_snap_days:
+                    return f'<td style="{_GREEN_T3}">{_CHECK_T3}</td>'
+                return f'<td style="{_RED_T3}">Snapshot Retention Too Short</td>'
+            # SLA M: green check when replicated retention meets SLA;
+            # else a short red reason. "Replication Not Enabled" covers
+            # both the no-replica-link and no-replicated-snapshot cases
+            # since either means the row carries no replicated coverage.
+            def _t3_repl_sla():
+                if sla_repl_days <= 0:
+                    return f'<td style="text-align:center;">{_DASH}</td>'
+                if (not rpols_list) or rep_n == 0 or not dests_ok:
+                    return f'<td style="{_RED_T3}">Replication Not Enabled</td>'
+                if repl_ret_n >= sla_repl_days:
+                    return f'<td style="{_GREEN_T3}">{_CHECK_T3}</td>'
+                return f'<td style="{_RED_T3}">Replicated Retention Too Short</td>'
+            tr_html_t3 += (
+                '<tr>'
+                f'<td>{_html.escape(fs_name)}</td>'
+                f'<td>{_html.escape(arr)}</td>'
+                f'<td style="{_OK if dests_ok else _BAD}">{dests}</td>'
+                f'<td style="{_OK if local_n > 0 else _BAD}text-align:right;">{local_n}</td>'
+                f'{rep_cell}'
+                f'<td style="{sm_style}">{sm_inner}</td>'
+                f'<td style="{_OK if pols_ok  else _BAD}">{pols_cell}</td>'
+                f'<td style="{_OK if rpols_ok else _BAD}">{rpols_cell}</td>'
+                f'<td style="{_OK if exp_ok   else _BAD}">{exp_cell}</td>'
+                f'<td style="{_OK if loc_ret_n  > 0 else _BAD}text-align:right;">{loc_ret_disp}</td>'
+                f'<td style="{_OK if repl_ret_n > 0 else _BAD}text-align:right;">{repl_ret_disp}</td>'
+                f'{_t3_local_sla()}'
+                f'{_t3_repl_sla()}'
+                '</tr>\n')
+
     err_banner = ''
     if err_lines:
         err_banner = ('<div class="err-banner"><strong>Collection errors:</strong><br>'
                       + '<br>'.join(err_lines) + '</div>')
-
-    placeholder = ('<p style="color:#666;font-style:italic;">'
-                   'Specification pending &mdash; coming in next update.</p>')
 
     # Static info banner above Table 1 reminding the reader that the
     # Comments column is read-only and how to update it. Only rendered
@@ -2513,6 +3321,18 @@ def build_protection_html(per_array, config):
         'Max Local Snap Retention (Days)', 'Max Repl Snap Retention (Days)',
         'Local Snap Retention vs SLA', 'Repl Snap Retention vs SLA',
         'Exports', 'Non Protection Reasoning']
+    # Table 3 mirrors Table 2 without the Pod / Remote Pod columns
+    # (FlashBlade filesystems are not pod-scoped) and with an explicit
+    # "Replication Policies" column splitting the snapshot policies that
+    # drive replica-link traffic out from the local snapshot policies.
+    # Column letters A..M align with the user's Section 3 spec; the
+    # SLA columns L/M compare against the days in columns J/K.
+    _T3_COLS = [
+        'Filesystem Name', 'Array Name', 'Replication Destination',
+        'Local Snapshots', 'Replicated Snapshots', 'Safemode',
+        'Snapshot Policies', 'Replication Policies', 'Exports',
+        'Max Local Snap Retention (Days)', 'Max Repl Snap Retention (Days)',
+        'Local Snap Retention vs SLA', 'Repl Snap Retention vs SLA']
     def _build_thead(cols):
         return ('<thead><tr>' + ''.join(
             f'<th class="sortable" onclick="sfHeaderClick(event,{i})">'
@@ -2524,6 +3344,7 @@ def build_protection_html(per_array, config):
             for i, c in enumerate(cols)) + '</tr></thead>')
     thead_t1 = _build_thead(_T1_COLS)
     thead_t2 = _build_thead(_T2_COLS)
+    thead_t3 = _build_thead(_T3_COLS)
 
     sf_script = r"""<script>
 (function(){
@@ -2877,7 +3698,8 @@ def build_protection_html(per_array, config):
   <p class="meta">Generated {now_str} {tz}</p>
   <p class="meta">Arrays inventoried: {len(per_array)} &middot;
                   FlashArray volume rows: {len(rows)} &middot;
-                  FlashArray filesystem rows: {len(rows_t2)}</p>
+                  FlashArray filesystem rows: {len(rows_t2)} &middot;
+                  FlashBlade filesystem rows: {len(rows_t3)}</p>
   <p class="meta">Minimum Snapshot Retention SLA:
                   {('%d day(s)' % sla_snap_days) if sla_snap_days > 0 else 'Not set'}
                   &middot; Minimum Replicated Retention SLA:
@@ -2904,7 +3726,13 @@ def build_protection_html(per_array, config):
   </div>
 
   <h2>3. FlashBlade Filesystems</h2>
-  {placeholder}
+  <div class="t1-wrap">
+    <table class="sf t1">
+      {thead_t3}
+      <tbody>
+{tr_html_t3}      </tbody>
+    </table>
+  </div>
 
   {modal_block}
   {script_block}
@@ -2914,4 +3742,4 @@ def build_protection_html(per_array, config):
 """
 
 
-__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purepolicy_snapshot_list_csv', '_parse_purepolicy_snapshot_rule_list_csv', '_parse_puredir_export_list_csv', '_parse_purepolicy_nfs_rule_list_csv', '_parse_purepolicy_nfs_list_csv', '_parse_purepolicy_smb_rule_list_csv', '_parse_purepolicy_smb_list_csv', '_parse_retention_to_days', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', '_load_recent_comments', 'build_protection_html']
+__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purepolicy_snapshot_list_csv', '_parse_purepolicy_snapshot_rule_list_csv', '_parse_puredir_export_list_csv', '_parse_purepolicy_nfs_rule_list_csv', '_parse_purepolicy_nfs_list_csv', '_parse_purepolicy_smb_rule_list_csv', '_parse_purepolicy_smb_list_csv', '_parse_fb_purefs_list_csv', '_parse_fb_purefs_snap_csv', '_parse_fb_purearray_list_connect_csv', '_parse_fb_purefs_export_list_csv', '_parse_fb_purefs_multi_protocol_csv', '_parse_fb_purefs_replica_link_csv', '_parse_fb_purepolicy_snapshot_replica_link_csv', '_parse_fb_purepolicy_snapshot_list_csv', '_parse_fb_purepolicy_snapshot_rule_list_csv', '_parse_fb_purepolicy_smb_share_list_csv', '_parse_fb_purepolicy_smb_share_rule_list_csv', '_parse_fb_purepolicy_nfs_list_csv', '_parse_fb_purepolicy_nfs_rule_list_csv', '_parse_retention_to_days', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', '_collect_one_fb_protection', '_fake_fb_protection_data_for', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', 'aggregate_fb_filesystem_rows', '_load_recent_comments', 'build_protection_html']
