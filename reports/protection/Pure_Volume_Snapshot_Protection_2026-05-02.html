@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Volume &amp; Snapshot Protection</title>
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 10pt; margin: 16px; }
+    h1   { color: #1f3a5c; margin: 0 0 4px 0; }
+    h2   { color: #1f3a5c; margin: 24px 0 8px 0; border-bottom: 1px solid #b8cfe8;
+           padding-bottom: 4px; }
+    p.meta { margin: 2px 0; color: #444; }
+    table { border-collapse: collapse; width: 100%; margin-top: 6px; }
+    th, td { border: 1px solid #b8cfe8; padding: 4px 8px; vertical-align: top; }
+    th    { background: #dce6f1; font-weight: bold; }
+    tr:nth-child(even) td { background: #f7faff; }
+    /* Pin the table header to the top of the viewport while the body
+       scrolls. `border-collapse: collapse` causes the cell's own borders
+       to scroll away with the content, so we redraw the top + bottom
+       edges with a box-shadow that stays anchored to the sticky cell.
+       z-index keeps the header above body cells but below the modal
+       overlay (which is z-index 1000). */
+    thead th { position: sticky; top: 0; z-index: 2;
+                box-shadow: inset 0 1px 0 #b8cfe8,
+                            inset 0 -1px 0 #b8cfe8; }
+    /* Volumes table: own scroll container so the sticky thead and
+       the frozen left columns both anchor to this wrap (not the
+       page). min-width on the table forces horizontal overflow on
+       narrow viewports; box-sizing makes the fixed widths on the
+       frozen columns match the left offsets exactly. */
+    .t1-wrap { overflow: auto; max-height: calc(100vh - 220px);
+                border: 1px solid #b8cfe8; margin-top: 6px; }
+    .t1-wrap > table.t1 { margin-top: 0; min-width: 1700px; }
+    .t1-wrap > table.t1 th,
+    .t1-wrap > table.t1 td { box-sizing: border-box; }
+    /* Freeze "Volume Name" (col 1) and "Array Name" (col 2). Sticky
+       cells need an opaque background since rows scroll under them;
+       the inset right-edge shadow draws the seam between the frozen
+       pane and the scrolling body. With table-layout:auto a plain
+       `width` on a cell is only a hint -- the browser may render the
+       column wider or narrower based on content. min-width+max-width
+       lock the rendered width exactly so col 2's `left: 220px`
+       offset matches col 1's actual right edge (otherwise a gap or
+       overlap appears between the two frozen columns). word-break
+       lets long volume names wrap inside the fixed width. */
+    .t1-wrap > table.t1 th:nth-child(1),
+    .t1-wrap > table.t1 td:nth-child(1) {
+        position: sticky; left: 0;
+        width: 220px; min-width: 220px; max-width: 220px;
+        word-break: break-word;
+        background: #fff; z-index: 1;
+        box-shadow: inset -1px 0 0 #b8cfe8; }
+    .t1-wrap > table.t1 th:nth-child(2),
+    .t1-wrap > table.t1 td:nth-child(2) {
+        position: sticky; left: 220px;
+        width: 170px; min-width: 170px; max-width: 170px;
+        word-break: break-word;
+        background: #fff; z-index: 1;
+        box-shadow: inset -1px 0 0 #b8cfe8; }
+    /* Re-apply the even-row tint on the frozen cells so the body
+       stripe doesn't show through the opaque sticky background. */
+    .t1-wrap > table.t1 tbody tr:nth-child(even) td:nth-child(1),
+    .t1-wrap > table.t1 tbody tr:nth-child(even) td:nth-child(2) {
+        background: #f7faff; }
+    /* Header corner cells: sticky on both axes. z-index 3 keeps
+       them above plain sticky-top headers (z-index 2) and plain
+       sticky-left body cells (z-index 1). Re-add the top/bottom
+       inset edges plus the right-edge seam. */
+    .t1-wrap > table.t1 thead th:nth-child(1),
+    .t1-wrap > table.t1 thead th:nth-child(2) {
+        background: #dce6f1; z-index: 3;
+        box-shadow: inset 0 1px 0 #b8cfe8,
+                    inset 0 -1px 0 #b8cfe8,
+                    inset -1px 0 0 #b8cfe8; }
+    .err-banner { background: #fff4f4; border: 1px solid #e0a0a0;
+                  padding: 6px 10px; margin: 8px 0; border-radius: 4px;
+                  color: #802020; }
+    .pg-link { color: #1a5fb4; cursor: pointer; text-decoration: underline; }
+    .pg-link:hover { color: #0b3d8c; }
+    .modal { display: none; position: fixed; inset: 0;
+             background: rgba(0,0,0,0.45);
+             align-items: flex-start; justify-content: center;
+             z-index: 1000; overflow: auto; padding-top: 60px; }
+    .modal-content { background: white; padding: 16px 20px;
+                     border-radius: 6px; width: min(90%, 760px);
+                     box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+                     position: relative; }
+    .modal-close { position: absolute; top: 6px; right: 12px;
+                   font-size: 20px; cursor: pointer; color: #666; }
+    .modal-close:hover { color: #000; }
+    .modal-content h3 { margin: 0 0 4px 0; color: #1f3a5c; }
+    .modal-content h4 { margin: 14px 0 4px 0; color: #1f3a5c; }
+    .pg-detail { width: 100%; border-collapse: collapse; margin-top: 0; }
+    .pg-detail th, .pg-detail td { border: 1px solid #b8cfe8;
+                                   padding: 4px 8px; font-size: 9pt; }
+    .pg-detail th { background: #dce6f1; }
+    /* Sort/filter chrome for tables marked class="sf". Each header cell
+       stacks a clickable label (with sort indicator) above a per-column
+       filter input; the input swallows its own clicks so typing into it
+       does not also toggle the column's sort. */
+    table.sf thead th { vertical-align: top; padding-top: 4px; }
+    table.sf thead th.sortable { cursor: pointer; user-select: none; }
+    table.sf thead th.sortable:hover { background: #c8d8ec; }
+    table.sf thead th .th-lbl { white-space: nowrap; }
+    table.sf thead th .sort-ind { color: #6b89ad; font-weight: normal;
+                                   font-size: 9pt; }
+    table.sf thead th.sort-asc .sort-ind,
+    table.sf thead th.sort-desc .sort-ind { color: #1f3a5c;
+                                             font-weight: bold; }
+    table.sf thead th .filter-input {
+        display: block; box-sizing: border-box; width: 100%;
+        margin-top: 3px; padding: 1px 3px;
+        font: 9pt 'Segoe UI', Arial, sans-serif; font-weight: normal;
+        border: 1px solid #b8cfe8; border-radius: 2px;
+        background: #fff; }
+    table.sf thead th .filter-input:focus {
+        outline: 1px solid #1a5fb4; }
+    /* Color-sort widget: a pair of clickable green/red dots appended to
+       the header label of any column whose body cells use the green/red
+       shading (Replication Destinations, Pod, Safemode, etc.). The JS
+       injects these only on color-bearing columns. Selecting a color
+       sort clears any text/numeric sort on the same table. */
+    table.sf thead th .color-sort {
+        margin-left: 4px; user-select: none; font-size: 9pt; }
+    table.sf thead th .color-sort .cs-g,
+    table.sf thead th .color-sort .cs-r {
+        cursor: pointer; padding: 0 2px;
+        opacity: 0.55; border-radius: 2px; }
+    table.sf thead th .color-sort .cs-g { color: #28a745; }
+    table.sf thead th .color-sort .cs-r { color: #dc3545; }
+    table.sf thead th .color-sort .cs-g:hover,
+    table.sf thead th .color-sort .cs-r:hover { opacity: 0.9; }
+    table.sf thead th .color-sort .cs-g.active {
+        opacity: 1; background: #d4edda;
+        outline: 1px solid #28a745; }
+    table.sf thead th .color-sort .cs-r.active {
+        opacity: 1; background: #f8d7da;
+        outline: 1px solid #dc3545; }
+    /* Comments column: per-row <textarea> with a per-cell Last Updated
+       timestamp directly underneath. Edits autosave to a single file
+       under reports/protection/ via the File System Access API; the
+       per-row Save button is gone in favor of debounced autosave. */
+    td.comment-cell { min-width: 220px; padding: 4px; }
+    td.comment-cell textarea.comment-input {
+        width: 100%; box-sizing: border-box; resize: vertical;
+        font: 9pt 'Segoe UI', Arial, sans-serif;
+        border: 1px solid #b8cfe8; border-radius: 2px;
+        padding: 2px 4px; background: #fff; }
+    td.comment-cell textarea.comment-input:focus {
+        outline: 1px solid #1a5fb4; }
+    td.comment-cell.comment-dirty textarea.comment-input {
+        border-color: #d49a00; background: #fffbe6; }
+    td.comment-cell .comment-meta {
+        margin-top: 3px; font-size: 8.5pt; color: #555;
+        white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis; }
+    td.comment-cell .comment-meta-lbl { color: #888; }
+    td.comment-cell .comment-updated { color: #1f3a5c; }
+    /* Global Save-All toolbar + autosave status indicator above
+       Table 1. The button drives the one-time folder pick; the
+       coloured status pill reflects autosave state. */
+    .comments-toolbar { display: flex; align-items: center;
+                         gap: 12px; margin: 6px 0 8px 0;
+                         flex-wrap: wrap; }
+    .comments-toolbar button.comment-save-all,
+    .comments-toolbar button.comment-load-all {
+        font: 10pt 'Segoe UI', Arial, sans-serif; font-weight: bold;
+        padding: 5px 16px; border: 1px solid #1a5fb4;
+        background: #e6efff; color: #1f3a5c; border-radius: 3px;
+        cursor: pointer; }
+    .comments-toolbar button.comment-save-all:hover,
+    .comments-toolbar button.comment-load-all:hover {
+        background: #d4e2f7; }
+    .comments-toolbar button.comment-save-all.saved-flash {
+        background: #d4edda; border-color: #28a745; color: #1f5c2f; }
+    /* Tint the load button slightly differently so the two actions
+       are visually distinct in the toolbar. */
+    .comments-toolbar button.comment-load-all {
+        background: #f0f4fa; }
+    .comments-toolbar .comments-status {
+        font-size: 9pt; padding: 2px 8px; border-radius: 3px;
+        border: 1px solid transparent; }
+    .comments-toolbar .comments-status.ok {
+        background: #d4edda; border-color: #28a745; color: #1f5c2f; }
+    .comments-toolbar .comments-status.warn {
+        background: #fff4d6; border-color: #d49a00; color: #6b4a00; }
+    .comments-toolbar .comments-status.err {
+        background: #f8d7da; border-color: #dc3545; color: #6b1f29; }
+    .comments-toolbar .comments-toolbar-hint {
+        font-size: 9pt; color: #666; }
+    .comments-toolbar .comments-toolbar-hint code {
+        background: #f0f4fa; padding: 0 4px; border-radius: 2px;
+        font-family: Consolas, 'Courier New', monospace; }
+  </style>
+</head>
+<body>
+  <h1>Everpure &mdash; Volume &amp; Snapshot Protection</h1>
+  <p class="meta">Generated Saturday, May 02, 2026 at 09:14:31 PM Eastern Daylight Time</p>
+  <p class="meta">Arrays inventoried: 4 &middot;
+                  FlashArray volume rows: 0</p>
+  <div class="err-banner"><strong>Collection errors:</strong><br>flasharray1: [Errno 11001] getaddrinfo failed<br>flasharray2: [Errno 11001] getaddrinfo failed<br>flashblade1: [Errno 11001] getaddrinfo failed<br>flashblade2: [Errno 11001] getaddrinfo failed</div>
+
+  <h2>1. FlashArray Volumes</h2>
+  
+  <div class="t1-wrap">
+    <table class="sf t1">
+      <thead><tr><th class="sortable" onclick="sfHeaderClick(event,0)"><div class="th-lbl">Volume Name<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,0)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,1)"><div class="th-lbl">Array Name<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,1)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,2)"><div class="th-lbl">Replication Destinations<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,2)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,3)"><div class="th-lbl">Pod<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,3)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,4)"><div class="th-lbl">Remote Pod<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,4)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,5)"><div class="th-lbl">Local Snapshots<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,5)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,6)"><div class="th-lbl">Pod Snapshots<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,6)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,7)"><div class="th-lbl">Replicated Snapshots<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,7)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,8)"><div class="th-lbl">Safemode<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,8)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,9)"><div class="th-lbl">Protection Groups<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,9)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,10)"><div class="th-lbl">Connected Hosts<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,10)" onclick="event.stopPropagation()"></th><th class="sortable" onclick="sfHeaderClick(event,11)"><div class="th-lbl">Non Protection Reasoning<span class="sort-ind"> ⇕</span></div><input class="filter-input" type="text" placeholder="filter…" oninput="sfFilter(this,11)" onclick="event.stopPropagation()"></th></tr></thead>
+      <tbody>
+<tr><td colspan="12" style="text-align:center;color:#888;">No FlashArray volumes discovered.</td></tr>      </tbody>
+    </table>
+  </div>
+
+  <h2>2. FlashArray Filesystems</h2>
+  <p style="color:#666;font-style:italic;">Specification pending &mdash; coming in next update.</p>
+
+  <h2>3. FlashBlade Filesystems</h2>
+  <p style="color:#666;font-style:italic;">Specification pending &mdash; coming in next update.</p>
+
+  
+  
+  <script>
+(function(){
+  function cellVal(c){
+    if(!c) return '';
+    // Comment cells host a <textarea>; sort/filter against the user's
+    // current input rather than the static cell text.
+    var ta = c.querySelector && c.querySelector('textarea');
+    if(ta) return (ta.value || '').trim();
+    var t = c.textContent.trim();
+    if(t === '\u2014' || t === '-') return '';
+    return t;
+  }
+  function isNumLike(s){
+    if(s === '') return false;
+    return /^[-+]?[0-9]+(\.[0-9]+)?$/.test(
+      s.replace(/,/g,'').replace(/\s+/g,''));
+  }
+  function cmp(a,b,dir){
+    if(a==='' && b==='') return 0;
+    if(a==='') return 1;
+    if(b==='') return -1;
+    if(isNumLike(a) && isNumLike(b)){
+      return (parseFloat(a.replace(/,/g,''))
+            - parseFloat(b.replace(/,/g,''))) * dir;
+    }
+    return a.toLowerCase().localeCompare(b.toLowerCase()) * dir;
+  }
+  function setInd(th, dir){
+    var ind = th.querySelector('.sort-ind');
+    if(!ind) return;
+    ind.textContent = dir === 1 ? ' \u25b2'
+                    : (dir === -1 ? ' \u25bc' : ' \u21d5');
+  }
+  // Cell colour detection. Inline styles like background:#d4edda end up
+  // as backgroundColor 'rgb(212, 237, 218)' once parsed by the browser.
+  function colorOf(c){
+    if(!c) return '';
+    var bg = c.style && c.style.backgroundColor;
+    if(bg === 'rgb(212, 237, 218)') return 'g';
+    if(bg === 'rgb(248, 215, 218)') return 'r';
+    return '';
+  }
+  function detectColorCols(tbl){
+    var ncols = tbl.tHead.rows[0].cells.length;
+    var has = new Array(ncols).fill(false);
+    for(var i=0;i<tbl._sf.orig.length;i++){
+      var row = tbl._sf.orig[i];
+      for(var j=0;j<ncols;j++){
+        if(colorOf(row.cells[j])) has[j] = true;
+      }
+    }
+    return has;
+  }
+  // For columns whose body cells use the green/red shading, append a
+  // pair of clickable dots to the header label. Each dot toggles a
+  // "greens first" or "reds first" sort on that column. Dots
+  // stopPropagation so clicking them never triggers the underlying
+  // text-sort cycle on the th.
+  function injectColorWidgets(tbl){
+    var has = detectColorCols(tbl);
+    var ths = tbl.tHead.rows[0].cells;
+    for(let j=0;j<ths.length;j++){
+      if(!has[j]) continue;
+      var lbl = ths[j].querySelector('.th-lbl');
+      if(!lbl) continue;
+      var w = document.createElement('span');
+      w.className = 'color-sort';
+      w.innerHTML = ' <span class="cs-g" title="Sort greens first">'
+                  + '\u25CF</span><span class="cs-r" '
+                  + 'title="Sort reds first">\u25CF</span>';
+      lbl.appendChild(w);
+      w.querySelector('.cs-g').addEventListener('click', function(e){
+        e.stopPropagation();
+        cycleColorSort(tbl, j, 'g');
+      });
+      w.querySelector('.cs-r').addEventListener('click', function(e){
+        e.stopPropagation();
+        cycleColorSort(tbl, j, 'r');
+      });
+    }
+  }
+  function cycleColorSort(tbl, idx, target){
+    var s = tbl._sf;
+    // Selecting a colour sort clears any active text/numeric sort so
+    // the table is only ever ordered by one criterion at a time.
+    s.col = -1; s.dir = 0;
+    if(s.colorCol === idx && s.colorMode === target){
+      s.colorCol = -1; s.colorMode = '';
+    } else {
+      s.colorCol = idx; s.colorMode = target;
+    }
+    applyTable(tbl);
+  }
+  function applyTable(tbl){
+    var tbody = tbl.tBodies[0];
+    var s = tbl._sf;
+    if(!s) return;
+    var filtered = s.orig.filter(function(r){
+      for(var i=0;i<s.filters.length;i++){
+        var f = s.filters[i];
+        if(!f) continue;
+        var c = r.cells[i];
+        if(!c) return false;
+        if(cellVal(c).toLowerCase().indexOf(f) < 0) return false;
+      }
+      return true;
+    });
+    if(s.colorCol >= 0 && s.colorMode){
+      var cc = s.colorCol, mode = s.colorMode;
+      var rank = function(cell){
+        var col = colorOf(cell);
+        if(mode === 'g') return col === 'g' ? 0 : (col === '' ? 1 : 2);
+        return col === 'r' ? 0 : (col === '' ? 1 : 2);
+      };
+      filtered = filtered.slice().sort(function(a,b){
+        return rank(a.cells[cc]) - rank(b.cells[cc]);
+      });
+    } else if(s.col >= 0 && s.dir !== 0){
+      filtered = filtered.slice().sort(function(a,b){
+        return cmp(cellVal(a.cells[s.col]),
+                   cellVal(b.cells[s.col]), s.dir);
+      });
+    }
+    var ths = tbl.tHead.rows[0].cells;
+    for(var i=0;i<ths.length;i++){
+      ths[i].classList.remove('sort-asc','sort-desc');
+      var csG = ths[i].querySelector('.cs-g');
+      var csR = ths[i].querySelector('.cs-r');
+      if(csG) csG.classList.remove('active');
+      if(csR) csR.classList.remove('active');
+      if(i === s.col && s.dir !== 0){
+        ths[i].classList.add(s.dir === 1 ? 'sort-asc' : 'sort-desc');
+        setInd(ths[i], s.dir);
+      } else {
+        setInd(ths[i], 0);
+      }
+      if(i === s.colorCol && s.colorMode){
+        var cs = ths[i].querySelector(
+          s.colorMode === 'g' ? '.cs-g' : '.cs-r');
+        if(cs) cs.classList.add('active');
+      }
+    }
+    var ds = new Set(filtered);
+    for(var j=0;j<s.orig.length;j++){
+      s.orig[j].style.display = ds.has(s.orig[j]) ? '' : 'none';
+    }
+    for(var k=0;k<filtered.length;k++){
+      tbody.appendChild(filtered[k]);
+    }
+  }
+  function initTable(tbl){
+    var tbody = tbl.tBodies[0];
+    if(!tbody) return;
+    var orig = [];
+    for(var i=0;i<tbody.rows.length;i++) orig.push(tbody.rows[i]);
+    var ncols = (tbl.tHead && tbl.tHead.rows[0])
+              ? tbl.tHead.rows[0].cells.length : 0;
+    tbl._sf = {orig:orig, col:-1, dir:0,
+               colorCol:-1, colorMode:'',
+               filters:new Array(ncols).fill('')};
+    injectColorWidgets(tbl);
+  }
+  window.sfHeaderClick = function(e, idx){
+    if(e.target.tagName === 'INPUT') return;
+    if(e.target.closest && e.target.closest('.color-sort')) return;
+    var tbl = e.currentTarget.closest('table');
+    if(!tbl || !tbl._sf) return;
+    var s = tbl._sf;
+    // Selecting a text sort clears any active colour sort.
+    s.colorCol = -1; s.colorMode = '';
+    if(s.col !== idx){ s.col = idx; s.dir = 1; }
+    else if(s.dir === 1) s.dir = -1;
+    else if(s.dir === -1){ s.dir = 0; s.col = -1; }
+    else s.dir = 1;
+    applyTable(tbl);
+  };
+  window.sfFilter = function(input, idx){
+    var tbl = input.closest('table');
+    if(!tbl || !tbl._sf) return;
+    tbl._sf.filters[idx] = input.value.toLowerCase();
+    applyTable(tbl);
+  };
+  document.addEventListener('DOMContentLoaded', function(){
+    document.querySelectorAll('table.sf').forEach(initTable);
+  });
+  // --- Comments column: debounced autosave to reports/protection/. -
+  // Edits flush automatically ~600 ms after the last keystroke. The
+  // chosen reports/protection/ directory handle is persisted in
+  // IndexedDB so subsequent page loads only need a one-click
+  // permission grant (no folder picker again).
+  function _stamp(d){
+    function p(n){ return (n<10?'0':'')+n; }
+    return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())
+         +' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+  }
+  function _fnstamp(d){
+    function p(n){ return (n<10?'0':'')+n; }
+    return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())
+         +'_'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());
+  }
+  // ---- IndexedDB shim for the directory handle ---------------------
+  function _idbOpen(){
+    return new Promise(function(res, rej){
+      if(!window.indexedDB){ rej(new Error('no idb')); return; }
+      var r = indexedDB.open('pure-comments', 1);
+      r.onupgradeneeded = function(){ r.result.createObjectStore('h'); };
+      r.onsuccess = function(){ res(r.result); };
+      r.onerror   = function(){ rej(r.error); };
+    });
+  }
+  async function _idbGet(key){
+    try {
+      var db = await _idbOpen();
+      return await new Promise(function(res, rej){
+        var t = db.transaction('h','readonly').objectStore('h').get(key);
+        t.onsuccess = function(){ res(t.result); };
+        t.onerror   = function(){ rej(t.error); };
+      });
+    } catch(e){ return null; }
+  }
+  async function _idbPut(key, val){
+    try {
+      var db = await _idbOpen();
+      return await new Promise(function(res, rej){
+        var t = db.transaction('h','readwrite').objectStore('h').put(val, key);
+        t.onsuccess = function(){ res(); };
+        t.onerror   = function(){ rej(t.error); };
+      });
+    } catch(e){}
+  }
+  // ---- Directory handle resolver -----------------------------------
+  // _ensureDir(false) → silent: returns the cached handle iff the page
+  // already has 'granted' read/write permission for it; never prompts.
+  // _ensureDir(true)  → may invoke requestPermission (one click) or
+  // showDirectoryPicker (one folder pick) on a user gesture.
+  var _dirHandle    = null;
+  var _dirLoaded    = false;
+  async function _loadCachedDir(){
+    if(_dirLoaded) return;
+    _dirLoaded = true;
+    try { _dirHandle = await _idbGet('dir') || null; } catch(e){}
+  }
+  async function _ensureDir(promptOk){
+    await _loadCachedDir();
+    if(_dirHandle && _dirHandle.queryPermission){
+      var p = await _dirHandle.queryPermission({mode:'readwrite'});
+      if(p === 'granted') return _dirHandle;
+      if(promptOk){
+        try { p = await _dirHandle.requestPermission({mode:'readwrite'}); }
+        catch(e){ p = 'denied'; }
+        if(p === 'granted') return _dirHandle;
+      }
+    }
+    if(promptOk && window.showDirectoryPicker){
+      try {
+        var h = await window.showDirectoryPicker({
+          id:    'pure-reports-protection',
+          mode:  'readwrite',
+          startIn: 'documents'});
+        _dirHandle = h;
+        await _idbPut('dir', h);
+        return _dirHandle;
+      } catch(e){
+        if(e && e.name === 'AbortError') return null;
+        return null;
+      }
+    }
+    return null;
+  }
+  // ---- Status indicator + button flash -----------------------------
+  function _setStatus(msg, kind){
+    var s = document.getElementById('comments-status');
+    if(!s) return;
+    s.textContent = msg;
+    s.classList.remove('ok','warn','err');
+    if(kind) s.classList.add(kind);
+  }
+  function _flashSaved(){
+    var btns = document.querySelectorAll('button.comment-save-all');
+    btns.forEach(function(b){
+      var prev = b.textContent;
+      b.textContent = 'Saved \u2713';
+      b.classList.add('saved-flash');
+      setTimeout(function(){
+        b.textContent = prev;
+        b.classList.remove('saved-flash');
+      }, 1200);
+    });
+  }
+  // ---- Per-row gather: stamp changed cells, build payload ----------
+  function _gather(){
+    var cells = document.querySelectorAll('td.comment-cell');
+    var now   = new Date();
+    var stamp = _stamp(now);
+    var entries = [];
+    var changed = 0;
+    cells.forEach(function(cell){
+      var ta = cell.querySelector('textarea.comment-input');
+      if(!ta) return;
+      var arr  = cell.getAttribute('data-arr') || '';
+      var vol  = cell.getAttribute('data-vol') || '';
+      var val  = ta.value || '';
+      var orig = cell.getAttribute('data-orig') || '';
+      var lbl  = cell.querySelector('.comment-updated');
+      var upd  = lbl ? (lbl.textContent || '') : '';
+      if(upd === '\u2014') upd = '';
+      if(val !== orig){
+        upd = stamp;
+        changed += 1;
+        cell.setAttribute('data-orig', val);
+        cell.classList.remove('comment-dirty');
+        if(lbl) lbl.textContent = upd;
+        try { ta.textContent = val; } catch(e) {}
+      }
+      if(val !== '' || upd !== ''){
+        entries.push({array:arr, volume:vol,
+                      comment:val, last_updated:upd});
+      }
+    });
+    return {now:now, stamp:stamp, changed:changed,
+            payload:{generated:stamp, comments:entries}};
+  }
+  // ---- Write the payload to comments_active.json -------------------
+  // Always uses the same filename inside the chosen reports/protection/
+  // directory so the loader's "newest-mtime wins" picker keeps finding
+  // the same file across runs.
+  async function _writeJson(json, promptOk){
+    var dir = await _ensureDir(promptOk);
+    if(!dir) return false;
+    try {
+      var fh = await dir.getFileHandle('comments_active.json',
+                                       {create: true});
+      var w  = await fh.createWritable();
+      await w.write(json);
+      await w.close();
+      return true;
+    } catch(e){
+      // Permission expired or write failed — drop the handle if it
+      // looks unrecoverable so the next prompt-allowed call re-picks.
+      if(e && (e.name === 'NotAllowedError' ||
+               e.name === 'SecurityError')){
+        _dirHandle = null;
+        try { await _idbPut('dir', null); } catch(_){}
+      }
+      return false;
+    }
+  }
+  // ---- Read comments_active.json from the chosen folder ------------
+  // Returns the parsed payload object on success, or null if the file
+  // is absent / unreadable / unparseable / permission missing. Never
+  // prompts (load is silent on page open); the user grants access via
+  // Save All Comments which then triggers the next page-load to pick
+  // it up automatically.
+  async function _readJson(promptOk){
+    var dir = await _ensureDir(promptOk);
+    if(!dir) return null;
+    try {
+      var fh   = await dir.getFileHandle('comments_active.json');
+      var file = await fh.getFile();
+      var text = await file.text();
+      if(!text) return null;
+      return JSON.parse(text);
+    } catch(e){
+      // NotFoundError is normal on a fresh folder; only an explicit
+      // permission failure should drop the cached handle.
+      if(e && (e.name === 'NotAllowedError' ||
+               e.name === 'SecurityError')){
+        _dirHandle = null;
+        try { await _idbPut('dir', null); } catch(_){}
+      }
+      return null;
+    }
+  }
+  // ---- Apply a loaded payload to the table -------------------------
+  // Walks the JSON's comments array and, for each entry whose
+  // (array, volume) matches a row in the page, overlays the textarea
+  // value + last-updated label and refreshes data-orig so the cell
+  // isn't flagged dirty. Cells with no matching JSON entry are left
+  // untouched (they keep whatever the Python-side loader put in at
+  // HTML generation time).
+  function _applyLoaded(payload){
+    if(!payload || !Array.isArray(payload.comments)) return 0;
+    var applied = 0;
+    payload.comments.forEach(function(e){
+      if(!e || typeof e !== 'object') return;
+      var arr = e.array  || '';
+      var vol = e.volume || '';
+      if(!arr || !vol) return;
+      // Attribute-equals selector with CSS.escape on both sides so
+      // names containing quotes or brackets don't break the query.
+      var sel = 'td.comment-cell[data-arr="' + (window.CSS && CSS.escape ? CSS.escape(arr) : arr.replace(/"/g,'\\"')) + '"]'
+              + '[data-vol="' + (window.CSS && CSS.escape ? CSS.escape(vol) : vol.replace(/"/g,'\\"')) + '"]';
+      var cell;
+      try { cell = document.querySelector(sel); }
+      catch(err){ cell = null; }
+      if(!cell) return;
+      var ta  = cell.querySelector('textarea.comment-input');
+      var lbl = cell.querySelector('.comment-updated');
+      var val = (e.comment != null) ? String(e.comment) : '';
+      var upd = (e.last_updated != null) ? String(e.last_updated) : '';
+      if(ta){
+        ta.value = val;
+        try { ta.textContent = val; } catch(_){}
+      }
+      cell.setAttribute('data-orig', val);
+      cell.classList.remove('comment-dirty');
+      if(lbl) lbl.textContent = upd || '\u2014';
+      applied += 1;
+    });
+    return applied;
+  }
+  // ---- Debounced autosave on every edit ----------------------------
+  var _autosaveTimer = null;
+  function _scheduleAutosave(immediate){
+    if(_autosaveTimer){ clearTimeout(_autosaveTimer); _autosaveTimer = null; }
+    var delay = immediate ? 0 : 600;
+    _autosaveTimer = setTimeout(function(){
+      _autosaveTimer = null;
+      window.saveComments(false);
+    }, delay);
+  }
+  window.commentEdited = function(el, immediate){
+    try { el.textContent = el.value; } catch(e) {}
+    var cell = el.closest && el.closest('.comment-cell');
+    if(cell){
+      var orig = cell.getAttribute('data-orig') || '';
+      if((el.value || '') !== orig) cell.classList.add('comment-dirty');
+      else cell.classList.remove('comment-dirty');
+    }
+    _scheduleAutosave(!!immediate);
+  };
+  // saveComments(prompt) — prompt=true is the user-driven path
+  // (Save All Comments button or first-time setup); prompt=false is
+  // the autosave path that never invokes a picker.
+  window.saveComments = async function(promptOk){
+    var g = _gather();
+    var json = JSON.stringify(g.payload, null, 2);
+    if(window.showDirectoryPicker){
+      var ok = await _writeJson(json, !!promptOk);
+      if(ok){
+        _setStatus('Autosave \u2713 ' + g.stamp
+                   + ' \u2192 reports/protection/comments_active.json',
+                   'ok');
+        if(promptOk) _flashSaved();
+        return;
+      }
+      if(!promptOk){
+        _setStatus('Autosave paused \u2014 click '
+                   + '\u201cSave All Comments\u201d to grant folder access',
+                   'warn');
+        return;
+      }
+      // Prompt path failed (user cancelled or browser refused) — fall
+      // through to the download below so the edits aren't lost.
+    } else if(!promptOk){
+      _setStatus('Autosave unsupported in this browser \u2014 '
+                 + 'use \u201cSave All Comments\u201d to download',
+                 'warn');
+      return;
+    }
+    // Fallback: traditional download (browsers without
+    // showDirectoryPicker, or after the user declined the picker).
+    var fname = 'comments_' + _fnstamp(g.now) + '.json';
+    var blob  = new Blob([json], {type:'application/json'});
+    var url   = URL.createObjectURL(blob);
+    var a     = document.createElement('a');
+    a.href     = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 0);
+    _setStatus('Downloaded ' + fname
+               + ' \u2014 move it into reports/protection/',
+               'warn');
+    _flashSaved();
+  };
+  // loadComments(prompt) — user-driven manual reload from the JSON
+  // sidecar. prompt=true (the toolbar button) lets _readJson invoke
+  // the directory picker if needed; prompt=false is reserved for
+  // page-load and never prompts. If any cells are dirty (typed but
+  // not yet matched in the JSON or otherwise mid-edit), confirms
+  // before overwriting since loading replaces local edits.
+  window.loadComments = async function(promptOk){
+    if(!window.showDirectoryPicker){
+      _setStatus('Load unsupported in this browser \u2014 '
+                 + 'File System Access API is required',
+                 'warn');
+      return;
+    }
+    if(promptOk){
+      var dirty = document.querySelectorAll('td.comment-cell.comment-dirty').length;
+      if(dirty > 0){
+        var ok = window.confirm(
+          'You have ' + dirty + ' unsaved edit'
+          + (dirty === 1 ? '' : 's') + '. Loading will replace '
+          + 'them with the comments from comments_active.json. Continue?');
+        if(!ok) return;
+      }
+    }
+    var payload = null;
+    try { payload = await _readJson(!!promptOk); }
+    catch(e){ payload = null; }
+    if(!payload){
+      if(promptOk){
+        _setStatus('Load failed \u2014 no comments_active.json found '
+                   + 'in the chosen folder, or access was declined',
+                   'warn');
+      }
+      return;
+    }
+    var loaded = _applyLoaded(payload);
+    var gen    = (payload && payload.generated) ? String(payload.generated) : '';
+    _setStatus('Loaded ' + loaded + ' comment'
+               + (loaded === 1 ? '' : 's') + ' from '
+               + 'comments_active.json'
+               + (gen ? ' (saved ' + gen + ')' : ''),
+               'ok');
+  };
+  // ---- Page-load probe: silently mount cached folder if granted ----
+  async function _initAutosave(){
+    if(!document.getElementById('comments-status')) return;
+    if(!window.showDirectoryPicker){
+      _setStatus('Autosave unsupported \u2014 use Save All Comments to download',
+                 'warn');
+      return;
+    }
+    var dir = await _ensureDir(false);
+    if(dir){
+      // Silently overlay any newer comments from the JSON sidecar so
+      // a user who just double-clicks the static .html file sees
+      // their latest edits even though the HTML itself was never
+      // rewritten. The Python loader already pre-populates cells at
+      // generation time; this catches edits made after that point.
+      var loaded = 0;
+      try {
+        var payload = await _readJson(false);
+        loaded = _applyLoaded(payload);
+      } catch(e){}
+      if(loaded > 0){
+        _setStatus('Autosave enabled \u2192 ' + (dir.name || 'saved folder')
+                   + ' \u2014 loaded ' + loaded + ' comment'
+                   + (loaded === 1 ? '' : 's') + ' from JSON',
+                   'ok');
+      } else {
+        _setStatus('Autosave enabled \u2192 ' + (dir.name || 'saved folder'),
+                   'ok');
+      }
+    } else {
+      var saved = null;
+      try { saved = await _idbGet('dir'); } catch(e){}
+      if(saved){
+        _setStatus('Autosave: click \u201cSave All Comments\u201d once '
+                   + 'to re-grant access to ' + (saved.name || 'saved folder')
+                   + ' (also loads latest comments)',
+                   'warn');
+      } else {
+        _setStatus('Autosave: click \u201cSave All Comments\u201d to '
+                   + 'pick reports/protection/ (one-time; also loads '
+                   + 'latest comments)',
+                   'warn');
+      }
+    }
+  }
+  document.addEventListener('DOMContentLoaded', _initAutosave);
+})();
+</script>
+</body>
+</html>

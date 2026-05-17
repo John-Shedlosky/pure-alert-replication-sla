@@ -1,0 +1,137 @@
+Output from Report run on Wednesday, April 29, 2026 at 04:28:32 PM Eastern Daylight Time
+Defined Replication SLA for SLA FB: 1h 30m 0s
+Defined Replication SLA for SLA FA-File: 1h 0m 0s
+Defined Replication SLA for SLA FA-Block: 1h 0m 0s
+Alert Codes Ignored: None
+Ignore Source Side Replica Reporting setting: Checked
+
+=== HARDWARE HEALTH SECTION ===
+nyc-pure-fa-01 - Hardware Health: Healthy
+nyc-pure-fa-02 - Hardware Health: Healthy
+nyc-pure-fb-01 - Hardware Health: Unhealthy (1 issue(s): CT0.FAN0)
+chi-pure-fa-01 - Hardware Health: Unhealthy (1 issue(s): CT1.TMP0)
+chi-pure-fa-02 - Hardware Health: Healthy
+chi-pure-fb-01 - Hardware Health: Healthy
+dal-pure-fa-01 - Hardware Health: Unhealthy (1 issue(s): CT0.FAN0)
+dal-pure-fb-01 - Hardware Health: Healthy
+sea-pure-fa-01 - Hardware Health: Unhealthy (1 issue(s): CT1.TMP0)
+sea-pure-fa-02 - Hardware Health: Healthy
+lon-pure-fa-01 - Hardware Health: Unhealthy (1 issue(s): CT0.FAN0)
+lon-pure-fb-01 - Hardware Health: Healthy
+
+=== ALERTS SECTION ===
+[ALERT-DEBUG] nyc-pure-fa-01 - 2 Critical, 2 Warning, 3 Info (synthetic data)
+[ALERT-DEBUG] nyc-pure-fa-01 - CRITICAL | S-CON-1001 | Replication link disconnected — no progress for 2 hours
+[ALERT-DEBUG] nyc-pure-fa-01 - CRITICAL | S-CON-1002 | Drive failure detected; array is degraded (CH0.BAY3)
+[ALERT-DEBUG] nyc-pure-fa-01 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+[ALERT-DEBUG] nyc-pure-fa-01 - WARNING  | S-WRN-2002 | Replication lag exceeds configured warning threshold
+[ALERT-DEBUG] nyc-pure-fa-01 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] nyc-pure-fa-01 - INFO     | S-INF-3002 | SSL certificate will expire within 30 days
+[ALERT-DEBUG] nyc-pure-fa-01 - INFO     | S-INF-3003 | Replication resync completed successfully
+
+[ALERT-DEBUG] nyc-pure-fa-02 - 0 Critical, 2 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] nyc-pure-fa-02 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+[ALERT-DEBUG] nyc-pure-fa-02 - WARNING  | S-WRN-2003 | Controller temperature elevated — check airflow
+[ALERT-DEBUG] nyc-pure-fa-02 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] nyc-pure-fa-02 - INFO     | S-INF-3004 | Volume snapshot count approaching retention limit
+
+[ALERT-DEBUG] nyc-pure-fb-01 - 1 Critical, 0 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] nyc-pure-fb-01 - CRITICAL | S-CON-1003 | Network interface link is down (eth0)
+[ALERT-DEBUG] nyc-pure-fb-01 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] nyc-pure-fb-01 - INFO     | S-INF-3005 | NFS export access list updated by administrator
+
+[ALERT-DEBUG] chi-pure-fa-01 - 1 Critical, 2 Warning, 3 Info (synthetic data)
+[ALERT-DEBUG] chi-pure-fa-01 - CRITICAL | S-CON-1001 | Replication link disconnected — no progress for 2 hours
+[ALERT-DEBUG] chi-pure-fa-01 - WARNING  | S-WRN-2002 | Replication lag exceeds configured warning threshold
+[ALERT-DEBUG] chi-pure-fa-01 - WARNING  | S-WRN-2004 | Volume approaching its configured size limit (vol-prod-001)
+[ALERT-DEBUG] chi-pure-fa-01 - INFO     | S-INF-3003 | Replication resync completed successfully
+[ALERT-DEBUG] chi-pure-fa-01 - INFO     | S-INF-3004 | Volume snapshot count approaching retention limit
+[ALERT-DEBUG] chi-pure-fa-01 - INFO     | S-INF-3005 | NFS export access list updated by administrator
+
+[ALERT-DEBUG] chi-pure-fa-02 - 0 Critical, 1 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] chi-pure-fa-02 - WARNING  | S-WRN-2003 | Controller temperature elevated — check airflow
+[ALERT-DEBUG] chi-pure-fa-02 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] chi-pure-fa-02 - INFO     | S-INF-3002 | SSL certificate will expire within 30 days
+
+[ALERT-DEBUG] chi-pure-fb-01 - 2 Critical, 1 Warning, 0 Info (synthetic data)
+[ALERT-DEBUG] chi-pure-fb-01 - CRITICAL | S-CON-1002 | Drive failure detected; array is degraded (CH0.BAY3)
+[ALERT-DEBUG] chi-pure-fb-01 - CRITICAL | S-CON-1003 | Network interface link is down (eth0)
+[ALERT-DEBUG] chi-pure-fb-01 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+
+[ALERT-DEBUG] dal-pure-fa-01 - 2 Critical, 2 Warning, 3 Info (synthetic data)
+[ALERT-DEBUG] dal-pure-fa-01 - CRITICAL | S-CON-1001 | Replication link disconnected — no progress for 2 hours
+[ALERT-DEBUG] dal-pure-fa-01 - CRITICAL | S-CON-1002 | Drive failure detected; array is degraded (CH0.BAY3)
+[ALERT-DEBUG] dal-pure-fa-01 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+[ALERT-DEBUG] dal-pure-fa-01 - WARNING  | S-WRN-2002 | Replication lag exceeds configured warning threshold
+[ALERT-DEBUG] dal-pure-fa-01 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] dal-pure-fa-01 - INFO     | S-INF-3002 | SSL certificate will expire within 30 days
+[ALERT-DEBUG] dal-pure-fa-01 - INFO     | S-INF-3003 | Replication resync completed successfully
+
+[ALERT-DEBUG] dal-pure-fb-01 - 0 Critical, 2 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] dal-pure-fb-01 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+[ALERT-DEBUG] dal-pure-fb-01 - WARNING  | S-WRN-2003 | Controller temperature elevated — check airflow
+[ALERT-DEBUG] dal-pure-fb-01 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] dal-pure-fb-01 - INFO     | S-INF-3004 | Volume snapshot count approaching retention limit
+
+[ALERT-DEBUG] sea-pure-fa-01 - 1 Critical, 0 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] sea-pure-fa-01 - CRITICAL | S-CON-1003 | Network interface link is down (eth0)
+[ALERT-DEBUG] sea-pure-fa-01 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] sea-pure-fa-01 - INFO     | S-INF-3005 | NFS export access list updated by administrator
+
+[ALERT-DEBUG] sea-pure-fa-02 - 1 Critical, 2 Warning, 3 Info (synthetic data)
+[ALERT-DEBUG] sea-pure-fa-02 - CRITICAL | S-CON-1001 | Replication link disconnected — no progress for 2 hours
+[ALERT-DEBUG] sea-pure-fa-02 - WARNING  | S-WRN-2002 | Replication lag exceeds configured warning threshold
+[ALERT-DEBUG] sea-pure-fa-02 - WARNING  | S-WRN-2004 | Volume approaching its configured size limit (vol-prod-001)
+[ALERT-DEBUG] sea-pure-fa-02 - INFO     | S-INF-3003 | Replication resync completed successfully
+[ALERT-DEBUG] sea-pure-fa-02 - INFO     | S-INF-3004 | Volume snapshot count approaching retention limit
+[ALERT-DEBUG] sea-pure-fa-02 - INFO     | S-INF-3005 | NFS export access list updated by administrator
+
+[ALERT-DEBUG] lon-pure-fa-01 - 0 Critical, 1 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] lon-pure-fa-01 - WARNING  | S-WRN-2003 | Controller temperature elevated — check airflow
+[ALERT-DEBUG] lon-pure-fa-01 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] lon-pure-fa-01 - INFO     | S-INF-3002 | SSL certificate will expire within 30 days
+
+[ALERT-DEBUG] lon-pure-fb-01 - 2 Critical, 1 Warning, 0 Info (synthetic data)
+[ALERT-DEBUG] lon-pure-fb-01 - CRITICAL | S-CON-1002 | Drive failure detected; array is degraded (CH0.BAY3)
+[ALERT-DEBUG] lon-pure-fb-01 - CRITICAL | S-CON-1003 | Network interface link is down (eth0)
+[ALERT-DEBUG] lon-pure-fb-01 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+
+=== REPLICATION SECTION ===
+[ALERT-DEBUG] nyc-pure-fa-01 - FA Block Replication SLA exceeded (simulated max lag 1h 15m 0s vs SLA 1h 0m 0s)
+
+[ALERT-DEBUG] nyc-pure-fa-02 - FA Block Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] nyc-pure-fb-01 - FA Block Replication SLA exceeded (simulated max lag 1h 30m 0s vs SLA 1h 0m 0s)
+
+[ALERT-DEBUG] chi-pure-fa-01 - FA Block Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] chi-pure-fa-02 - FA Block Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] chi-pure-fb-01 - FA Block Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] dal-pure-fa-01 - FA Block Replication SLA exceeded (simulated max lag 1h 15m 0s vs SLA 1h 0m 0s)
+
+[ALERT-DEBUG] dal-pure-fb-01 - FA Block Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] sea-pure-fa-01 - FA Block Replication SLA exceeded (simulated max lag 1h 30m 0s vs SLA 1h 0m 0s)
+
+[ALERT-DEBUG] sea-pure-fa-02 - FA Block Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] lon-pure-fa-01 - FA Block Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] lon-pure-fb-01 - FA Block Replication: Healthy (synthetic data)
+
+
+=== REPLICATION RELATIONSHIPS SECTION ===
+nyc-pure-fa-01 (FA, New York, NY) <-> nyc-pure-fa-02 (FA, New York, NY)
+nyc-pure-fa-02 (FA, New York, NY) <-> nyc-pure-fb-01 (FA, New York, NY)
+chi-pure-fa-01 (FA, Chicago, IL) <-> nyc-pure-fb-01 (FA, New York, NY)
+chi-pure-fa-01 (FA, Chicago, IL) <-> chi-pure-fa-02 (FA, Chicago, IL)
+chi-pure-fa-02 (FA, Chicago, IL) <-> chi-pure-fb-01 (FA, Chicago, IL)
+chi-pure-fb-01 (FA, Chicago, IL) <-> dal-pure-fa-01 (FA, Dallas, TX)
+dal-pure-fa-01 (FA, Dallas, TX) <-> dal-pure-fb-01 (FA, Dallas, TX)
+dal-pure-fb-01 (FA, Dallas, TX) <-> sea-pure-fa-01 (FA, Seattle, WA)
+sea-pure-fa-01 (FA, Seattle, WA) <-> sea-pure-fa-02 (FA, Seattle, WA)
+lon-pure-fa-01 (FA, London, UK) <-> sea-pure-fa-02 (FA, Seattle, WA)
+lon-pure-fa-01 (FA, London, UK) <-> lon-pure-fb-01 (FA, London, UK)
+lon-pure-fb-01 (FA, London, UK) <-> nyc-pure-fa-01 (FA, New York, NY)

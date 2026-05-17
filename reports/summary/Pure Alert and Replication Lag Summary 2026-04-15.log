@@ -1,0 +1,31 @@
+Output from Report run on Wednesday, April 15, 2026 at 04:21:16 PM Eastern Daylight Time
+Defined Replication SLA for SLA FB: 0h 45m 0s
+Defined Replication SLA for SLA FA-File: 0h 30m 0s
+Defined Replication SLA for SLA FA-Block: 0h 30m 0s
+Alert Codes Ignored: 9999
+Ignore Source Side Replica Reporting setting: Checked
+
+=== ALERTS SECTION ===
+[ALERT-DEBUG] flasharray1 - 2 Critical, 2 Warning, 3 Info (synthetic data)
+[ALERT-DEBUG] flasharray1 - CRITICAL | S-CON-1001 | Replication link disconnected — no progress for 2 hours
+[ALERT-DEBUG] flasharray1 - CRITICAL | S-CON-1002 | Drive failure detected; array is degraded (CH0.BAY3)
+[ALERT-DEBUG] flasharray1 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+[ALERT-DEBUG] flasharray1 - WARNING  | S-WRN-2002 | Replication lag exceeds configured warning threshold
+[ALERT-DEBUG] flasharray1 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] flasharray1 - INFO     | S-INF-3002 | SSL certificate will expire within 30 days
+[ALERT-DEBUG] flasharray1 - INFO     | S-INF-3003 | Replication resync completed successfully
+
+[ALERT-DEBUG] flasharray2 - 0 Critical, 2 Warning, 2 Info (synthetic data)
+[ALERT-DEBUG] flasharray2 - WARNING  | S-WRN-2001 | Array capacity utilization exceeds 80%
+[ALERT-DEBUG] flasharray2 - WARNING  | S-WRN-2003 | Controller temperature elevated — check airflow
+[ALERT-DEBUG] flasharray2 - INFO     | S-INF-3001 | Array software version update is available
+[ALERT-DEBUG] flasharray2 - INFO     | S-INF-3004 | Volume snapshot count approaching retention limit
+
+=== REPLICATION SECTION ===
+[ALERT-DEBUG] flasharray1 - FA File Replication SLA exceeded (simulated max lag 1h 15m 0s vs SLA 0h 30m 0s)
+
+[ALERT-DEBUG] flasharray2 - FA File Replication: Healthy (synthetic data)
+
+[ALERT-DEBUG] flasharray1 - FA Block Replication SLA exceeded (simulated max lag 1h 15m 0s vs SLA 0h 30m 0s)
+
+[ALERT-DEBUG] flasharray2 - FA Block Replication: Healthy (synthetic data)
