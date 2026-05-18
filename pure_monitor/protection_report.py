@@ -743,6 +743,26 @@ def _parse_fb_purefs_multi_protocol_csv(text):
     return out
 
 
+def _parse_fb_purefs_protocol_nfs_csv(text):
+    """Parse `purefs list --protocol-specific nfs --csv` rows.
+    Returns [{'name','rules'}, ...]. The Rules cell is what the Export
+    Details modal surfaces when an NFS export has no attached NFS
+    Policy (the rule list match against `purepolicy nfs rule list`
+    yields no rows because the Policy column on `purefs export list`
+    is empty for that filesystem).
+    """
+    out = []
+    for d in _csv_to_dicts(text):
+        name = (d.get('Name') or '').strip()
+        if not name:
+            continue
+        out.append({
+            'name':  name,
+            'rules': (d.get('Rules') or '').strip(),
+        })
+    return out
+
+
 def _parse_fb_purefs_replica_link_csv(text):
     """Parse `purefs replica-link list --csv` (FlashBlade) rows.
     Returns [{'name','direction','remote','remote_file_system','policy',
@@ -1188,6 +1208,7 @@ def _fake_fb_protection_data_for(array):
         'fb_array_connect':            [],
         'fb_fs_exports':               [],
         'fb_fs_multi_protocol':        [],
+        'fb_fs_protocol_nfs':          [],
         'fb_fs_replica_links':         replica_links,
         'fb_policy_snap_replica':      [],
         'fb_policy_snapshots':         policy_snapshots,
@@ -1211,12 +1232,12 @@ def _collect_one_fb_protection(array, user, detailed_logs, nogui=False):
         return _fake_fb_protection_data_for(array)
     out = {'fb_filesystems':            [], 'fb_fs_snapshots':           [],
            'fb_array_connect':          [], 'fb_fs_exports':             [],
-           'fb_fs_multi_protocol':      [], 'fb_fs_replica_links':       [],
-           'fb_policy_snap_replica':    [], 'fb_policy_snapshots':       [],
-           'fb_policy_snap_rules':      {}, 'fb_policy_smb_share':       [],
-           'fb_policy_smb_share_rules': [], 'fb_policy_nfs':             [],
-           'fb_policy_nfs_rules':       [], 'eradication':               {},
-           'error':                     None}
+           'fb_fs_multi_protocol':      [], 'fb_fs_protocol_nfs':        [],
+           'fb_fs_replica_links':       [], 'fb_policy_snap_replica':    [],
+           'fb_policy_snapshots':       [], 'fb_policy_snap_rules':      {},
+           'fb_policy_smb_share':       [], 'fb_policy_smb_share_rules': [],
+           'fb_policy_nfs':             [], 'fb_policy_nfs_rules':       [],
+           'eradication':               {}, 'error':                     None}
     _errs = []
     # The fourteen FB collection calls, paired with the parser that
     # consumes their CSV. Ordering matches the spec given for Section 3.
@@ -1233,6 +1254,8 @@ def _collect_one_fb_protection(array, user, detailed_logs, nogui=False):
          'fb_fs_exports',             _parse_fb_purefs_export_list_csv),
         ('purefs list --multi-protocol --csv',
          'fb_fs_multi_protocol',      _parse_fb_purefs_multi_protocol_csv),
+        ('purefs list --protocol-specific nfs --csv',
+         'fb_fs_protocol_nfs',        _parse_fb_purefs_protocol_nfs_csv),
         ('purefs replica-link list --csv',
          'fb_fs_replica_links',       _parse_fb_purefs_replica_link_csv),
         ('purepolicy snapshot list --replica-link --csv',
@@ -1332,6 +1355,7 @@ def run_protection_collection_core(config, nogui=False, progress_cb=None):
                             'fb_filesystems': [], 'fb_fs_snapshots': [],
                             'fb_array_connect': [], 'fb_fs_exports': [],
                             'fb_fs_multi_protocol': [],
+                            'fb_fs_protocol_nfs': [],
                             'fb_fs_replica_links': [],
                             'fb_policy_snap_replica': [],
                             'fb_policy_snapshots': [],
@@ -3028,6 +3052,11 @@ def build_protection_html(per_array, config):
     # modal entry below so the Protocols mini-table can render without
     # a second lookup at click time.
     fb_fs_mp = {}
+    # Per-(array, filesystem) protocol-specific NFS row from
+    # `purefs list --protocol-specific nfs`. Used as the fallback
+    # source for the NFS Rules section when the export has no NFS
+    # Policy attached.
+    fb_fs_proto_nfs = {}
     for _arr, _data in per_array.items():
         if _data.get('platform') != 'FB':
             continue
@@ -3035,6 +3064,10 @@ def build_protection_html(per_array, config):
             _nm = _mp.get('name', '')
             if _nm:
                 fb_fs_mp[(_arr, _nm)] = _mp
+        for _pn in _data.get('fb_fs_protocol_nfs', []) or []:
+            _nm = _pn.get('name', '')
+            if _nm:
+                fb_fs_proto_nfs[(_arr, _nm)] = _pn
         for _exp in _data.get('fb_fs_exports', []):
             _fs = _exp.get('file_system', '')
             _en = _exp.get('export_name') or _exp.get('name', '')
@@ -3050,10 +3083,15 @@ def build_protection_html(per_array, config):
     # SMB attachments produces two rows under purefs export list — both
     # are kept so the modal renders Export Info + NFS Rules + SMB Rules
     # in document order). Rules are matched at build time so the modal
-    # JS only has to render: NFS rules accept any `purepolicy nfs rule
-    # list` row whose Name equals the export's Share Policy verbatim or
-    # has Share Policy as a "<policy>." prefix; SMB rules match where
-    # the rule's Policy column equals the Share Policy verbatim.
+    # JS only has to render. NFS rules come from one of two sources:
+    # if the export's Policy column on `purefs export list` is set,
+    # any `purepolicy nfs rule list` row whose Name equals that policy
+    # verbatim or has it as a "<policy>." prefix is included; if no
+    # policy is attached, the Rules cell from `purefs list
+    # --protocol-specific nfs` for the underlying filesystem is
+    # surfaced verbatim in a single-column fallback table. SMB rules
+    # match where the rule's Policy column equals the export's Share
+    # Policy verbatim.
     fb_export_profiles = {}
     for _arr, _data in per_array.items():
         if _data.get('platform') != 'FB':
@@ -3066,17 +3104,23 @@ def build_protection_html(per_array, config):
                 continue
             _fs = _exp.get('file_system', '')
             _sp = _exp.get('share_policy', '')
+            _pl = _exp.get('policy', '')
             _etype = (_exp.get('type') or '').lower()
             _kind = ('smb' if 'smb' in _etype
                      else ('nfs' if 'nfs' in _etype else ''))
             _matched_nfs = []
             _matched_smb = []
-            if _sp:
-                _prefix = _sp + '.'
+            _nfs_rules_fallback = ''
+            if _kind == 'nfs' and _pl:
+                _prefix = _pl + '.'
                 for _r in _nfs_rules:
                     _nm = _r.get('name', '')
-                    if _nm == _sp or _nm.startswith(_prefix):
+                    if _nm == _pl or _nm.startswith(_prefix):
                         _matched_nfs.append(_r)
+            if _kind == 'nfs' and not _matched_nfs:
+                _proto_row = fb_fs_proto_nfs.get((_arr, _fs), {})
+                _nfs_rules_fallback = _proto_row.get('rules', '')
+            if _sp:
                 for _r in _smb_rules:
                     if _r.get('policy', '') == _sp:
                         _matched_smb.append(_r)
@@ -3092,18 +3136,19 @@ def build_protection_html(per_array, config):
                     'exports': []}
                 fb_export_profiles[_arr][_en] = prof
             prof['exports'].append({
-                'name':         _exp.get('name', ''),
-                'export_name':  _en,
-                'server':       _exp.get('server', ''),
-                'file_system':  _fs,
-                'policy':       _exp.get('policy', ''),
-                'type':         _exp.get('type', ''),
-                'share_policy': _sp,
-                'enabled':      _exp.get('enabled', ''),
-                'status':       _exp.get('status', ''),
-                'kind':         _kind,
-                'nfs_rules':    _matched_nfs,
-                'smb_rules':    _matched_smb})
+                'name':               _exp.get('name', ''),
+                'export_name':        _en,
+                'server':             _exp.get('server', ''),
+                'file_system':        _fs,
+                'policy':             _pl,
+                'type':               _exp.get('type', ''),
+                'share_policy':       _sp,
+                'enabled':            _exp.get('enabled', ''),
+                'status':             _exp.get('status', ''),
+                'kind':               _kind,
+                'nfs_rules':          _matched_nfs,
+                'nfs_rules_fallback': _nfs_rules_fallback,
+                'smb_rules':          _matched_smb})
     fb_export_profiles_json = _json.dumps(fb_export_profiles)
 
     rows_t3 = aggregate_fb_filesystem_rows(per_array)
@@ -3651,7 +3696,11 @@ def build_protection_html(per_array, config):
             #                   produces two records). Each record
             #                   carries its matched nfs_rules /
             #                   smb_rules so the renderer never has
-            #                   to re-match at click time.
+            #                   to re-match at click time. NFS-kind
+            #                   exports also carry nfs_rules_fallback,
+            #                   the Rules cell from `purefs list
+            #                   --protocol-specific nfs` used when no
+            #                   NFS Policy is attached.
             # The Export Info table reuses the FA pg-detail table
             # styling so the modal blends with the existing modals.
             script_parts.append(
@@ -3726,7 +3775,13 @@ def build_protection_html(per_array, config):
                 'secHtml+=fbRenderKV(e,FB_EXPORT_COLS);'
                 'const nfsHtml=fbRenderRules(e.nfs_rules,FB_NFS_RULE_COLS);'
                 'if(nfsHtml){secHtml+=\'<h5 style="margin-top:0.5em;">'
-                'NFS Rules - \'+escHtml(e.share_policy||"")+\'</h5>\'+nfsHtml;}'
+                'NFS Rules - \'+escHtml(e.policy||e.share_policy||"")'
+                '+\'</h5>\'+nfsHtml;}'
+                'else if(e.nfs_rules_fallback){'
+                'secHtml+=\'<h5 style="margin-top:0.5em;">NFS Rules</h5>\'+'
+                '\'<table class="pg-detail"><thead><tr><th>Rules</th></tr>\'+'
+                '\'</thead><tbody><tr><td>\'+escHtml(e.nfs_rules_fallback)+'
+                '\'</td></tr></tbody></table>\';}'
                 'const smbHtml=fbRenderRules(e.smb_rules,FB_SMB_RULE_COLS);'
                 'if(smbHtml){secHtml+=\'<h5 style="margin-top:0.5em;">'
                 'SMB Rules - \'+escHtml(e.share_policy||"")+\'</h5>\'+smbHtml;}'
@@ -4298,4 +4353,4 @@ def build_protection_html(per_array, config):
     return update_html_with_exceptions(_html_doc)
 
 
-__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purepolicy_snapshot_list_csv', '_parse_purepolicy_snapshot_rule_list_csv', '_parse_puredir_export_list_csv', '_parse_purepolicy_nfs_rule_list_csv', '_parse_purepolicy_nfs_list_csv', '_parse_purepolicy_smb_rule_list_csv', '_parse_purepolicy_smb_list_csv', '_parse_fb_purefs_list_csv', '_parse_fb_purefs_snap_csv', '_parse_fb_purearray_list_connect_csv', '_parse_fb_purefs_export_list_csv', '_parse_fb_purefs_multi_protocol_csv', '_parse_fb_purefs_replica_link_csv', '_parse_fb_purepolicy_snapshot_replica_link_csv', '_parse_fb_purepolicy_snapshot_list_csv', '_parse_fb_purepolicy_snapshot_rule_list_csv', '_parse_fb_purepolicy_smb_share_list_csv', '_parse_fb_purepolicy_smb_share_rule_list_csv', '_parse_fb_purepolicy_nfs_list_csv', '_parse_fb_purepolicy_nfs_rule_list_csv', '_parse_retention_to_days', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', '_collect_one_fb_protection', '_fake_fb_protection_data_for', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', 'aggregate_fb_filesystem_rows', 'EXCEPTION_CHOICES', '_exceptions_json_path', '_load_exceptions', '_save_exceptions', '_discover_and_update_exceptions', 'update_html_with_exceptions', 'build_protection_html']
+__all__ = ['_fake_protection_data_for', '_parse_purevol_list_csv', '_parse_purepod_replica_link_csv', '_parse_purevol_snap_csv', '_parse_purepgroup_list_csv', '_parse_purepgroup_retention_csv', '_parse_purevol_connect_csv', '_parse_purepgroup_schedule_csv', '_parse_purepgroup_retention_full_csv', '_parse_puredir_list_csv', '_parse_purefs_list_csv', '_parse_puredir_snap_list_csv', '_parse_purepolicy_snap_retention_lock_csv', '_parse_purepolicy_snapshot_list_csv', '_parse_purepolicy_snapshot_rule_list_csv', '_parse_puredir_export_list_csv', '_parse_purepolicy_nfs_rule_list_csv', '_parse_purepolicy_nfs_list_csv', '_parse_purepolicy_smb_rule_list_csv', '_parse_purepolicy_smb_list_csv', '_parse_fb_purefs_list_csv', '_parse_fb_purefs_snap_csv', '_parse_fb_purearray_list_connect_csv', '_parse_fb_purefs_export_list_csv', '_parse_fb_purefs_multi_protocol_csv', '_parse_fb_purefs_protocol_nfs_csv', '_parse_fb_purefs_replica_link_csv', '_parse_fb_purepolicy_snapshot_replica_link_csv', '_parse_fb_purepolicy_snapshot_list_csv', '_parse_fb_purepolicy_snapshot_rule_list_csv', '_parse_fb_purepolicy_smb_share_list_csv', '_parse_fb_purepolicy_smb_share_rule_list_csv', '_parse_fb_purepolicy_nfs_list_csv', '_parse_fb_purepolicy_nfs_rule_list_csv', '_parse_retention_to_days', '_parse_purearray_eradication_config_csv', '_fmt_eradication_delay', '_collect_one_fa_protection', '_collect_one_fb_protection', '_fake_fb_protection_data_for', 'run_protection_collection_core', '_compute_pg_max_retention', 'aggregate_fa_volume_rows', 'aggregate_fa_filesystem_rows', 'aggregate_fb_filesystem_rows', 'EXCEPTION_CHOICES', '_exceptions_json_path', '_load_exceptions', '_save_exceptions', '_discover_and_update_exceptions', 'update_html_with_exceptions', 'build_protection_html']
