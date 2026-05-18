@@ -624,6 +624,8 @@ def _parse_fb_purefs_list_csv(text):
     """Parse `purefs list --csv` (FlashBlade) rows.
     Returns [{'name','size','virtual','hard_limit','source','created',
     'protocols','writable','promotion_status','group_ownership'}, ...].
+    The Protocols column is normalised to space-separated tokens
+    (Pure emits it slash-separated, e.g. "nfsv4.1/smb").
     """
     out = []
     for d in _csv_to_dicts(text):
@@ -637,7 +639,8 @@ def _parse_fb_purefs_list_csv(text):
             'hard_limit':       (d.get('Hard Limit') or '').strip(),
             'source':           (d.get('Source') or '').strip(),
             'created':          (d.get('Created') or '').strip(),
-            'protocols':        (d.get('Protocols') or '').strip(),
+            'protocols':        (d.get('Protocols') or '').strip()
+                                  .replace('/', ' '),
             'writable':         (d.get('Writable') or '').strip(),
             'promotion_status': (d.get('Promotion Status') or '').strip(),
             'group_ownership':  (d.get('Group Ownership') or '').strip(),
@@ -722,7 +725,8 @@ def _parse_fb_purefs_export_list_csv(text):
 def _parse_fb_purefs_multi_protocol_csv(text):
     """Parse `purefs list --multi-protocol --csv` (FlashBlade) rows.
     Returns [{'name','protocols','access_control_style',
-    'safeguard_acls'}, ...].
+    'safeguard_acls'}, ...]. Protocols is space-separated for display
+    (Pure emits slash-separated values like "nfsv4.1/smb").
     """
     out = []
     for d in _csv_to_dicts(text):
@@ -731,7 +735,8 @@ def _parse_fb_purefs_multi_protocol_csv(text):
             continue
         out.append({
             'name':                 name,
-            'protocols':            (d.get('Protocols') or '').strip(),
+            'protocols':            (d.get('Protocols') or '').strip()
+                                      .replace('/', ' '),
             'access_control_style': (d.get('Access Control Style') or '').strip(),
             'safeguard_acls':       (d.get('Safeguard ACLs') or '').strip(),
         })
@@ -1112,7 +1117,7 @@ def _fake_fb_protection_data_for(array):
          'promotion_status': 'promoted', 'group_ownership': 'creator'},
         {'name': fs2, 'size': '500G', 'virtual': '120G',
          'hard_limit': 'false', 'source': '', 'created': '',
-         'protocols': 'smb,nfsv4.1', 'writable': 'true',
+         'protocols': 'smb nfsv4.1', 'writable': 'true',
          'promotion_status': 'promoted', 'group_ownership': 'creator'}]
     # Local snapshots: two on fs1 (policy 'daily'), one on fs2 (policy
     # 'daily-locked' on alternating arrays so half the rows demo a
@@ -2394,14 +2399,20 @@ def _discover_and_update_exceptions(row_metas):
         key, array_name, volume_name, array_type, would_be_color.
 
     For each row:
-    * If no entry exists, create one with exception_reason="None",
-      color=would_be_color, Last_Update="".
-    * If the entry exists and is currently red/grey but the would-be
-      color is green, promote it to green (Last_Update untouched).
-    * Otherwise leave the stored color/reason as-is.
+    * If no entry exists, create one with
+      exception_reason="None - Breaking SLA", color=would_be_color,
+      Last_Update="".
+    * If the entry exists with an un-acknowledged reason
+      ("None - Breaking SLA", "None", or empty), re-derive color from
+      would_be_color so the row tracks the current SLA state on every
+      run (red -> green when compliance is achieved, green -> red when
+      a previously-compliant row falls out of SLA).
+    * Otherwise (an acknowledged exception is set), leave the stored
+      color/reason as-is so the waiver persists across runs.
 
     The file is rewritten with the merged result.
     """
+    _UNACK = ('None - Breaking SLA', 'None', '')
     existing = _load_exceptions()
     for meta in row_metas:
         key = meta['key']
@@ -2411,7 +2422,7 @@ def _discover_and_update_exceptions(row_metas):
                 'array_name':       meta['array_name'],
                 'volume_name':      meta['volume_name'],
                 'array_type':       meta['array_type'],
-                'exception_reason': 'None',
+                'exception_reason': 'None - Breaking SLA',
                 'color':            wb,
                 'Last_Update':      '',
             }
@@ -2420,10 +2431,10 @@ def _discover_and_update_exceptions(row_metas):
         rec.setdefault('array_name',       meta['array_name'])
         rec.setdefault('volume_name',      meta['volume_name'])
         rec.setdefault('array_type',       meta['array_type'])
-        rec.setdefault('exception_reason', 'None')
+        rec.setdefault('exception_reason', 'None - Breaking SLA')
         rec.setdefault('Last_Update',      '')
-        if (rec.get('color') in ('red', 'grey')) and wb == 'green':
-            rec['color'] = 'green'
+        if rec.get('exception_reason') in _UNACK:
+            rec['color'] = wb
     _save_exceptions(existing)
     return existing
 
@@ -3769,8 +3780,13 @@ def build_protection_html(per_array, config):
         'Local Snap Retention vs SLA', 'Repl Snap Retention vs SLA',
         'Protocols', 'Exports', 'Config Drift Exceptions']
     def _build_thead(cols):
+        # Column 0 always holds the row's Volume / Directory / Filesystem
+        # name and is the cde-name column. Tag it with cde-name-col so
+        # the sort/filter JS injects the tri-color (Green / Grey / Red)
+        # filter dots instead of the default two-color sort dots.
         return ('<thead><tr>' + ''.join(
-            f'<th class="sortable" onclick="sfHeaderClick(event,{i})">'
+            f'<th class="sortable{" cde-name-col" if i == 0 else ""}" '
+            f'onclick="sfHeaderClick(event,{i})">'
             f'<div class="th-lbl">{_html.escape(c)}'
             f'<span class="sort-ind"> \u21d5</span></div>'
             f'<input class="filter-input" type="text" placeholder="filter\u2026" '
@@ -3812,11 +3828,14 @@ def build_protection_html(per_array, config):
   }
   // Cell colour detection. Inline styles like background:#d4edda end up
   // as backgroundColor 'rgb(212, 237, 218)' once parsed by the browser.
+  // 'x' represents grey, used by the cde-name columns to denote a row
+  // with an acknowledged Config Drift Exception.
   function colorOf(c){
     if(!c) return '';
     var bg = c.style && c.style.backgroundColor;
     if(bg === 'rgb(212, 237, 218)') return 'g';
     if(bg === 'rgb(248, 215, 218)') return 'r';
+    if(bg === 'rgb(233, 236, 239)') return 'x';
     return '';
   }
   function detectColorCols(tbl){
@@ -3834,7 +3853,11 @@ def build_protection_html(per_array, config):
   // pair of clickable dots to the header label. Each dot toggles a
   // "greens first" or "reds first" sort on that column. Dots
   // stopPropagation so clicking them never triggers the underlying
-  // text-sort cycle on the th.
+  // text-sort cycle on the th. The first column of each table is the
+  // cde-name column (Volume / Directory / Filesystem Name); it carries
+  // three colors (green / grey / red) and gets a color-filter widget
+  // instead of the two-color sort widget so the user can hide rows by
+  // exception color.
   function injectColorWidgets(tbl){
     var has = detectColorCols(tbl);
     var ths = tbl.tHead.rows[0].cells;
@@ -3842,6 +3865,10 @@ def build_protection_html(per_array, config):
       if(!has[j]) continue;
       var lbl = ths[j].querySelector('.th-lbl');
       if(!lbl) continue;
+      if(ths[j].classList.contains('cde-name-col')){
+        injectColorFilter(tbl, j, lbl);
+        continue;
+      }
       var w = document.createElement('span');
       w.className = 'color-sort';
       w.innerHTML = ' <span class="cs-g" title="Sort greens first">'
@@ -3857,6 +3884,35 @@ def build_protection_html(per_array, config):
         cycleColorSort(tbl, j, 'r');
       });
     }
+  }
+  // cde-name column filter widget. Three independently-toggleable
+  // dots (Green / Grey / Red); when at least one is selected, rows
+  // are restricted to the active colour set. With nothing selected,
+  // no colour filter is applied and all rows are shown.
+  function injectColorFilter(tbl, idx, lbl){
+    var w = document.createElement('span');
+    w.className = 'color-filter';
+    w.innerHTML = ' <span class="cs-g" title="Show only green rows">'
+                + '\u25CF</span><span class="cs-x" '
+                + 'title="Show only grey rows">\u25CF</span>'
+                + '<span class="cs-r" title="Show only red rows">'
+                + '\u25CF</span>';
+    lbl.appendChild(w);
+    tbl._sf.colorFilterCol = idx;
+    var bind = function(sel, code){
+      w.querySelector(sel).addEventListener('click', function(e){
+        e.stopPropagation();
+        toggleColorFilter(tbl, code);
+      });
+    };
+    bind('.cs-g', 'g');
+    bind('.cs-x', 'x');
+    bind('.cs-r', 'r');
+  }
+  function toggleColorFilter(tbl, code){
+    var s = tbl._sf;
+    s.colorFilters[code] = !s.colorFilters[code];
+    applyTable(tbl);
   }
   function cycleColorSort(tbl, idx, target){
     var s = tbl._sf;
@@ -3884,6 +3940,19 @@ def build_protection_html(per_array, config):
       }
       return true;
     });
+    // cde-name colour filter. When at least one of G / Grey / R is
+    // active, only rows whose cde-name cell colour is in the active
+    // set are kept. With nothing active the filter is a no-op.
+    if(s.colorFilterCol >= 0){
+      var cf = s.colorFilters || {};
+      if(cf.g || cf.x || cf.r){
+        var fcol = s.colorFilterCol;
+        filtered = filtered.filter(function(r){
+          var col = colorOf(r.cells[fcol]);
+          return !!cf[col];
+        });
+      }
+    }
     if(s.colorCol >= 0 && s.colorMode){
       var cc = s.colorCol, mode = s.colorMode;
       var rank = function(cell){
@@ -3903,8 +3972,8 @@ def build_protection_html(per_array, config):
     var ths = tbl.tHead.rows[0].cells;
     for(var i=0;i<ths.length;i++){
       ths[i].classList.remove('sort-asc','sort-desc');
-      var csG = ths[i].querySelector('.cs-g');
-      var csR = ths[i].querySelector('.cs-r');
+      var csG = ths[i].querySelector('.color-sort .cs-g');
+      var csR = ths[i].querySelector('.color-sort .cs-r');
       if(csG) csG.classList.remove('active');
       if(csR) csR.classList.remove('active');
       if(i === s.col && s.dir !== 0){
@@ -3915,8 +3984,18 @@ def build_protection_html(per_array, config):
       }
       if(i === s.colorCol && s.colorMode){
         var cs = ths[i].querySelector(
-          s.colorMode === 'g' ? '.cs-g' : '.cs-r');
+          s.colorMode === 'g' ? '.color-sort .cs-g'
+                              : '.color-sort .cs-r');
         if(cs) cs.classList.add('active');
+      }
+      if(i === s.colorFilterCol){
+        var cf2 = s.colorFilters || {};
+        var fg = ths[i].querySelector('.color-filter .cs-g');
+        var fx = ths[i].querySelector('.color-filter .cs-x');
+        var fr = ths[i].querySelector('.color-filter .cs-r');
+        if(fg) fg.classList.toggle('active', !!cf2.g);
+        if(fx) fx.classList.toggle('active', !!cf2.x);
+        if(fr) fr.classList.toggle('active', !!cf2.r);
       }
     }
     var ds = new Set(filtered);
@@ -3936,12 +4015,15 @@ def build_protection_html(per_array, config):
               ? tbl.tHead.rows[0].cells.length : 0;
     tbl._sf = {orig:orig, col:-1, dir:0,
                colorCol:-1, colorMode:'',
+               colorFilterCol:-1,
+               colorFilters:{g:false, x:false, r:false},
                filters:new Array(ncols).fill('')};
     injectColorWidgets(tbl);
   }
   window.sfHeaderClick = function(e, idx){
     if(e.target.tagName === 'INPUT') return;
-    if(e.target.closest && e.target.closest('.color-sort')) return;
+    if(e.target.closest && (e.target.closest('.color-sort')
+        || e.target.closest('.color-filter'))) return;
     var tbl = e.currentTarget.closest('table');
     if(!tbl || !tbl._sf) return;
     var s = tbl._sf;
@@ -4106,6 +4188,34 @@ def build_protection_html(per_array, config):
         opacity: 1; background: #d4edda;
         outline: 1px solid #28a745; }}
     table.sf thead th .color-sort .cs-r.active {{
+        opacity: 1; background: #f8d7da;
+        outline: 1px solid #dc3545; }}
+    /* Color-filter widget: three independently-toggleable dots
+       (Green / Grey / Red) injected on the cde-name column (first
+       column of each table). Each active dot keeps rows of that
+       colour visible; with nothing active no colour filter is
+       applied. Distinct from .color-sort (two dots) because the
+       cde-name column carries three possible row colours. */
+    table.sf thead th .color-filter {{
+        margin-left: 4px; user-select: none; font-size: 9pt; }}
+    table.sf thead th .color-filter .cs-g,
+    table.sf thead th .color-filter .cs-x,
+    table.sf thead th .color-filter .cs-r {{
+        cursor: pointer; padding: 0 2px;
+        opacity: 0.55; border-radius: 2px; }}
+    table.sf thead th .color-filter .cs-g {{ color: #28a745; }}
+    table.sf thead th .color-filter .cs-x {{ color: #6c757d; }}
+    table.sf thead th .color-filter .cs-r {{ color: #dc3545; }}
+    table.sf thead th .color-filter .cs-g:hover,
+    table.sf thead th .color-filter .cs-x:hover,
+    table.sf thead th .color-filter .cs-r:hover {{ opacity: 0.9; }}
+    table.sf thead th .color-filter .cs-g.active {{
+        opacity: 1; background: #d4edda;
+        outline: 1px solid #28a745; }}
+    table.sf thead th .color-filter .cs-x.active {{
+        opacity: 1; background: #e9ecef;
+        outline: 1px solid #6c757d; }}
+    table.sf thead th .color-filter .cs-r.active {{
         opacity: 1; background: #f8d7da;
         outline: 1px solid #dc3545; }}
     /* First-column "name" cell shaded by exceptions.json color. Any

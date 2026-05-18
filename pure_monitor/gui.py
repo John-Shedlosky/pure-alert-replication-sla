@@ -2483,11 +2483,15 @@ class PureMonitorApp(_AppBase):
                 continue
             rec['exception_reason'] = new_val
             rec['Last_Update']      = now_str
-            # Any non-breaking reason marks the row as an acknowledged
-            # exception; recolor to grey so the HTML overlay reflects
-            # the waived status. The first list entry is the explicit
-            # "still breaking SLA" sentinel.
-            if new_val != EXCEPTION_CHOICES[0]:
+            # Color follows the new reason. The un-acknowledged
+            # sentinels ("None - Breaking SLA" / "None") reset the
+            # row to red so the next protection-report run re-
+            # evaluates compliance (red if still breaking, green if
+            # all SLAs are met). Any other reason marks the row as
+            # an acknowledged exception and is recolored to grey.
+            if new_val in ('None - Breaking SLA', 'None'):
+                rec['color'] = 'red'
+            else:
                 rec['color'] = 'grey'
             changed += 1
         try:
