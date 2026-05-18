@@ -2349,14 +2349,14 @@ class PureMonitorApp(_AppBase):
         Top = ctk.CTkToplevel if HAS_CTK else tk.Toplevel
         win = Top(self)
         win.title("Manage Config Drift Exceptions")
-        win.geometry("960x560")
+        win.geometry("1180x560")
         win.transient(self)
         try: win.grab_set()
         except Exception: pass
         # Scrollable body: CTkScrollableFrame when CTk is installed,
         # plain Canvas + Frame fallback for the no-CTk path.
         if HAS_CTK:
-            body = ctk.CTkScrollableFrame(win, width=920, height=470)
+            body = ctk.CTkScrollableFrame(win, width=1140, height=470)
             body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
             inner = body
         else:
@@ -2429,9 +2429,12 @@ class PureMonitorApp(_AppBase):
 
         The Name column is colored to match the row's exceptions.json
         color verdict (green / red / grey). The exception-reason
-        CTkComboBox is populated from EXCEPTION_CHOICES; the current
-        value is selected if it's a member of the list, otherwise the
-        value is shown verbatim (so manual JSON edits survive).
+        CTkComboBox is populated from EXCEPTION_CHOICES; an inline
+        Entry next to it captures free-form text when "Custom" is
+        selected and is disabled otherwise. A stored exception_reason
+        that isn't a member of EXCEPTION_CHOICES is treated as a
+        previously-saved custom value: the combobox is set to
+        "Custom" and the Entry is pre-populated with that text.
         """
         cells = [(arr, None), (typ, None), (nm, fg), (upd, None)]
         for ci, (txt, color) in enumerate(cells):
@@ -2445,19 +2448,56 @@ class PureMonitorApp(_AppBase):
                     kw['fg'] = color
                 lbl = tk.Label(parent, **kw)
             lbl.grid(row=ri, column=ci, sticky='w', padx=6, pady=2)
-        # Exception-reason picker. Use CTkComboBox when available so
-        # the dropdown matches the rest of the UI; fall back to ttk
-        # otherwise. Width is wide enough for the longest preset.
+        # Reason cell: combobox + companion custom-text Entry packed
+        # side by side inside a single grid cell so the dialog only
+        # needs one column for the picker. Use CTkComboBox /
+        # CTkEntry when available; fall back to ttk / tk otherwise.
+        is_preset    = cur in EXCEPTION_CHOICES
+        dropdown_val = cur if is_preset else 'Custom'
+        custom_text  = '' if is_preset else cur
         if HAS_CTK:
-            cb = ctk.CTkComboBox(parent, values=list(EXCEPTION_CHOICES),
-                                 width=260, state='readonly')
-            cb.set(cur if cur in EXCEPTION_CHOICES else cur)
+            cell = ctk.CTkFrame(parent, fg_color="transparent")
         else:
-            cb = ttk.Combobox(parent, values=list(EXCEPTION_CHOICES),
-                              width=36, state='readonly')
-            cb.set(cur if cur in EXCEPTION_CHOICES else cur)
-        cb.grid(row=ri, column=4, sticky='w', padx=6, pady=2)
-        row_widgets.append({'key': key, 'cb': cb, 'original': cur})
+            cell = tk.Frame(parent)
+        cell.grid(row=ri, column=4, sticky='w', padx=6, pady=2)
+        if HAS_CTK:
+            cb  = ctk.CTkComboBox(cell, values=list(EXCEPTION_CHOICES),
+                                  width=220, state='readonly')
+            ent = ctk.CTkEntry(cell, width=220,
+                               placeholder_text='custom text…')
+        else:
+            cb  = ttk.Combobox(cell, values=list(EXCEPTION_CHOICES),
+                               width=30, state='readonly')
+            ent = tk.Entry(cell, width=32)
+        cb.set(dropdown_val)
+        cb.pack(side=tk.LEFT)
+        ent.pack(side=tk.LEFT, padx=(6, 0))
+        if custom_text:
+            try: ent.insert(0, custom_text)
+            except Exception: pass
+
+        def _on_sel_change(_=None):
+            # Enable the entry only when "Custom" is selected; clear
+            # and disable it otherwise so a stale value doesn't get
+            # persisted if the user toggles away from Custom.
+            sel = cb.get()
+            if sel == 'Custom':
+                try: ent.configure(state='normal')
+                except Exception: pass
+            else:
+                try:
+                    ent.delete(0, 'end')
+                    ent.configure(state='disabled')
+                except Exception:
+                    pass
+
+        if HAS_CTK:
+            cb.configure(command=_on_sel_change)
+        else:
+            cb.bind('<<ComboboxSelected>>', _on_sel_change)
+        _on_sel_change()
+        row_widgets.append({'key': key, 'cb': cb, 'entry': ent,
+                            'original': cur})
 
     def _cde_save(self, data, row_widgets, win):
         """Persist the dialog's edits back to exceptions.json.
@@ -2473,9 +2513,22 @@ class PureMonitorApp(_AppBase):
         changed = 0
         for rw in row_widgets:
             key = rw['key']
-            new_val = rw['cb'].get().strip()
-            if not new_val:
-                new_val = 'None'
+            sel = rw['cb'].get().strip()
+            if not sel:
+                sel = 'None'
+            # When "Custom" is selected the persisted exception_reason
+            # is the user-entered free-form text; an empty entry falls
+            # back to the literal "Custom" so the row is still flagged
+            # as an acknowledged exception.
+            if sel == 'Custom':
+                ent = rw.get('entry')
+                custom_text = ''
+                if ent is not None:
+                    try: custom_text = ent.get().strip()
+                    except Exception: custom_text = ''
+                new_val = custom_text if custom_text else 'Custom'
+            else:
+                new_val = sel
             if new_val == rw['original']:
                 continue
             rec = data.get(key)
@@ -2487,8 +2540,9 @@ class PureMonitorApp(_AppBase):
             # sentinels ("None - Breaking SLA" / "None") reset the
             # row to red so the next protection-report run re-
             # evaluates compliance (red if still breaking, green if
-            # all SLAs are met). Any other reason marks the row as
-            # an acknowledged exception and is recolored to grey.
+            # all SLAs are met). Any other reason (including any
+            # custom-text waiver) marks the row as an acknowledged
+            # exception and is recolored to grey.
             if new_val in ('None - Breaking SLA', 'None'):
                 rec['color'] = 'red'
             else:
