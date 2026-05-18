@@ -2371,8 +2371,9 @@ class PureMonitorApp(_AppBase):
             canv.create_window((0,0), window=inner, anchor='nw')
             inner.bind('<Configure>', lambda e: canv.configure(
                 scrollregion=canv.bbox('all')))
-        # Column headers
-        hdr_cells = ('Array', 'Type', 'Name', 'Last Updated',
+        # Column headers. Name leads so the colour-shaded identifier is
+        # the first thing the eye lands on.
+        hdr_cells = ('Name', 'Array', 'Type', 'Last Updated',
                      'Exception Reason')
         for ci, txt in enumerate(hdr_cells):
             lbl_kw = {'text': txt, 'font': (UI_FONT_FAMILY, 10, 'bold')}
@@ -2436,9 +2437,16 @@ class PureMonitorApp(_AppBase):
         previously-saved custom value: the combobox is set to
         "Custom" and the Entry is pre-populated with that text.
         """
-        cells = [(arr, None), (typ, None), (nm, fg), (upd, None)]
-        for ci, (txt, color) in enumerate(cells):
+        # Cell order matches the header row: Name leads, rendered two
+        # points larger and bold so the colour-shaded identifier stands
+        # out from the metadata that follows.
+        _name_font = (UI_FONT_FAMILY, 12, 'bold')
+        cells = [(nm, fg, _name_font), (arr, None, None),
+                 (typ, None, None), (upd, None, None)]
+        for ci, (txt, color, font) in enumerate(cells):
             kw = {'text': txt, 'anchor': 'w'}
+            if font is not None:
+                kw['font'] = font
             if HAS_CTK:
                 if color:
                     kw['text_color'] = color
