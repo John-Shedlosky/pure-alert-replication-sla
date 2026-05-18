@@ -2349,10 +2349,76 @@ class PureMonitorApp(_AppBase):
         Top = ctk.CTkToplevel if HAS_CTK else tk.Toplevel
         win = Top(self)
         win.title("Manage Config Drift Exceptions")
-        win.geometry("1180x560")
+        win.geometry("1180x620")
         win.transient(self)
         try: win.grab_set()
         except Exception: pass
+        # Toolbar above the scrollable body: live text-search on Name,
+        # three colour-filter toggle buttons (Green / Grey / Red) and
+        # a sort selector. State for the colour toggles and sort mode
+        # is closed over by _apply() below.
+        color_state = {'green': False, 'grey': False, 'red': False}
+        color_btns  = {}
+        if HAS_CTK:
+            tb = ctk.CTkFrame(win, fg_color="transparent")
+        else:
+            tb = tk.Frame(win)
+        tb.pack(fill=tk.X, padx=10, pady=(10, 0))
+        search_var = tk.StringVar()
+        if HAS_CTK:
+            ctk.CTkLabel(tb, text="Search Name:").pack(
+                side=tk.LEFT, padx=(0, 4))
+            ctk.CTkEntry(tb, width=220,
+                         textvariable=search_var).pack(side=tk.LEFT)
+            ctk.CTkLabel(tb, text="Color:").pack(
+                side=tk.LEFT, padx=(14, 4))
+        else:
+            tk.Label(tb, text="Search Name:").pack(side=tk.LEFT, padx=(0, 4))
+            tk.Entry(tb, width=28, textvariable=search_var).pack(side=tk.LEFT)
+            tk.Label(tb, text="Color:").pack(side=tk.LEFT, padx=(14, 4))
+        # On-toggle palette mirrors the lighter Name-column shades
+        # (legible on dark backgrounds). Off-toggle uses the muted
+        # frame fill so an inactive dot reads as "not selected".
+        _ON  = {'green': '#28a745', 'grey': '#6c757d', 'red': '#dc3545'}
+        _OFF = '#3a4046'
+        def _refresh_color_btn(col):
+            b = color_btns[col]
+            bg = _ON[col] if color_state[col] else _OFF
+            try:
+                if HAS_CTK: b.configure(fg_color=bg)
+                else:        b.configure(bg=bg)
+            except Exception:
+                pass
+        def _make_color_btn(col, label):
+            def _toggle():
+                color_state[col] = not color_state[col]
+                _refresh_color_btn(col)
+                _apply()
+            if HAS_CTK:
+                b = ctk.CTkButton(tb, text=label, width=78, command=_toggle,
+                                  fg_color=_OFF, hover_color=_ON[col])
+            else:
+                b = tk.Button(tb, text=label, width=9, command=_toggle,
+                              bg=_OFF, fg='white')
+            b.pack(side=tk.LEFT, padx=(4, 0))
+            color_btns[col] = b
+        _make_color_btn('green', '● Green')
+        _make_color_btn('grey',  '● Grey')
+        _make_color_btn('red',   '● Red')
+        if HAS_CTK:
+            ctk.CTkLabel(tb, text="Sort:").pack(side=tk.LEFT, padx=(14, 4))
+            sort_cb = ctk.CTkComboBox(tb, width=150, state='readonly',
+                                      values=['Default',
+                                              'Name A\u2192Z',
+                                              'Name Z\u2192A'])
+        else:
+            tk.Label(tb, text="Sort:").pack(side=tk.LEFT, padx=(14, 4))
+            sort_cb = ttk.Combobox(tb, width=14, state='readonly',
+                                   values=['Default',
+                                           'Name A\u2192Z',
+                                           'Name Z\u2192A'])
+        sort_cb.set('Default')
+        sort_cb.pack(side=tk.LEFT)
         # Scrollable body: CTkScrollableFrame when CTk is installed,
         # plain Canvas + Frame fallback for the no-CTk path.
         if HAS_CTK:
@@ -2372,11 +2438,12 @@ class PureMonitorApp(_AppBase):
             inner.bind('<Configure>', lambda e: canv.configure(
                 scrollregion=canv.bbox('all')))
         # Column headers. Name leads so the colour-shaded identifier is
-        # the first thing the eye lands on.
+        # the first thing the eye lands on. Header text is rendered
+        # four points larger than the default 10pt and in bold.
         hdr_cells = ('Name', 'Array', 'Type', 'Last Updated',
                      'Exception Reason')
         for ci, txt in enumerate(hdr_cells):
-            lbl_kw = {'text': txt, 'font': (UI_FONT_FAMILY, 10, 'bold')}
+            lbl_kw = {'text': txt, 'font': (UI_FONT_FAMILY, 14, 'bold')}
             if HAS_CTK:
                 lbl = ctk.CTkLabel(inner, **lbl_kw)
             else:
@@ -2388,19 +2455,55 @@ class PureMonitorApp(_AppBase):
                              key=lambda k: (data[k].get('array_name',''),
                                             data[k].get('volume_name','')))
         row_widgets = []
-        _COLOR_FG = {'green': '#2f7a3a', 'red': '#a32030',
-                     'grey':  '#5a6268'}
+        # Foreground tones for the Name column. Lighter shades than the
+        # web-CSS palette so the identifier stays legible against the
+        # CTk dark-mode panel background (~#2b2b2b).
+        _COLOR_FG = {'green': '#6bcf7f', 'red': '#ff8a80',
+                     'grey':  '#b0b6bc'}
         for ri, key in enumerate(sorted_keys, start=1):
             rec = data[key]
-            arr  = rec.get('array_name', '')
-            typ  = rec.get('array_type', '')
-            nm   = rec.get('volume_name', '')
-            upd  = rec.get('Last_Update', '') or '—'
-            cur  = rec.get('exception_reason', 'None') or 'None'
+            arr   = rec.get('array_name', '')
+            typ   = rec.get('array_type', '')
+            nm    = rec.get('volume_name', '')
+            upd   = rec.get('Last_Update', '') or '—'
+            cur   = rec.get('exception_reason', 'None') or 'None'
             color = (rec.get('color') or 'grey').lower()
-            fg    = _COLOR_FG.get(color, _COLOR_FG['grey'])
+            if color not in _COLOR_FG:
+                color = 'grey'
+            fg    = _COLOR_FG[color]
             self._cde_render_row(inner, ri, arr, typ, nm, upd, cur, fg,
-                                 row_widgets, key)
+                                 color, row_widgets, key)
+        # Filter / sort applier. Hides rows whose Name doesn't contain
+        # the search substring or whose colour isn't in the active
+        # filter set, then re-grids the survivors in selected order at
+        # sequential row indexes so blank rows don't appear mid-list.
+        def _apply(*_):
+            q = (search_var.get() or '').strip().lower()
+            active = {c for c, on in color_state.items() if on}
+            mode = sort_cb.get()
+            visible = [rw for rw in row_widgets
+                       if (not q or q in rw['name'].lower())
+                       and (not active or rw['color'] in active)]
+            if mode == 'Name A\u2192Z':
+                visible.sort(key=lambda r: r['name'].lower())
+            elif mode == 'Name Z\u2192A':
+                visible.sort(key=lambda r: r['name'].lower(), reverse=True)
+            for rw in row_widgets:
+                for w, _kw in rw['widgets']:
+                    try: w.grid_remove()
+                    except Exception: pass
+            for i, rw in enumerate(visible, start=1):
+                for w, kw in rw['widgets']:
+                    try: w.grid(row=i, **kw)
+                    except Exception: pass
+        try: search_var.trace_add('write', _apply)
+        except Exception:
+            try: search_var.trace('w', lambda *_a: _apply())
+            except Exception: pass
+        if HAS_CTK:
+            sort_cb.configure(command=_apply)
+        else:
+            sort_cb.bind('<<ComboboxSelected>>', _apply)
         # Footer with Save / Cancel buttons.
         btn_row = tk.Frame(win) if not HAS_CTK else ctk.CTkFrame(
             win, fg_color="transparent")
@@ -2425,7 +2528,7 @@ class PureMonitorApp(_AppBase):
                       width=12).pack(side=tk.RIGHT)
 
     def _cde_render_row(self, parent, ri, arr, typ, nm, upd, cur, fg,
-                        row_widgets, key):
+                        color, row_widgets, key):
         """Render a single Manage Exceptions row and record its widgets.
 
         The Name column is colored to match the row's exceptions.json
@@ -2436,26 +2539,37 @@ class PureMonitorApp(_AppBase):
         that isn't a member of EXCEPTION_CHOICES is treated as a
         previously-saved custom value: the combobox is set to
         "Custom" and the Entry is pre-populated with that text.
+
+        Each created widget is captured with its grid keyword args
+        (sans 'row') so the dialog's filter/sort apply pass can call
+        ``grid_remove()`` on hidden rows and ``grid(row=i, **kw)`` on
+        visible rows to renumber them sequentially.
         """
-        # Cell order matches the header row: Name leads, rendered two
-        # points larger and bold so the colour-shaded identifier stands
-        # out from the metadata that follows.
-        _name_font = (UI_FONT_FAMILY, 12, 'bold')
+        captured = []
+        # Cell order matches the header row: Name leads, rendered in a
+        # monospace face four points larger and bold so the colour-
+        # shaded identifier stands out from the metadata that follows.
+        # Consolas ships with Windows and renders volume / filesystem
+        # tokens (with dots, colons, double-colons) more legibly than
+        # the proportional UI font.
+        _name_font = ('Consolas', 14, 'bold')
         cells = [(nm, fg, _name_font), (arr, None, None),
                  (typ, None, None), (upd, None, None)]
-        for ci, (txt, color, font) in enumerate(cells):
+        for ci, (txt, color_fg, font) in enumerate(cells):
             kw = {'text': txt, 'anchor': 'w'}
             if font is not None:
                 kw['font'] = font
             if HAS_CTK:
-                if color:
-                    kw['text_color'] = color
+                if color_fg:
+                    kw['text_color'] = color_fg
                 lbl = ctk.CTkLabel(parent, **kw)
             else:
-                if color:
-                    kw['fg'] = color
+                if color_fg:
+                    kw['fg'] = color_fg
                 lbl = tk.Label(parent, **kw)
-            lbl.grid(row=ri, column=ci, sticky='w', padx=6, pady=2)
+            grid_kw = {'column': ci, 'sticky': 'w', 'padx': 6, 'pady': 2}
+            lbl.grid(row=ri, **grid_kw)
+            captured.append((lbl, grid_kw))
         # Reason cell: combobox + companion custom-text Entry packed
         # side by side inside a single grid cell so the dialog only
         # needs one column for the picker. Use CTkComboBox /
@@ -2467,7 +2581,9 @@ class PureMonitorApp(_AppBase):
             cell = ctk.CTkFrame(parent, fg_color="transparent")
         else:
             cell = tk.Frame(parent)
-        cell.grid(row=ri, column=4, sticky='w', padx=6, pady=2)
+        cell_kw = {'column': 4, 'sticky': 'w', 'padx': 6, 'pady': 2}
+        cell.grid(row=ri, **cell_kw)
+        captured.append((cell, cell_kw))
         if HAS_CTK:
             cb  = ctk.CTkComboBox(cell, values=list(EXCEPTION_CHOICES),
                                   width=220, state='readonly')
@@ -2505,7 +2621,8 @@ class PureMonitorApp(_AppBase):
             cb.bind('<<ComboboxSelected>>', _on_sel_change)
         _on_sel_change()
         row_widgets.append({'key': key, 'cb': cb, 'entry': ent,
-                            'original': cur})
+                            'original': cur, 'widgets': captured,
+                            'name': nm, 'color': color})
 
     def _cde_save(self, data, row_widgets, win):
         """Persist the dialog's edits back to exceptions.json.
